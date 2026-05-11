@@ -11,7 +11,7 @@ import shutil
 import uuid
 from contextlib import suppress
 from datetime import datetime
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -40,6 +40,9 @@ DEFAULT_CONFIG = {
     "proxy_enabled": False,
     "proxy_scheme": "http",
     "proxy_url": "",
+    "token_pool_enabled": False,
+    "token_pool_site": "",
+    "token_pool_key": "",
 }
 
 WORKER_TIMEOUT_SECONDS = max(180, int(os.getenv("WORKER_TIMEOUT_SECONDS", "900")))
@@ -282,6 +285,7 @@ class Task:
         self.status = "pending"     # pending -> running -> stopping -> completed/stopped
         self.completed = 0
         self.failed = 0
+        self.token_pool_imported = 0
         self.created_at = datetime.now().strftime("%m-%d %H:%M")
         self.result_files = []
         self.asyncio_tasks = []
@@ -298,6 +302,7 @@ class Task:
             "status": self.status,
             "completed": self.completed,
             "failed": self.failed,
+            "token_pool_imported": self.token_pool_imported,
             "created_at": self.created_at,
             "result_count": len(self.result_files),
             "result_files": self.result_files,
@@ -370,6 +375,7 @@ class TaskManager:
                         t.status = t_data["status"]
                         t.completed = t_data.get("completed", 0)
                         t.failed = t_data.get("failed", 0)
+                        t.token_pool_imported = t_data.get("token_pool_imported", 0)
                         t.created_at = t_data.get("created_at", "")
                         t.result_files = t_data.get("result_files", [])
                         # Mark interrupted tasks as stopped
@@ -455,6 +461,9 @@ class ConfigUpdate(BaseModel):
     proxy_enabled: bool = False
     proxy_scheme: str = "http"
     proxy_url: str = ""
+    token_pool_enabled: bool = False
+    token_pool_site: str = ""
+    token_pool_key: str = ""
 
 class ProxyTestRequest(BaseModel):
     proxy_scheme: str = "http"
@@ -505,6 +514,9 @@ async def update_config(item: ConfigUpdate):
         "proxy_enabled": item.proxy_enabled,
         "proxy_scheme": proxy_scheme,
         "proxy_url": item.proxy_url.strip(),
+        "token_pool_enabled": item.token_pool_enabled,
+        "token_pool_site": item.token_pool_site.strip(),
+        "token_pool_key": item.token_pool_key.strip(),
     }
     save_config(config)
     return {"status": "ok"}
@@ -627,6 +639,62 @@ async def finalize_output_task(output_task: asyncio.Task):
             await output_task
 
 
+def build_token_pool_import_url(site: str) -> str:
+    raw = (site or "").strip()
+    if not raw:
+        return ""
+    if not raw.startswith(("http://", "https://")):
+        raw = f"http://{raw}"
+    if "/api/v1/automation/import-cookie" in raw:
+        return raw
+    return urljoin(raw.rstrip("/") + "/", "api/v1/automation/import-cookie")
+
+
+async def import_cookie_to_token_pool(cookie_file: str, prefix: str) -> bool:
+    if not config.get("token_pool_enabled"):
+        return True
+
+    import_url = build_token_pool_import_url(config.get("token_pool_site", ""))
+    token_pool_key = (config.get("token_pool_key") or "").strip()
+    if not import_url or not token_pool_key:
+        await task_manager.broadcast(f"{prefix} ⚠️ 自动入池已开启，但网站地址或 Token 池密钥未配置")
+        return False
+
+    try:
+        with open(cookie_file, "r", encoding="utf-8") as f:
+            cookie_data = json.load(f)
+    except Exception as e:
+        await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败：无法读取 Cookie 文件 ({e})")
+        return False
+
+    payload = {
+        "name": cookie_data.get("name", ""),
+        "cookie": cookie_data.get("cookie", ""),
+    }
+    if not payload["cookie"]:
+        await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败：Cookie 内容为空")
+        return False
+
+    headers = {
+        "Authorization": f"Bearer {token_pool_key}",
+        "X-Token-Pool-Key": token_pool_key,
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(import_url, json=payload, headers=headers)
+        if 200 <= response.status_code < 300:
+            await task_manager.broadcast(f"{prefix} ✅ 已自动导入 Token 池")
+            return True
+        detail = response.text[:200].replace("\n", " ")
+        await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败：HTTP {response.status_code} {detail}")
+        return False
+    except Exception as e:
+        await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败：{e}")
+        return False
+
+
 async def execute_single_worker(task: Task, worker_index: int):
     cleaned = cleanup_stale_profiles(collect_active_profile_paths(task_manager.tasks))
     if cleaned:
@@ -681,6 +749,9 @@ async def execute_single_worker(task: Task, worker_index: int):
             task.completed += 1
             task.result_files.append(expected_cookie_file)
             await task_manager.broadcast(f"{prefix} ✅ 注册成功！(已导出完整 7 项 Cookie)")
+            if await import_cookie_to_token_pool(expected_cookie_file, prefix):
+                if config.get("token_pool_enabled"):
+                    task.token_pool_imported += 1
         else:
             task.failed += 1
             await task_manager.broadcast(f"{prefix} ❌ 失败 (未导出完整 7 项 Cookie)")

@@ -274,6 +274,7 @@ h1 {
 
 .record-meta .ok { color: var(--success); font-weight: 600; }
 .record-meta .fail { color: var(--danger); font-weight: 600; }
+.record-meta .pool { color: var(--primary-color); font-weight: 600; }
 
 /* ─── Glassmorphism Cards ─── */
 .glass-card {
@@ -515,10 +516,14 @@ select:focus {
     font-size: 0.75rem;
     color: var(--text-secondary);
     text-align: right;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
 }
 
 .task-item .task-counts .ok { color: var(--success); font-weight: 600; }
 .task-item .task-counts .fail { color: var(--danger); font-weight: 600; }
+.task-item .task-counts .pool { color: var(--primary-color); font-weight: 600; white-space: nowrap; }
 
 .badge {
     display: inline-block;

@@ -93,6 +93,26 @@
                 </div>
                 <div class="status-msg" id="proxy-status"></div>
             </div>
+
+            <!-- Token Pool Config -->
+            <div class="card glass-card">
+                <h2><span class="icon">🔁</span> 自动入池配置</h2>
+                <p class="card-desc">开启后，注册成功并导出完整 7 项 Cookie 后，会自动导入到指定 adobe2api Token 池。</p>
+                <label class="proxy-toggle-row">
+                    <input type="checkbox" id="token_pool_enabled">
+                    <span>开启自动入池模式</span>
+                </label>
+                <div class="form-group">
+                    <label>网站地址</label>
+                    <input type="text" id="token_pool_site" placeholder="http://127.0.0.1:6001">
+                </div>
+                <div class="form-group">
+                    <label>Token 池密钥</label>
+                    <input type="password" id="token_pool_key" placeholder="automation_import_key">
+                </div>
+                <button class="btn primary" id="save-token-pool-btn">保存配置</button>
+                <div class="status-msg" id="token-pool-status"></div>
+            </div>
         </div>
     </div>
     <script>
@@ -104,9 +124,13 @@
         const proxyEnabledInput = document.getElementById("proxy_enabled");
         const proxySchemeInput = document.getElementById("proxy_scheme");
         const proxyUrlInput = document.getElementById("proxy_url");
+        const tokenPoolEnabledInput = document.getElementById("token_pool_enabled");
+        const tokenPoolSiteInput = document.getElementById("token_pool_site");
+        const tokenPoolKeyInput = document.getElementById("token_pool_key");
         const configStatus = document.getElementById("config-status");
         const captchaStatus = document.getElementById("captcha-status");
         const proxyStatus = document.getElementById("proxy-status");
+        const tokenPoolStatus = document.getElementById("token-pool-status");
 
         // Load config
         fetch("/api/config").then(r => r.json()).then(data => {
@@ -118,6 +142,9 @@
             proxyEnabledInput.checked = Boolean(data.proxy_enabled);
             proxySchemeInput.value = data.proxy_scheme || "http";
             proxyUrlInput.value = data.proxy_url || "";
+            tokenPoolEnabledInput.checked = Boolean(data.token_pool_enabled);
+            tokenPoolSiteInput.value = data.token_pool_site || "";
+            tokenPoolKeyInput.value = data.token_pool_key || "";
         });
 
         function showStatus(el, msg, ok) {
@@ -138,6 +165,9 @@
                     proxy_enabled: proxyEnabledInput.checked,
                     proxy_scheme: proxySchemeInput.value,
                     proxy_url: proxyUrlInput.value,
+                    token_pool_enabled: tokenPoolEnabledInput.checked,
+                    token_pool_site: tokenPoolSiteInput.value,
+                    token_pool_key: tokenPoolKeyInput.value,
                 })
             }).then(r => r.json());
         }
@@ -224,6 +254,16 @@
             saveAllConfig().then(() => {
                 showStatus(proxyStatus, "✅ 配置已保存", true);
                 setTimeout(() => proxyStatus.textContent = "", 2000);
+            });
+        });
+        document.getElementById("save-token-pool-btn").addEventListener("click", () => {
+            if (tokenPoolEnabledInput.checked && (!tokenPoolSiteInput.value.trim() || !tokenPoolKeyInput.value.trim())) {
+                showStatus(tokenPoolStatus, "请填写网站地址和 Token 池密钥", false);
+                return;
+            }
+            saveAllConfig().then(() => {
+                showStatus(tokenPoolStatus, "✅ 配置已保存", true);
+                setTimeout(() => tokenPoolStatus.textContent = "", 2000);
             });
         });
     });

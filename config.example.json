@@ -6,5 +6,8 @@
   "yescaptcha_key": "",
   "proxy_enabled": false,
   "proxy_scheme": "http",
-  "proxy_url": ""
+  "proxy_url": "",
+  "token_pool_enabled": false,
+  "token_pool_site": "",
+  "token_pool_key": ""
 }
