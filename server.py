@@ -277,6 +277,7 @@ def export_timestamp() -> str:
 
 config = load_config()
 self_email_lock = asyncio.Lock()
+self_email_reserved = set()
 
 # ─── Task Management ───
 class Task:
@@ -603,29 +604,31 @@ async def get_self_emails():
 
 @app.post("/api/self-emails")
 async def update_self_emails(item: SelfEmailUpdate):
-    global config
+    global config, self_email_reserved
     accounts = parse_self_email_accounts(item.accounts)
     present = {account["email"].strip().lower() for account in accounts}
     used = normalize_self_email_used(config.get("self_email_used", []))
     config["self_email_accounts"] = item.accounts
     config["self_email_used"] = sorted(email for email in used if email in present)
     config["self_email_cursor"] = len(config["self_email_used"])
+    self_email_reserved = {email for email in self_email_reserved if email in present}
     save_config(config)
     return {"status": "ok", **build_self_email_overview()}
 
 
 @app.post("/api/self-emails/reset-used")
 async def reset_self_email_used():
-    global config
+    global config, self_email_reserved
     config["self_email_used"] = []
     config["self_email_cursor"] = 0
+    self_email_reserved = set()
     save_config(config)
     return {"status": "ok", **build_self_email_overview()}
 
 # ─── Task Endpoints ───
 @app.post("/api/self-emails/delete")
 async def delete_self_emails(item: SelfEmailDeleteRequest):
-    global config
+    global config, self_email_reserved
     targets = {email.strip().lower() for email in item.emails if email.strip()}
     accounts = parse_self_email_accounts(config.get("self_email_accounts", ""))
     kept_accounts = [
@@ -636,13 +639,14 @@ async def delete_self_emails(item: SelfEmailDeleteRequest):
     config["self_email_accounts"] = serialize_self_email_accounts(kept_accounts)
     config["self_email_used"] = sorted(email for email in used if email not in targets)
     config["self_email_cursor"] = len(config["self_email_used"])
+    self_email_reserved = {email for email in self_email_reserved if email not in targets}
     save_config(config)
     return {"status": "ok", "deleted": len(accounts) - len(kept_accounts), **build_self_email_overview()}
 
 
 @app.post("/api/self-emails/clean-used")
 async def clean_used_self_emails():
-    global config
+    global config, self_email_reserved
     used = normalize_self_email_used(config.get("self_email_used", []))
     accounts = parse_self_email_accounts(config.get("self_email_accounts", ""))
     kept_accounts = [
@@ -653,6 +657,7 @@ async def clean_used_self_emails():
     config["self_email_accounts"] = serialize_self_email_accounts(kept_accounts)
     config["self_email_used"] = []
     config["self_email_cursor"] = 0
+    self_email_reserved = set()
     save_config(config)
     return {"status": "ok", "deleted": removed, **build_self_email_overview()}
 
@@ -702,13 +707,25 @@ async def terminate_process(process: asyncio.subprocess.Process | None):
         await asyncio.wait_for(process.wait(), timeout=5)
 
 
-async def stream_process_output(process: asyncio.subprocess.Process, prefix: str):
+async def stream_process_output(
+    process: asyncio.subprocess.Process,
+    prefix: str,
+    self_email: str = "",
+    email_state: dict | None = None,
+):
     while True:
         line = await process.stdout.readline()
         if not line:
             break
         decoded = line.decode("utf-8", errors="ignore").strip()
         if decoded:
+            if "__SELF_EMAIL_VERIFICATION_SENT__" in decoded and self_email:
+                if email_state is not None and not email_state.get("used_marked"):
+                    await mark_self_email_used(self_email)
+                    email_state["used_marked"] = True
+                    await task_manager.broadcast(f"{prefix} ✅ 自备邮箱已走到发送验证码，标记为已使用")
+                    await task_manager.broadcast("__STATE_UPDATE__")
+                continue
             await task_manager.broadcast(f"{prefix} {decoded}")
 
 
@@ -834,7 +851,7 @@ def serialize_self_email_accounts(accounts: list[dict]) -> str:
 
 
 async def allocate_self_email_account() -> dict | None:
-    global config
+    global config, self_email_reserved
     async with self_email_lock:
         accounts = parse_self_email_accounts(config.get("self_email_accounts", ""))
         if not accounts:
@@ -843,16 +860,48 @@ async def allocate_self_email_account() -> dict | None:
         account = None
         for candidate in accounts:
             email_key = candidate["email"].strip().lower()
-            if email_key not in used:
+            if email_key not in used and email_key not in self_email_reserved:
                 account = candidate
-                used.add(email_key)
+                self_email_reserved.add(email_key)
                 break
         if not account:
             return None
+        return account
+
+
+async def mark_self_email_used(email: str):
+    global config, self_email_reserved
+    email_key = (email or "").strip().lower()
+    if not email_key:
+        return
+    async with self_email_lock:
+        used = normalize_self_email_used(config.get("self_email_used", []))
+        used.add(email_key)
+        self_email_reserved.discard(email_key)
         config["self_email_used"] = sorted(used)
         config["self_email_cursor"] = len(used)
         save_config(config)
-        return account
+
+
+async def release_self_email_account(email: str):
+    global config, self_email_reserved
+    email_key = (email or "").strip().lower()
+    if not email_key:
+        return
+    async with self_email_lock:
+        self_email_reserved.discard(email_key)
+        accounts = parse_self_email_accounts(config.get("self_email_accounts", ""))
+        kept_accounts = []
+        moved_account = None
+        for account in accounts:
+            if account["email"].strip().lower() == email_key and moved_account is None:
+                moved_account = account
+            else:
+                kept_accounts.append(account)
+        if moved_account:
+            kept_accounts.append(moved_account)
+            config["self_email_accounts"] = serialize_self_email_accounts(kept_accounts)
+            save_config(config)
 
 
 async def execute_single_worker(task: Task, worker_index: int):
@@ -887,6 +936,8 @@ async def execute_single_worker(task: Task, worker_index: int):
     env["USER_DATA_DIR"] = user_data_dir
     task.active_profiles[worker_index] = user_data_dir
 
+    self_email = ""
+    self_email_state = {"used_marked": False}
     prefix = f"[任务#{task.id}-{worker_index}]"
 
     if task.email_source == "self":
@@ -896,6 +947,7 @@ async def execute_single_worker(task: Task, worker_index: int):
             await task_manager.broadcast(f"{prefix} ❌ 自备邮箱模式未导入可用邮箱")
             await task_manager.broadcast("__STATE_UPDATE__")
             return
+        self_email = account["email"]
         env["SELF_EMAIL_ADDRESS"] = account["email"]
         env["SELF_EMAIL_API_URL"] = account["api_url"]
         await task_manager.broadcast(f"{prefix} 📧 使用自备邮箱: {account['email']}")
@@ -907,7 +959,7 @@ async def execute_single_worker(task: Task, worker_index: int):
         env=env
     )
     task.active_processes[worker_index] = process
-    output_task = asyncio.create_task(stream_process_output(process, prefix))
+    output_task = asyncio.create_task(stream_process_output(process, prefix, self_email, self_email_state))
 
     try:
         try:
@@ -918,6 +970,9 @@ async def execute_single_worker(task: Task, worker_index: int):
 
         # 只检查该 worker 专属的 cookie 文件是否存在
         if os.path.exists(expected_cookie_file):
+            if self_email and not self_email_state.get("used_marked"):
+                await mark_self_email_used(self_email)
+                self_email_state["used_marked"] = True
             task.completed += 1
             task.result_files.append(expected_cookie_file)
             await task_manager.broadcast(f"{prefix} ✅ 注册成功！(已导出完整 7 项 Cookie)")
@@ -934,6 +989,8 @@ async def execute_single_worker(task: Task, worker_index: int):
         raise
     finally:
         await finalize_output_task(output_task)
+        if self_email and not self_email_state.get("used_marked"):
+            await release_self_email_account(self_email)
         task.active_processes.pop(worker_index, None)
         task.active_profiles.pop(worker_index, None)
         cleanup_stale_profiles(collect_active_profile_paths(task_manager.tasks))

@@ -1360,6 +1360,8 @@ async def main():
             # ══════════════════════════════════════
             log("━" * 50)
             log("Step 5: 等待验证邮件")
+            if EMAIL_SOURCE == "self":
+                log("__SELF_EMAIL_VERIFICATION_SENT__")
             code = await mail.wait_for_code(max_wait=120, interval=5)
 
             if code:
