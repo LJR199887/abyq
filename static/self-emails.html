@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>自备邮箱 - Firefly Registration</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="glass-bg"></div>
+    <div class="container">
+        <header>
+            <div class="header-row">
+                <div class="logo-box">
+                    <div class="logo-icon"></div>
+                    <h1>Firefly Registration</h1>
+                </div>
+                <nav class="nav-links">
+                    <a href="/" class="nav-link">🚀 任务</a>
+                    <a href="/records.html" class="nav-link">📋 记录</a>
+                    <a href="/self-emails.html" class="nav-link active">📮 自备邮箱</a>
+                    <a href="/settings.html" class="nav-link">⚙️ 设置</a>
+                </nav>
+            </div>
+        </header>
+
+        <div class="self-email-layout">
+            <div class="card glass-card">
+                <div class="self-email-header">
+                    <div>
+                        <h2><span class="icon">📮</span> 自备邮箱配置</h2>
+                        <p class="card-desc">每行一条，格式：邮箱----密码----取件api链接。任务使用后会自动标记为已使用。</p>
+                    </div>
+                    <div class="self-email-stats">
+                        <div class="mini-stat">
+                            <span id="self-total">0</span>
+                            <small>总数</small>
+                        </div>
+                        <div class="mini-stat">
+                            <span id="self-available">0</span>
+                            <small>未使用</small>
+                        </div>
+                        <div class="mini-stat">
+                            <span id="self-used">0</span>
+                            <small>已使用</small>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="self-email-actions">
+                    <button class="btn primary" id="open-editor-btn">输入邮箱</button>
+                    <label class="btn secondary file-import-btn" for="txt-import-input">导入 TXT</label>
+                    <input type="file" id="txt-import-input" accept=".txt,text/plain" hidden>
+                    <button class="btn secondary" id="clean-used-btn">清理已用邮箱</button>
+                </div>
+                <div class="status-msg" id="self-email-status"></div>
+            </div>
+
+            <div class="card glass-card">
+                <div class="records-toolbar">
+                    <h2><span class="icon">📌</span> 使用状态</h2>
+                    <div class="toolbar-actions">
+                        <span class="card-desc" id="self-email-summary"></span>
+                        <button class="btn-sm danger" id="delete-selected-btn" disabled>删除选中</button>
+                    </div>
+                </div>
+                <div class="self-email-table-wrap">
+                    <table class="self-email-table">
+                        <thead>
+                            <tr>
+                                <th><input type="checkbox" id="select-all-emails"></th>
+                                <th>#</th>
+                                <th>邮箱</th>
+                                <th>密码</th>
+                                <th>取件 API</th>
+                                <th>状态</th>
+                            </tr>
+                        </thead>
+                        <tbody id="self-email-rows"></tbody>
+                    </table>
+                    <div class="empty-state" id="self-email-empty">尚未导入自备邮箱</div>
+                </div>
+                <div class="pagination-bar" id="pagination-bar">
+                    <button class="btn-sm primary" id="prev-page-btn">上一页</button>
+                    <span id="page-info">第 1 / 1 页</span>
+                    <button class="btn-sm primary" id="next-page-btn">下一页</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal-backdrop" id="editor-modal" hidden>
+        <div class="modal-card">
+            <div class="modal-header">
+                <h2><span class="icon">📮</span> 输入自备邮箱</h2>
+                <button class="icon-btn" id="close-editor-btn" aria-label="关闭">×</button>
+            </div>
+            <p class="card-desc">每行一条，格式：邮箱----密码----取件api链接。</p>
+            <div class="editor-helper">
+                <span id="editor-line-count">0 行</span>
+                <span>一行一个邮箱，支持直接粘贴整批列表</span>
+            </div>
+            <textarea id="self_email_accounts" rows="14" placeholder="JamesMartin214180@hotmail.com----mszyw41195----https://xiaoheiapi.top/m/xxx/JamesMartin214180%40hotmail.com"></textarea>
+            <div class="modal-actions">
+                <button class="btn primary" id="save-self-email-btn">保存配置</button>
+                <button class="btn secondary" id="cancel-editor-btn">取消</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    document.addEventListener("DOMContentLoaded", () => {
+        const PAGE_SIZE = 50;
+        const accountsInput = document.getElementById("self_email_accounts");
+        const statusEl = document.getElementById("self-email-status");
+        const totalEl = document.getElementById("self-total");
+        const availableEl = document.getElementById("self-available");
+        const usedEl = document.getElementById("self-used");
+        const rowsEl = document.getElementById("self-email-rows");
+        const emptyEl = document.getElementById("self-email-empty");
+        const summaryEl = document.getElementById("self-email-summary");
+        const openEditorBtn = document.getElementById("open-editor-btn");
+        const closeEditorBtn = document.getElementById("close-editor-btn");
+        const cancelEditorBtn = document.getElementById("cancel-editor-btn");
+        const saveBtn = document.getElementById("save-self-email-btn");
+        const cleanUsedBtn = document.getElementById("clean-used-btn");
+        const selectAllInput = document.getElementById("select-all-emails");
+        const deleteSelectedBtn = document.getElementById("delete-selected-btn");
+        const txtImportInput = document.getElementById("txt-import-input");
+        const editorModal = document.getElementById("editor-modal");
+        const editorLineCount = document.getElementById("editor-line-count");
+        const paginationBar = document.getElementById("pagination-bar");
+        const prevPageBtn = document.getElementById("prev-page-btn");
+        const nextPageBtn = document.getElementById("next-page-btn");
+        const pageInfo = document.getElementById("page-info");
+
+        let currentData = {accounts: [], raw: "", total: 0, available: 0, used: 0};
+        let currentPage = 1;
+
+        function showStatus(message, ok = true) {
+            statusEl.style.color = ok ? "var(--success)" : "var(--danger)";
+            statusEl.textContent = message;
+            if (message) setTimeout(() => statusEl.textContent = "", 2500);
+        }
+
+        function escapeHtml(value) {
+            return String(value || "").replace(/[&<>"']/g, ch => ({
+                "&": "&amp;",
+                "<": "&lt;",
+                ">": "&gt;",
+                '"': "&quot;",
+                "'": "&#39;",
+            }[ch]));
+        }
+
+        function openEditor() {
+            accountsInput.value = currentData.raw || "";
+            updateEditorLineCount();
+            editorModal.hidden = false;
+            setTimeout(() => accountsInput.focus(), 0);
+        }
+
+        function closeEditor() {
+            editorModal.hidden = true;
+        }
+
+        function getSelectedEmails() {
+            return Array.from(document.querySelectorAll(".self-email-check:checked"))
+                .map(input => input.value);
+        }
+
+        function updateSelectionState() {
+            const checks = Array.from(document.querySelectorAll(".self-email-check"));
+            const selectedCount = checks.filter(input => input.checked).length;
+            deleteSelectedBtn.disabled = selectedCount === 0;
+            deleteSelectedBtn.textContent = selectedCount ? `删除选中 (${selectedCount})` : "删除选中";
+            selectAllInput.checked = checks.length > 0 && selectedCount === checks.length;
+            selectAllInput.indeterminate = selectedCount > 0 && selectedCount < checks.length;
+        }
+
+        function updateEditorLineCount() {
+            const count = accountsInput.value
+                .split(/\r?\n/)
+                .filter(line => line.trim()).length;
+            editorLineCount.textContent = `${count} 行`;
+        }
+
+        function render(data, keepPage = false) {
+            currentData = data || currentData;
+            totalEl.textContent = currentData.total || 0;
+            availableEl.textContent = currentData.available || 0;
+            usedEl.textContent = currentData.used || 0;
+            summaryEl.textContent = currentData.total ? `未使用 ${currentData.available} / 已使用 ${currentData.used}` : "";
+
+            const accounts = currentData.accounts || [];
+            const totalPages = Math.max(1, Math.ceil(accounts.length / PAGE_SIZE));
+            if (!keepPage) currentPage = 1;
+            currentPage = Math.min(Math.max(currentPage, 1), totalPages);
+            const start = (currentPage - 1) * PAGE_SIZE;
+            const pageAccounts = accounts.slice(start, start + PAGE_SIZE);
+
+            emptyEl.style.display = accounts.length ? "none" : "block";
+            paginationBar.style.display = accounts.length > PAGE_SIZE ? "flex" : "none";
+            pageInfo.textContent = `第 ${currentPage} / ${totalPages} 页`;
+            prevPageBtn.disabled = currentPage <= 1;
+            nextPageBtn.disabled = currentPage >= totalPages;
+
+            rowsEl.innerHTML = pageAccounts.map(item => `
+                <tr class="${item.used ? "used" : ""}">
+                    <td><input class="self-email-check" type="checkbox" value="${escapeHtml(item.email)}"></td>
+                    <td>${item.index}</td>
+                    <td>${escapeHtml(item.email)}</td>
+                    <td>${escapeHtml(item.password_mask)}</td>
+                    <td class="api-url">${escapeHtml(item.api_url)}</td>
+                    <td><span class="badge ${item.used ? "stopped" : "completed"}">${item.used ? "已使用" : "未使用"}</span></td>
+                </tr>
+            `).join("");
+            rowsEl.querySelectorAll(".self-email-check").forEach(input => {
+                input.addEventListener("change", updateSelectionState);
+            });
+            updateSelectionState();
+        }
+
+        function loadSelfEmails() {
+            return fetch("/api/self-emails")
+                .then(r => r.json())
+                .then(data => render(data))
+                .catch(() => showStatus("❌ 读取自备邮箱失败", false));
+        }
+
+        function saveAccounts(raw, successText = "✅ 配置已保存") {
+            saveBtn.disabled = true;
+            saveBtn.textContent = "保存中...";
+            return fetch("/api/self-emails", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({accounts: raw}),
+            }).then(r => r.json()).then(data => {
+                render(data);
+                showStatus(successText);
+                return data;
+            }).catch(() => {
+                showStatus("❌ 保存失败", false);
+            }).finally(() => {
+                saveBtn.disabled = false;
+                saveBtn.textContent = "保存配置";
+            });
+        }
+
+        openEditorBtn.addEventListener("click", openEditor);
+        closeEditorBtn.addEventListener("click", closeEditor);
+        cancelEditorBtn.addEventListener("click", closeEditor);
+        editorModal.addEventListener("click", event => {
+            if (event.target === editorModal) closeEditor();
+        });
+
+        saveBtn.addEventListener("click", () => {
+            saveAccounts(accountsInput.value).then(data => {
+                if (data) closeEditor();
+            });
+        });
+
+        txtImportInput.addEventListener("change", () => {
+            const file = txtImportInput.files && txtImportInput.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = () => {
+                const existing = (currentData.raw || "").trim();
+                const imported = String(reader.result || "").trim();
+                const nextRaw = existing && imported ? `${existing}\n${imported}` : (imported || existing);
+                saveAccounts(nextRaw, "✅ TXT 已导入");
+                txtImportInput.value = "";
+            };
+            reader.onerror = () => {
+                showStatus("❌ TXT 读取失败", false);
+                txtImportInput.value = "";
+            };
+            reader.readAsText(file, "utf-8");
+        });
+
+        cleanUsedBtn.addEventListener("click", () => {
+            if (!confirm("确定删除所有已使用邮箱吗？删除后这些邮箱会从列表中移除。")) return;
+            cleanUsedBtn.disabled = true;
+            fetch("/api/self-emails/clean-used", {method: "POST"})
+                .then(r => r.json())
+                .then(data => {
+                    render(data);
+                    showStatus(`✅ 已清理 ${data.deleted || 0} 个已用邮箱`);
+                })
+                .catch(() => showStatus("❌ 清理失败", false))
+                .finally(() => cleanUsedBtn.disabled = false);
+        });
+
+        deleteSelectedBtn.addEventListener("click", () => {
+            const emails = getSelectedEmails();
+            if (!emails.length) return;
+            if (!confirm(`确定删除选中的 ${emails.length} 个邮箱吗？`)) return;
+            deleteSelectedBtn.disabled = true;
+            fetch("/api/self-emails/delete", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({emails}),
+            }).then(r => r.json()).then(data => {
+                render(data, true);
+                showStatus(`✅ 已删除 ${data.deleted || emails.length} 个邮箱`);
+            }).catch(() => {
+                showStatus("❌ 删除失败", false);
+            }).finally(updateSelectionState);
+        });
+
+        selectAllInput.addEventListener("change", () => {
+            document.querySelectorAll(".self-email-check").forEach(input => {
+                input.checked = selectAllInput.checked;
+            });
+            updateSelectionState();
+        });
+
+        accountsInput.addEventListener("input", updateEditorLineCount);
+
+        prevPageBtn.addEventListener("click", () => {
+            currentPage -= 1;
+            render(currentData, true);
+        });
+
+        nextPageBtn.addEventListener("click", () => {
+            currentPage += 1;
+            render(currentData, true);
+        });
+
+        loadSelfEmails();
+    });
+    </script>
+</body>
+</html>

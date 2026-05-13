@@ -43,6 +43,9 @@ DEFAULT_CONFIG = {
     "token_pool_enabled": False,
     "token_pool_site": "",
     "token_pool_key": "",
+    "self_email_accounts": "",
+    "self_email_cursor": 0,
+    "self_email_used": [],
 }
 
 WORKER_TIMEOUT_SECONDS = max(180, int(os.getenv("WORKER_TIMEOUT_SECONDS", "900")))
@@ -273,14 +276,16 @@ def export_timestamp() -> str:
     return datetime.now().strftime("%m-%d_%H-%M")
 
 config = load_config()
+self_email_lock = asyncio.Lock()
 
 # ─── Task Management ───
 class Task:
-    def __init__(self, task_id, quantity, concurrency=1, show_browser=False, name=""):
+    def __init__(self, task_id, quantity, concurrency=1, show_browser=False, name="", email_source="temp"):
         self.id = task_id
         self.quantity = quantity
         self.concurrency = concurrency
         self.show_browser = show_browser
+        self.email_source = email_source if email_source in ("temp", "self") else "temp"
         self.name = (name or "").strip() or f"任务 #{task_id}"
         self.status = "pending"     # pending -> running -> stopping -> completed/stopped
         self.completed = 0
@@ -298,6 +303,7 @@ class Task:
             "quantity": self.quantity,
             "concurrency": self.concurrency,
             "show_browser": self.show_browser,
+            "email_source": self.email_source,
             "name": self.name,
             "status": self.status,
             "completed": self.completed,
@@ -371,6 +377,7 @@ class TaskManager:
                             t_data.get("concurrency", 1),
                             t_data.get("show_browser", False),
                             t_data.get("name", ""),
+                            t_data.get("email_source", "temp"),
                         )
                         t.status = t_data["status"]
                         t.completed = t_data.get("completed", 0)
@@ -385,8 +392,8 @@ class TaskManager:
             except Exception as e:
                 print(f"Failed to load tasks: {e}")
 
-    def create_task(self, quantity, concurrency=1, show_browser=False, name="") -> Task:
-        task = Task(self.next_id, quantity, concurrency, show_browser, name)
+    def create_task(self, quantity, concurrency=1, show_browser=False, name="", email_source="temp") -> Task:
+        task = Task(self.next_id, quantity, concurrency, show_browser, name, email_source)
         self.tasks[self.next_id] = task
         self.next_id += 1
         return task
@@ -465,6 +472,15 @@ class ConfigUpdate(BaseModel):
     token_pool_site: str = ""
     token_pool_key: str = ""
 
+
+class SelfEmailUpdate(BaseModel):
+    accounts: str = ""
+
+
+class SelfEmailDeleteRequest(BaseModel):
+    emails: list[str]
+
+
 class ProxyTestRequest(BaseModel):
     proxy_scheme: str = "http"
     proxy_url: str = ""
@@ -474,6 +490,7 @@ class TaskStart(BaseModel):
     concurrency: int = 1
     show_browser: bool = False
     name: str = ""
+    email_source: str = "temp"
 
 class TaskDeleteRequest(BaseModel):
     ids: list[int]
@@ -517,6 +534,9 @@ async def update_config(item: ConfigUpdate):
         "token_pool_enabled": item.token_pool_enabled,
         "token_pool_site": item.token_pool_site.strip(),
         "token_pool_key": item.token_pool_key.strip(),
+        "self_email_accounts": config.get("self_email_accounts", ""),
+        "self_email_cursor": config.get("self_email_cursor", 0),
+        "self_email_used": config.get("self_email_used", []),
     }
     save_config(config)
     return {"status": "ok"}
@@ -575,11 +595,73 @@ async def test_captcha_config(data: dict):
 async def get_config():
     return config
 
+
+@app.get("/api/self-emails")
+async def get_self_emails():
+    return build_self_email_overview()
+
+
+@app.post("/api/self-emails")
+async def update_self_emails(item: SelfEmailUpdate):
+    global config
+    accounts = parse_self_email_accounts(item.accounts)
+    present = {account["email"].strip().lower() for account in accounts}
+    used = normalize_self_email_used(config.get("self_email_used", []))
+    config["self_email_accounts"] = item.accounts
+    config["self_email_used"] = sorted(email for email in used if email in present)
+    config["self_email_cursor"] = len(config["self_email_used"])
+    save_config(config)
+    return {"status": "ok", **build_self_email_overview()}
+
+
+@app.post("/api/self-emails/reset-used")
+async def reset_self_email_used():
+    global config
+    config["self_email_used"] = []
+    config["self_email_cursor"] = 0
+    save_config(config)
+    return {"status": "ok", **build_self_email_overview()}
+
 # ─── Task Endpoints ───
+@app.post("/api/self-emails/delete")
+async def delete_self_emails(item: SelfEmailDeleteRequest):
+    global config
+    targets = {email.strip().lower() for email in item.emails if email.strip()}
+    accounts = parse_self_email_accounts(config.get("self_email_accounts", ""))
+    kept_accounts = [
+        account for account in accounts
+        if account["email"].strip().lower() not in targets
+    ]
+    used = normalize_self_email_used(config.get("self_email_used", []))
+    config["self_email_accounts"] = serialize_self_email_accounts(kept_accounts)
+    config["self_email_used"] = sorted(email for email in used if email not in targets)
+    config["self_email_cursor"] = len(config["self_email_used"])
+    save_config(config)
+    return {"status": "ok", "deleted": len(accounts) - len(kept_accounts), **build_self_email_overview()}
+
+
+@app.post("/api/self-emails/clean-used")
+async def clean_used_self_emails():
+    global config
+    used = normalize_self_email_used(config.get("self_email_used", []))
+    accounts = parse_self_email_accounts(config.get("self_email_accounts", ""))
+    kept_accounts = [
+        account for account in accounts
+        if account["email"].strip().lower() not in used
+    ]
+    removed = len(accounts) - len(kept_accounts)
+    config["self_email_accounts"] = serialize_self_email_accounts(kept_accounts)
+    config["self_email_used"] = []
+    config["self_email_cursor"] = 0
+    save_config(config)
+    return {"status": "ok", "deleted": removed, **build_self_email_overview()}
+
+
 @app.post("/api/tasks")
 async def start_task(item: TaskStart):
     conc = max(1, min(item.concurrency, 10))
-    task = task_manager.create_task(item.quantity, conc, item.show_browser, item.name)
+    email_source = item.email_source if item.email_source in ("temp", "self") else "temp"
+    task = task_manager.create_task(item.quantity, conc, item.show_browser, item.name, email_source)
     await task_manager.queue.put(task)
 
     # Ensure queue worker is running
@@ -695,6 +777,84 @@ async def import_cookie_to_token_pool(cookie_file: str, prefix: str) -> bool:
         return False
 
 
+def parse_self_email_accounts(raw: str) -> list[dict]:
+    accounts = []
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [part.strip() for part in line.split("----")]
+        if len(parts) < 3 or not parts[0] or not parts[1] or not parts[2]:
+            continue
+        accounts.append({
+            "email": parts[0],
+            "password": parts[1],
+            "api_url": "----".join(parts[2:]).strip(),
+        })
+    return accounts
+
+
+def normalize_self_email_used(value) -> set[str]:
+    if isinstance(value, list):
+        return {str(item).strip().lower() for item in value if str(item).strip()}
+    if isinstance(value, str):
+        return {item.strip().lower() for item in value.splitlines() if item.strip()}
+    return set()
+
+
+def build_self_email_overview() -> dict:
+    accounts = parse_self_email_accounts(config.get("self_email_accounts", ""))
+    used = normalize_self_email_used(config.get("self_email_used", []))
+    rows = []
+    for idx, account in enumerate(accounts, 1):
+        email_key = account["email"].strip().lower()
+        password = account["password"]
+        rows.append({
+            "index": idx,
+            "email": account["email"],
+            "password_mask": "*" * min(max(len(password), 6), 12),
+            "api_url": account["api_url"],
+            "used": email_key in used,
+        })
+    used_count = sum(1 for row in rows if row["used"])
+    return {
+        "accounts": rows,
+        "raw": config.get("self_email_accounts", ""),
+        "total": len(rows),
+        "used": used_count,
+        "available": len(rows) - used_count,
+    }
+
+
+def serialize_self_email_accounts(accounts: list[dict]) -> str:
+    return "\n".join(
+        f"{account['email']}----{account['password']}----{account['api_url']}"
+        for account in accounts
+    )
+
+
+async def allocate_self_email_account() -> dict | None:
+    global config
+    async with self_email_lock:
+        accounts = parse_self_email_accounts(config.get("self_email_accounts", ""))
+        if not accounts:
+            return None
+        used = normalize_self_email_used(config.get("self_email_used", []))
+        account = None
+        for candidate in accounts:
+            email_key = candidate["email"].strip().lower()
+            if email_key not in used:
+                account = candidate
+                used.add(email_key)
+                break
+        if not account:
+            return None
+        config["self_email_used"] = sorted(used)
+        config["self_email_cursor"] = len(used)
+        save_config(config)
+        return account
+
+
 async def execute_single_worker(task: Task, worker_index: int):
     cleaned = cleanup_stale_profiles(collect_active_profile_paths(task_manager.tasks))
     if cleaned:
@@ -707,6 +867,7 @@ async def execute_single_worker(task: Task, worker_index: int):
     # 多域名列表：传给 worker 进程，实现均匀分布
     env["EMAIL_DOMAINS"] = config.get("email_domains", "") or config.get("email_domain", "rossa.cfd")
     env["YESCAPTCHA_KEY"] = config.get("yescaptcha_key", "")
+    env["EMAIL_SOURCE"] = task.email_source
     env["PROXY_ENABLED"] = "1" if config.get("proxy_enabled") else "0"
     env["PROXY_SCHEME"] = config.get("proxy_scheme", "http")
     env["PROXY_URL"] = config.get("proxy_url", "")
@@ -727,6 +888,17 @@ async def execute_single_worker(task: Task, worker_index: int):
     task.active_profiles[worker_index] = user_data_dir
 
     prefix = f"[任务#{task.id}-{worker_index}]"
+
+    if task.email_source == "self":
+        account = await allocate_self_email_account()
+        if not account:
+            task.failed += 1
+            await task_manager.broadcast(f"{prefix} ❌ 自备邮箱模式未导入可用邮箱")
+            await task_manager.broadcast("__STATE_UPDATE__")
+            return
+        env["SELF_EMAIL_ADDRESS"] = account["email"]
+        env["SELF_EMAIL_API_URL"] = account["api_url"]
+        await task_manager.broadcast(f"{prefix} 📧 使用自备邮箱: {account['email']}")
 
     process = await asyncio.create_subprocess_exec(
         sys.executable, "-u", "auto_register_firefly.py",

@@ -51,12 +51,18 @@ document.addEventListener("DOMContentLoaded", () => {
     // ────────────────── Create Task ──────────────────
     const concurrencyInput = document.getElementById("task_concurrency");
     const showBrowserCb = document.getElementById("show_browser");
+    const emailSourceInput = document.getElementById("email_source");
+
+    function emailSourceLabel(source) {
+        return source === "self" ? "自备邮箱" : "临时邮箱";
+    }
 
     startBtn.addEventListener("click", () => {
         const qty = parseInt(qtyInput.value) || 1;
         const conc = parseInt(concurrencyInput.value) || 1;
         const showBrowser = showBrowserCb.checked;
         const taskName = (taskNameInput.value || "").trim();
+        const emailSource = emailSourceInput ? emailSourceInput.value : "temp";
 
         startBtn.disabled = true;
         startBtn.textContent = "加入中...";
@@ -64,14 +70,14 @@ document.addEventListener("DOMContentLoaded", () => {
         fetch("/api/tasks", {
             method: "POST",
             headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({ name: taskName, quantity: qty, concurrency: conc, show_browser: showBrowser })
+            body: JSON.stringify({ name: taskName, quantity: qty, concurrency: conc, show_browser: showBrowser, email_source: emailSource })
         }).then(r => r.json()).then(data => {
             startBtn.disabled = false;
             startBtn.textContent = "加入队列";
             taskStatus.style.color = "var(--success)";
-            taskStatus.textContent = `✅ ${data.name} 已创建 (${data.quantity}个, 并发${data.concurrency})`;
+            taskStatus.textContent = `✅ ${data.name} 已创建 (${data.quantity}个, 并发${data.concurrency} · ${emailSourceLabel(data.email_source)})`;
             setTimeout(() => taskStatus.textContent = "", 3000);
-            appendLog(`系统: ${data.name} 已加入队列 (#${data.id}, ${data.quantity}个注册, 并发${data.concurrency})`, "sys");
+            appendLog(`系统: ${data.name} 已加入队列 (#${data.id}, ${data.quantity}个注册, 并发${data.concurrency} · ${emailSourceLabel(data.email_source)})`, "sys");
             refreshTaskList();
         }).catch(() => {
             startBtn.disabled = false;
@@ -125,7 +131,7 @@ document.addEventListener("DOMContentLoaded", () => {
                         <div class="task-item${activeClass}" data-id="${t.id}" style="cursor: pointer;">
                             <div class="task-left">
                                 <span class="task-id">${t.name || `任务 #${t.id}`}</span>
-                                <span class="task-meta">#${t.id} · ${t.created_at} · ${t.quantity}个 · 并发${t.concurrency}</span>
+                                <span class="task-meta">#${t.id} · ${t.created_at} · ${emailSourceLabel(t.email_source)} · ${t.quantity}个 · 并发${t.concurrency}</span>
                             </div>
                             <div class="task-right">
                                 <div class="task-counts">

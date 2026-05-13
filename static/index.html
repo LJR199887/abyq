@@ -18,6 +18,7 @@
                 <nav class="nav-links">
                     <a href="/" class="nav-link active">🚀 任务</a>
                     <a href="/records.html" class="nav-link">📋 记录</a>
+                    <a href="/self-emails.html" class="nav-link">📮 自备邮箱</a>
                     <a href="/settings.html" class="nav-link">⚙️ 设置</a>
                 </nav>
             </div>
@@ -55,6 +56,13 @@
                     <div class="form-group">
                         <label>任务名称</label>
                         <input type="text" id="task_name" placeholder="例如：代理A批次 / 夜间跑号" maxlength="40">
+                    </div>
+                    <div class="form-group">
+                        <label>邮箱模式</label>
+                        <select id="email_source">
+                            <option value="temp">临时邮箱</option>
+                            <option value="self">自备邮箱</option>
+                        </select>
                     </div>
                     <div class="task-grid">
                         <div class="form-group">

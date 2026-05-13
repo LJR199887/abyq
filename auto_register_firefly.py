@@ -31,6 +31,9 @@ API_KEY = os.getenv("API_KEY", "")
 API_BASE = os.getenv("API_BASE", "https://rossa.cfd/api")
 EMAIL_DOMAIN = os.getenv("EMAIL_DOMAIN", "rossa.cfd")
 YESCAPTCHA_KEY = os.getenv("YESCAPTCHA_KEY", "")
+EMAIL_SOURCE = os.getenv("EMAIL_SOURCE", "temp")
+SELF_EMAIL_ADDRESS = os.getenv("SELF_EMAIL_ADDRESS", "")
+SELF_EMAIL_API_URL = os.getenv("SELF_EMAIL_API_URL", "")
 SHOW_BROWSER = os.getenv("SHOW_BROWSER", "0") == "1"
 PROXY_ENABLED = os.getenv("PROXY_ENABLED", "0") == "1"
 PROXY_SCHEME = os.getenv("PROXY_SCHEME", "http")
@@ -796,6 +799,77 @@ class TempMail:
         await self.client.aclose()
 
 
+class SelfEmailMail:
+    def __init__(self):
+        self.email_id = SELF_EMAIL_ADDRESS
+        self.address = SELF_EMAIL_ADDRESS
+        self.api_url = SELF_EMAIL_API_URL
+        self.client = httpx.AsyncClient(timeout=30.0, **build_api_httpx_proxy_kwargs())
+
+    async def create(self) -> str:
+        if not self.address or not self.api_url:
+            raise RuntimeError("自备邮箱信息不完整")
+        log(f"📬 自备邮箱: {self.address}")
+        return self.address
+
+    async def wait_for_code(self, max_wait=120, interval=5) -> str | None:
+        log(f"⏳ 通过自备邮箱 API 等待验证码 (最长 {max_wait}s)...")
+        start = time.time()
+        attempt = 0
+        while time.time() - start < max_wait:
+            attempt += 1
+            elapsed = int(time.time() - start)
+            try:
+                r = await self.client.get(self.api_url)
+                r.raise_for_status()
+                raw = r.text or ""
+                code = None
+                try:
+                    data = r.json()
+                    code = extract_code_from_api_payload(data)
+                except Exception:
+                    code = extract_code({"text": raw})
+                if code:
+                    log(f"🔐 验证码: {code}")
+                    return code
+                if attempt % 3 == 1:
+                    log(f"  轮询 #{attempt} ({elapsed}s) 暂未获取验证码...")
+            except Exception as e:
+                log(f"  自备邮箱 API 轮询出错: {e}")
+            await asyncio.sleep(interval)
+        log("❌ 等待自备邮箱验证码超时")
+        return None
+
+    async def close(self):
+        await self.client.aclose()
+
+
+def extract_code_from_api_payload(data) -> str | None:
+    if isinstance(data, dict):
+        for key in ("code", "verify_code", "verification_code", "otp"):
+            value = data.get(key)
+            if value:
+                m = re.search(r"\b(\d{4,8})\b", str(value))
+                if m:
+                    return m.group(1)
+        for key in ("html", "content", "body", "text", "message", "data"):
+            value = data.get(key)
+            if value is None:
+                continue
+            if isinstance(value, (dict, list)):
+                found = extract_code_from_api_payload(value)
+            else:
+                found = extract_code({"text": str(value)})
+            if found:
+                return found
+    if isinstance(data, list):
+        for item in data:
+            found = extract_code_from_api_payload(item)
+            if found:
+                return found
+    return None
+
+
 def extract_code(mail: dict) -> str | None:
     body = (mail.get("html") or mail.get("content") or
             mail.get("body") or mail.get("text") or "")
@@ -1019,19 +1093,19 @@ SIGNUP_URL = (
 # ════════════════════════ 主流程 ════════════════════════
 
 async def main():
-    mail = TempMail()
+    mail = SelfEmailMail() if EMAIL_SOURCE == "self" else TempMail()
 
     log("╔═══════════════════════════════════════════════════╗")
     log("║   Adobe Firefly 自动注册 (直接注册模式)          ║")
     log("╚═══════════════════════════════════════════════════╝")
 
-    # ── Step 0: 生成临时邮箱 ──
+    # ── Step 0: 准备邮箱 ──
     log("━" * 50)
-    log("Step 0: 生成临时邮箱")
+    log("Step 0: 准备邮箱")
     try:
         email_addr = await mail.create()
     except Exception as e:
-        log(f"❌ 临时邮箱创建失败，任务结束: {e}")
+        log(f"❌ 邮箱准备失败，任务结束: {e}")
         await mail.close()
         return
 
