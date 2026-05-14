@@ -901,6 +901,15 @@ class SelfEmailMail:
 
     async def wait_for_code(self, max_wait=120, interval=5) -> str | None:
         log(f"⏳ 通过自备邮箱 API 等待验证码 (最长 {max_wait}s)...")
+        result = await self.wait_for_verification(max_wait=max_wait, interval=interval)
+        if result and result.get("type") == "code":
+            return result["value"]
+        if result and result.get("type") == "link":
+            log("  ⚠️ 收到的是邮箱验证链接，不是数字验证码")
+        return None
+
+    async def wait_for_verification(self, max_wait=120, interval=5) -> dict | None:
+        log(f"⏳ 通过自备邮箱 API 等待验证码或验证链接 (最长 {max_wait}s)...")
         start = time.time()
         attempt = 0
         while time.time() - start < max_wait:
@@ -911,20 +920,26 @@ class SelfEmailMail:
                 r.raise_for_status()
                 raw = r.text or ""
                 code = None
+                link = None
                 try:
                     data = r.json()
                     code = extract_code_from_api_payload(data)
+                    link = extract_verification_link_from_api_payload(data)
                 except Exception:
                     code = extract_code({"text": raw})
+                    link = extract_verification_link({"text": raw})
                 if code:
                     log(f"🔐 验证码: {code}")
-                    return code
+                    return {"type": "code", "value": code}
+                if link:
+                    log(f"🔗 验证链接: {link[:90]}...")
+                    return {"type": "link", "value": link}
                 if attempt % 3 == 1:
-                    log(f"  轮询 #{attempt} ({elapsed}s) 暂未获取验证码...")
+                    log(f"  轮询 #{attempt} ({elapsed}s) 暂未获取验证码或验证链接...")
             except Exception as e:
                 log(f"  自备邮箱 API 轮询出错: {e}")
             await asyncio.sleep(interval)
-        log("❌ 等待自备邮箱验证码超时")
+        log("❌ 等待自备邮箱验证码或验证链接超时")
         return None
 
     async def close(self):
@@ -954,6 +969,52 @@ def extract_code_from_api_payload(data) -> str | None:
             found = extract_code_from_api_payload(item)
             if found:
                 return found
+    return None
+
+def extract_verification_link_from_api_payload(data) -> str | None:
+    if isinstance(data, dict):
+        for key in ("verify_url", "verification_url", "url", "link"):
+            value = data.get(key)
+            if value:
+                found = extract_verification_link({"text": str(value)})
+                if found:
+                    return found
+        for key in ("html", "content", "body", "text", "message", "data"):
+            value = data.get(key)
+            if value is None:
+                continue
+            if isinstance(value, (dict, list)):
+                found = extract_verification_link_from_api_payload(value)
+            else:
+                found = extract_verification_link({"text": str(value)})
+            if found:
+                return found
+    if isinstance(data, list):
+        for item in data:
+            found = extract_verification_link_from_api_payload(item)
+            if found:
+                return found
+    return None
+
+def extract_verification_link(mail: dict) -> str | None:
+    body = (mail.get("html") or mail.get("content") or
+            mail.get("body") or mail.get("text") or "")
+    text = re.sub(r'&amp;', '&', str(body))
+    text = re.sub(r'<[^>]+>', ' ', text)
+    patterns = [
+        r'https://adobeid-na1\.services\.adobe\.com/ims/verify/v2/[^\s<>"\']+',
+        r'https://adobeid-[^\s<>"\']+/ims/verify/v2/[^\s<>"\']+',
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, re.I)
+        if m:
+            return m.group(0).strip().rstrip(').,;')
+    # Some plain-text mail renderers wrap long URLs across whitespace.
+    compact = re.sub(r'\s+', '', text)
+    for pattern in patterns:
+        m = re.search(pattern, compact, re.I)
+        if m:
+            return m.group(0).strip().rstrip(').,;')
     return None
 
 
@@ -1692,12 +1753,12 @@ async def run_self_email_microsoft_flow(ctx: BrowserContext, main_page: Page, ma
             return False
 
         try:
-            await adobe_page.wait_for_load_state("domcontentloaded", timeout=30000)
+            await adobe_page.wait_for_load_state("domcontentloaded", timeout=50000)
         except Exception:
             pass
         if adobe_page.url == before_create_url:
-            log("  ⏳ 已点击 Create account，等待 Adobe 进入下一步...")
-            await adobe_page.wait_for_timeout(3000)
+            log("  ⏳ 已点击 Create account，等待 Adobe 进入下一步（最长 50 秒）...")
+            await adobe_page.wait_for_timeout(50000)
 
         log("Step 6.5: 检查并处理图形验证码")
         captcha_ok = await wait_for_captcha_solved(adobe_page, log, shot, max_wait=180)
@@ -1725,13 +1786,51 @@ async def run_self_email_microsoft_flow(ctx: BrowserContext, main_page: Page, ma
         log("❌ 未识别到生日页、邮箱验证码页或 Adobe home，注册失败")
         return False
 
-    log("Step 7.1: 通过自备邮箱 API 获取验证码")
+    log("Step 7.1: 通过自备邮箱 API 获取验证码或验证链接")
     log("__SELF_EMAIL_VERIFICATION_SENT__")
-    code = await mail.wait_for_code(max_wait=120, interval=5)
-    if not code:
+    verification = await mail.wait_for_verification(max_wait=120, interval=5)
+    if not verification:
         log("❌ 验证邮件超时，注册失败")
         return False
 
+    if verification.get("type") == "link":
+        verify_link = verification["value"]
+        log("Step 7.2: 打开邮箱验证链接")
+        try:
+            await adobe_page.goto(verify_link, wait_until="domcontentloaded", timeout=60000)
+            await adobe_page.wait_for_timeout(5000)
+        except Exception as e:
+            log(f"❌ 打开邮箱验证链接失败: {e}")
+            return False
+
+        await click_any(adobe_page, [
+            "button:has-text('Continue')",
+            "button:has-text('继续')",
+            "a:has-text('Continue')",
+            "a:has-text('继续')",
+        ])
+
+        state, adobe_page = await wait_for_self_email_adobe_state(
+            ctx,
+            adobe_page,
+            timeout_ms=90000,
+            allow_dob=False,
+        )
+        if state == "home":
+            log("Step 8: 邮箱链接验证完成，进入 Adobe home")
+            log("Step 9: 补齐并导出 Cookie")
+            return await export_cookies_and_result(ctx, adobe_page, email_addr, account_password)
+
+        log("Step 8: 等待 Adobe 登录态落地")
+        session_ready = await wait_for_login_session(ctx, adobe_page, timeout_seconds=45)
+        if not session_ready:
+            log("❌ Adobe 主登录态未完成落地，注册失败")
+            return False
+
+        log("Step 9: 补齐并导出 Cookie")
+        return await export_cookies_and_result(ctx, adobe_page, email_addr, account_password)
+
+    code = verification["value"]
     log(f"Step 7.2: 输入验证码 [{code}]")
     await adobe_page.wait_for_timeout(1000)
     if await enter_email_verification_code(adobe_page, code):
