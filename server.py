@@ -949,6 +949,7 @@ async def execute_single_worker(task: Task, worker_index: int):
             return
         self_email = account["email"]
         env["SELF_EMAIL_ADDRESS"] = account["email"]
+        env["SELF_EMAIL_PASSWORD"] = account["password"]
         env["SELF_EMAIL_API_URL"] = account["api_url"]
         await task_manager.broadcast(f"{prefix} 📧 使用自备邮箱: {account['email']}")
 

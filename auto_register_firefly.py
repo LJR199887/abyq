@@ -33,6 +33,7 @@ EMAIL_DOMAIN = os.getenv("EMAIL_DOMAIN", "rossa.cfd")
 YESCAPTCHA_KEY = os.getenv("YESCAPTCHA_KEY", "")
 EMAIL_SOURCE = os.getenv("EMAIL_SOURCE", "temp")
 SELF_EMAIL_ADDRESS = os.getenv("SELF_EMAIL_ADDRESS", "")
+SELF_EMAIL_PASSWORD = os.getenv("SELF_EMAIL_PASSWORD", "")
 SELF_EMAIL_API_URL = os.getenv("SELF_EMAIL_API_URL", "")
 SHOW_BROWSER = os.getenv("SHOW_BROWSER", "0") == "1"
 PROXY_ENABLED = os.getenv("PROXY_ENABLED", "0") == "1"
@@ -505,14 +506,105 @@ async def wait_for_captcha_solved(page, log_fn, shot_fn, max_wait=300):
     except Exception:
         pass
 
-    has_captcha = False
-    for frame in page.frames:
-        url = frame.url
-        if "arkoselabs.com" in url or "arks-client.adobe.com" in url or "funcaptcha" in url or "/fc/" in url:
-            has_captcha = True
-            break
+    captcha_url_keywords = (
+        "arkoselabs.com",
+        "arkose",
+        "arks-client.adobe.com",
+        "funcaptcha",
+        "/fc/",
+    )
+    start_button_selectors = [
+        "text=Start puzzle",
+        "button:has-text('Start puzzle')",
+        "[role='button']:has-text('Start puzzle')",
+        "div:has-text('Start puzzle')",
+        "button:has-text('Verify')",
+        "[role='button']:has-text('Verify')",
+        "button:has-text('验证')",
+        "button:has-text('开始')",
+        "#home_children_button",
+        "[data-theme='home.verifyButton']"
+    ]
+    captcha_detect_selectors = [
+        "text=Please solve a few puzzles",
+        "text=Start puzzle",
+        *start_button_selectors,
+    ]
 
-    if not has_captcha:
+    async def frame_has_captcha(frame):
+        url = frame.url or ""
+        if any(keyword in url for keyword in captcha_url_keywords):
+            return True
+        for sel in captcha_detect_selectors:
+            try:
+                el = await frame.query_selector(sel)
+                if el and await el.is_visible():
+                    return True
+            except Exception:
+                pass
+        return False
+
+    async def find_captcha_frame():
+        for frame in page.frames:
+            if await frame_has_captcha(frame):
+                return frame
+        return None
+
+    async def reached_email_step():
+        url = page.url or ""
+        if "challenge/email-verification" in url or "email-verification" in url or "verify-email" in url:
+            return True
+        for sel in [
+            "input[autocomplete='one-time-code']",
+            "input[name='code']",
+            "#otp-input-0",
+            "input[data-index='0']",
+            "text=/verification code/i",
+            "text=/verify your email/i",
+            "text=/check your email/i",
+            "text=/enter.*code/i",
+            "text=验证码",
+            "text=驗證碼",
+        ]:
+            try:
+                el = await page.query_selector(sel)
+                if el and await el.is_visible():
+                    return True
+            except Exception:
+                pass
+        try:
+            visible_small_inputs = 0
+            inputs = await page.query_selector_all("input[maxlength='1'], input[data-index]")
+            for inp in inputs:
+                if not await inp.is_visible():
+                    continue
+                inp_id = (await inp.get_attribute("id") or "").lower()
+                inp_name = (await inp.get_attribute("name") or "").lower()
+                if "dateofbirth" in inp_id or "bday" in inp_name:
+                    continue
+                visible_small_inputs += 1
+            return visible_small_inputs >= 4
+        except Exception:
+            pass
+        return False
+
+    log_fn("  ⏳ 等待验证码组件或下一步页面加载...")
+    captcha_frame = None
+    detect_start = time.time()
+    while time.time() - detect_start < 45:
+        captcha_frame = await find_captcha_frame()
+        if captcha_frame:
+            break
+        if await reached_email_step():
+            log_fn("  ✅ 已进入邮箱验证码步骤，无需处理图形验证码")
+            return True
+        await page.wait_for_timeout(500)
+
+    if not captcha_frame:
+        frame_urls = [frame.url or "about:blank" for frame in page.frames]
+        log_fn(f"  ⚠️ 未检测到验证码，当前 frame 数: {len(frame_urls)}")
+        for idx, url in enumerate(frame_urls[:8], 1):
+            log_fn(f"    frame[{idx}]: {url[:160]}")
         log_fn("  ✅ 未检测到验证码，继续...")
         return True
 
@@ -522,28 +614,23 @@ async def wait_for_captcha_solved(page, log_fn, shot_fn, max_wait=300):
     # 主动点击 Start puzzle / Verify 按钮
     click_time = time.time()
     clicked = False
-    selectors = [
-        "button:has-text('Start puzzle')",
-        "button:has-text('Verify')",
-        "button:has-text('验证')",
-        "button:has-text('开始')",
-        "#home_children_button",
-        "[data-theme='home.verifyButton']"
-    ]
     while time.time() - click_time < 15:
-        for frame in page.frames:
-            if "arks-client.adobe.com" in frame.url or "arkoselabs.com" in frame.url or "funcaptcha" in frame.url:
-                for sel in selectors:
-                    try:
-                        btn = await frame.query_selector(sel)
-                        if btn and await btn.is_visible():
-                            await btn.click()
-                            log_fn(f"  👉 成功点击验证起始按钮！")
-                            clicked = True
-                            break
-                    except Exception:
-                        pass
-                if clicked: break
+        candidate_frames = [captcha_frame]
+        candidate_frames.extend(frame for frame in page.frames if frame != captcha_frame)
+        for frame in candidate_frames:
+            if not await frame_has_captcha(frame):
+                continue
+            for sel in start_button_selectors:
+                try:
+                    btn = await frame.query_selector(sel)
+                    if btn and await btn.is_visible():
+                        await btn.click()
+                        log_fn(f"  👉 成功点击验证起始按钮！")
+                        clicked = True
+                        break
+                except Exception:
+                    pass
+            if clicked: break
         if clicked: break
         await page.wait_for_timeout(1000)
 
@@ -850,7 +937,7 @@ def extract_code_from_api_payload(data) -> str | None:
             value = data.get(key)
             if value:
                 m = re.search(r"\b(\d{4,8})\b", str(value))
-                if m:
+                if m and len(set(m.group(1))) > 1:
                     return m.group(1)
         for key in ("html", "content", "body", "text", "message", "data"):
             value = data.get(key)
@@ -874,14 +961,26 @@ def extract_code(mail: dict) -> str | None:
     body = (mail.get("html") or mail.get("content") or
             mail.get("body") or mail.get("text") or "")
     text = re.sub(r'<[^>]+>', ' ', body)
-    # "验证码: 123456"
-    m = re.search(r'(?:验证码|驗證碼|code|OTP)[:\s]*(\d{4,6})', text, re.I)
+
+    def valid_code(candidate: str) -> str | None:
+        if not candidate:
+            return None
+        if len(set(candidate)) == 1:
+            return None
+        return candidate
+
+    # "验证码: 123456" / "Your verification code is: 359619"
+    m = re.search(r'(?:验证码|驗證碼|verification\s+code|code|OTP)(?:\s+is)?[:\s]*(\d{4,8})', text, re.I)
     if m:
-        return m.group(1)
+        code = valid_code(m.group(1))
+        if code:
+            return code
     # 独立 6 位数字
     m = re.search(r'\b(\d{6})\b', text)
     if m:
-        return m.group(1)
+        code = valid_code(m.group(1))
+        if code:
+            return code
     return None
 
 
@@ -923,6 +1022,220 @@ async def click_any(page: Page, selectors: list) -> bool:
             continue
     return False
 
+async def wait_click_any(page: Page, selectors: list, timeout_ms: int = 30000) -> bool:
+    end_at = time.time() + timeout_ms / 1000
+    while time.time() < end_at:
+        if page.is_closed():
+            return False
+        if await click_any(page, selectors):
+            return True
+        await page.wait_for_timeout(500)
+    return False
+
+async def wait_fill_any(page: Page, selectors: list, value: str, timeout_ms: int = 30000) -> bool:
+    end_at = time.time() + timeout_ms / 1000
+    while time.time() < end_at:
+        if page.is_closed():
+            return False
+        if await fill(page, selectors, value):
+            return True
+        await page.wait_for_timeout(500)
+    return False
+
+async def wait_for_url_keywords(page: Page, keywords: list[str], timeout_ms: int = 30000) -> bool:
+    end_at = time.time() + timeout_ms / 1000
+    while time.time() < end_at:
+        if page.is_closed():
+            return False
+        url = page.url or ""
+        if any(keyword in url for keyword in keywords):
+            return True
+        await page.wait_for_timeout(500)
+    return False
+
+async def pick_page_by_url_keywords(ctx: BrowserContext, fallback: Page, keywords: list[str], timeout_ms: int = 30000) -> Page:
+    end_at = time.time() + timeout_ms / 1000
+    while time.time() < end_at:
+        for candidate in list(ctx.pages):
+            if candidate.is_closed():
+                continue
+            url = candidate.url or ""
+            if any(keyword in url for keyword in keywords):
+                return candidate
+        if not fallback.is_closed():
+            url = fallback.url or ""
+            if any(keyword in url for keyword in keywords):
+                return fallback
+            await fallback.wait_for_timeout(500)
+        else:
+            await asyncio.sleep(0.5)
+    return fallback
+
+async def enter_email_verification_code(page: Page, code: str) -> bool:
+    first_input_ok = False
+    for sel in [
+        "input[data-index='0']", "input[name='code']",
+        "input[aria-label*='1']",
+        "#otp-input-0", "input[maxlength='1']:first-of-type",
+        "input[autocomplete='one-time-code']",
+    ]:
+        try:
+            el = await page.query_selector(sel)
+            if el and await el.is_visible():
+                await el.click()
+                first_input_ok = True
+                break
+        except Exception:
+            continue
+
+    if not first_input_ok:
+        inputs = await page.query_selector_all("input")
+        for inp in inputs:
+            try:
+                if await inp.is_visible():
+                    box = await inp.bounding_box()
+                    inp_id = (await inp.get_attribute("id") or "").lower()
+                    inp_name = (await inp.get_attribute("name") or "").lower()
+                    if "dateofbirth" in inp_id or "bday" in inp_name:
+                        continue
+                    if box and box["width"] < 120:
+                        await inp.click()
+                        first_input_ok = True
+                        break
+            except Exception:
+                continue
+
+    if not first_input_ok:
+        return False
+
+    await page.wait_for_timeout(300)
+    await page.keyboard.type(code, delay=150)
+    return True
+
+async def page_has_visible_selector(page: Page, selectors: list[str]) -> bool:
+    if page.is_closed():
+        return False
+    for sel in selectors:
+        try:
+            el = await page.query_selector(sel)
+            if el and await el.is_visible():
+                return True
+        except Exception:
+            pass
+    return False
+
+def is_adobe_home_url(url: str) -> bool:
+    url = (url or "").lower()
+    return "adobe.com/home" in url
+
+def is_adobe_home_token_callback(url: str) -> bool:
+    url = (url or "").lower()
+    return is_adobe_home_url(url) and "#access_token=" in url
+
+DOB_YEAR_SELECTORS = [
+    "#Signup-DateOfBirthChooser-Year",
+    "input[data-id='DateOfBirthChooser-Year']",
+    "input[name='bday-year']",
+    "input[autocomplete='bday-year']",
+]
+
+async def page_has_email_verification_marker(page: Page) -> bool:
+    if page.is_closed():
+        return False
+    text_selectors = [
+        "text=/verification code/i",
+        "text=/verify your email/i",
+        "text=/check your email/i",
+        "text=/enter.*code/i",
+        "text=验证码",
+        "text=驗證碼",
+    ]
+    single_code_selectors = [
+        "input[autocomplete='one-time-code']",
+        "input[name='code']",
+        "#otp-input-0",
+        "input[data-index='0']",
+    ]
+    url = page.url or ""
+    if "challenge/email-verification" in url or "email-verification" in url or "verify-email" in url:
+        return True
+    if await page_has_visible_selector(page, text_selectors):
+        return True
+    if await page_has_visible_selector(page, single_code_selectors):
+        return True
+    try:
+        visible_small_inputs = 0
+        inputs = await page.query_selector_all("input[maxlength='1'], input[data-index]")
+        for inp in inputs:
+            if not await inp.is_visible():
+                continue
+            inp_id = (await inp.get_attribute("id") or "").lower()
+            inp_name = (await inp.get_attribute("name") or "").lower()
+            if "dateofbirth" in inp_id or "bday" in inp_name:
+                continue
+            visible_small_inputs += 1
+        if visible_small_inputs >= 4:
+            return True
+    except Exception:
+        pass
+    return False
+
+async def wait_for_email_verification_step(page: Page, timeout_ms: int = 90000) -> bool:
+    end_at = time.time() + timeout_ms / 1000
+    while time.time() < end_at:
+        if page.is_closed():
+            return False
+        if await page_has_email_verification_marker(page):
+            return True
+        await page.wait_for_timeout(500)
+    return False
+
+async def wait_for_self_email_adobe_state(
+    ctx: BrowserContext,
+    fallback: Page,
+    timeout_ms: int = 120000,
+    allow_dob: bool = True,
+) -> tuple[str | None, Page]:
+    end_at = time.time() + timeout_ms / 1000
+    home_page = None
+    home_since = None
+    while time.time() < end_at:
+        pages = [page for page in list(ctx.pages) if not page.is_closed()]
+        if fallback and not fallback.is_closed() and fallback not in pages:
+            pages.append(fallback)
+
+        for candidate in pages:
+            if await page_has_email_verification_marker(candidate):
+                return "email", candidate
+            if allow_dob and await page_has_visible_selector(candidate, DOB_YEAR_SELECTORS):
+                return "dob", candidate
+
+        current_home_page = None
+        for candidate in pages:
+            if is_adobe_home_url(candidate.url):
+                current_home_page = candidate
+                break
+
+        now = time.time()
+        if current_home_page:
+            if home_page != current_home_page:
+                home_page = current_home_page
+                home_since = now
+                log("  ⏳ 检测到 Adobe home，开始 22 秒稳定等待...")
+            elif home_since and now - home_since >= 22:
+                log("  ✅ Adobe home 已稳定停留 22 秒，判定注册成功")
+                return "home", current_home_page
+        else:
+            home_page = None
+            home_since = None
+
+        if fallback and not fallback.is_closed():
+            await fallback.wait_for_timeout(500)
+        else:
+            await asyncio.sleep(0.5)
+
+    return None, fallback
+
 async def collect_core_cookies(ctx: BrowserContext, cookie_keys: list[str]) -> dict:
     all_cookies = await ctx.cookies([
         "https://firefly.adobe.com",
@@ -945,8 +1258,11 @@ def is_auth_success_callback(url: str) -> bool:
     if not url:
         return False
     return (
-        "auth-light.identity.adobe.com/wrapper-popup-helper/index.html" in url
-        and "#access_token=" in url
+        (
+            "auth-light.identity.adobe.com/wrapper-popup-helper/index.html" in url
+            and "#access_token=" in url
+        )
+        or is_adobe_home_token_callback(url)
     )
 
 async def wait_for_complete_core_cookies(ctx: BrowserContext, page: Page, cookie_keys: list[str], timeout_seconds: int = 20) -> dict:
@@ -956,13 +1272,21 @@ async def wait_for_complete_core_cookies(ctx: BrowserContext, page: Page, cookie
         ("Adobe 账户页", "https://account.adobe.com"),
         ("Firefly 首页", "https://firefly.adobe.com"),
     ]
-    try:
-        label, url = warmup_urls[0]
-        log(f"  → 打开 {label}")
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    if is_adobe_home_token_callback(page.url):
+        log("  ✅ 当前为 Adobe home access_token 回调页，先等待会话写入")
         await page.wait_for_timeout(5000)
-    except Exception as e:
-        log(f"  ⚠️ 打开 Firefly 首页失败，继续尝试读取 Cookie: {e}")
+        cookie_by_name = await collect_core_cookies(ctx, cookie_keys)
+        found_keys = [key for key in cookie_keys if key in cookie_by_name]
+        if found_keys:
+            log(f"  ℹ️ 回调页已获取 Cookie: {len(found_keys)}/7 ({', '.join(found_keys)})")
+    else:
+        try:
+            label, url = warmup_urls[0]
+            log(f"  → 打开 {label}")
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(5000)
+        except Exception as e:
+            log(f"  ⚠️ 打开 Firefly 首页失败，继续尝试读取 Cookie: {e}")
 
     refresh_done = False
     warmup_index = 1
@@ -1059,6 +1383,355 @@ async def wait_for_login_session(ctx: BrowserContext, page: Page, timeout_second
         await page.wait_for_timeout(2000)
 
     return False
+
+async def export_cookies_and_result(ctx: BrowserContext, page: Page, email_addr: str, password: str) -> bool:
+    log("━" * 50)
+    AUTH_COOKIE_KEYS = [
+        'ims_sid', 'aux_sid', 'fg', 'relay', 'ftrset',
+        'filter-profile-map', 'filter-profile-map-permanent',
+    ]
+    try:
+        cookie_by_name = await wait_for_complete_core_cookies(ctx, page, AUTH_COOKIE_KEYS, timeout_seconds=24)
+        if not cookie_by_name:
+            log("  ❌ 未获取到 Cookie，注册失败")
+            return False
+
+        missing_keys = [key for key in AUTH_COOKIE_KEYS if key not in cookie_by_name]
+        if missing_keys:
+            found_keys = [key for key in AUTH_COOKIE_KEYS if key in cookie_by_name]
+            log(f"  ❌ Cookie 不完整，缺少 {len(missing_keys)} 个核心字段: {', '.join(missing_keys)}")
+            log(f"  ℹ️ 当前仅获取到 {len(found_keys)}/7: {', '.join(found_keys) if found_keys else '无'}")
+            return False
+
+        unique = [cookie_by_name[key] for key in AUTH_COOKIE_KEYS]
+        cookie_header = "; ".join(
+            f"{c['name']}={c['value']}" for c in unique
+        )
+
+        cookie_id = os.getenv("COOKIE_ID", "")
+        if cookie_id:
+            cookie_file = os.path.join(SCREENSHOT_DIR, f"cookie_{cookie_id}.json")
+        else:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            cookie_file = os.path.join(SCREENSHOT_DIR, f"cookie_{ts}.json")
+        cookie_data = {
+            "cookie": cookie_header,
+            "name": email_addr
+        }
+        with open(cookie_file, "w", encoding="utf-8") as f:
+            json.dump(cookie_data, f, ensure_ascii=False, indent=4)
+        log(f"  🍪 已导出完整核心 Cookie ({len(unique)}/7)")
+        log(f"  📁 文件: {cookie_file}")
+    except Exception as e:
+        log(f"  ❌ Cookie 导出失败: {e}")
+        return False
+
+    log("━" * 50)
+    result = {
+        "email": email_addr, "email_id": mail_email_id(email_addr),
+        "password": password,
+        "name": f"{LAST_NAME} {FIRST_NAME}",
+        "url": page.url,
+        "time": datetime.now().isoformat(),
+    }
+    with open(os.path.join(SCREENSHOT_DIR, "result.json"), "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=4)
+    log(f"  结果已保存到 {os.path.join(SCREENSHOT_DIR, 'result.json')}")
+    return True
+
+def mail_email_id(email_addr: str) -> str:
+    return SELF_EMAIL_ADDRESS if EMAIL_SOURCE == "self" else email_addr
+
+async def pick_active_auth_page(ctx: BrowserContext, fallback: Page, timeout_ms: int = 60000) -> Page:
+    end_at = time.time() + timeout_ms / 1000
+    auth_keywords = [
+        "auth.services.adobe.com",
+        "auth-light.identity.adobe.com",
+        "adobeid-na1.services.adobe.com",
+    ]
+    while time.time() < end_at:
+        for candidate in list(ctx.pages):
+            if candidate.is_closed():
+                continue
+            url = candidate.url or ""
+            if any(keyword in url for keyword in auth_keywords):
+                return candidate
+        if not fallback.is_closed():
+            url = fallback.url or ""
+            if any(keyword in url for keyword in auth_keywords):
+                return fallback
+        if fallback.is_closed():
+            await asyncio.sleep(0.5)
+        else:
+            await fallback.wait_for_timeout(500)
+    return fallback
+
+async def maybe_handle_microsoft_post_login(page: Page):
+    for _ in range(6):
+        if page.is_closed():
+            return
+        url = page.url or ""
+        if "login.microsoftonline.com" not in url and "login.live.com" not in url:
+            return
+        clicked = await click_any(page, [
+            "#idSIButton9",
+            "button[data-testid='primaryButton']:has-text('是')",
+            "button[data-testid='primaryButton']:has-text('Yes')",
+            "input[type='submit'][value='是']",
+            "input[type='submit'][value='Yes']",
+        ])
+        if not clicked:
+            clicked = await click_any(page, [
+                "#idBtn_Back",
+                "button:has-text('否')",
+                "button:has-text('No')",
+            ])
+        try:
+            await page.wait_for_timeout(1500 if clicked else 1000)
+        except Exception:
+            return
+
+async def run_self_email_microsoft_flow(ctx: BrowserContext, main_page: Page, mail, email_addr: str) -> bool:
+    if not SELF_EMAIL_PASSWORD:
+        log("❌ 自备邮箱缺少密码，无法走 Microsoft 登录专属模式")
+        return False
+
+    account_password = SELF_EMAIL_PASSWORD
+
+    log("━" * 50)
+    log("自备邮箱专属模式: Adobe 首页 Microsoft 注册")
+
+    log("Step 1: 打开 Adobe 首页")
+    await main_page.goto("https://www.adobe.com/", wait_until="domcontentloaded", timeout=50000)
+    await main_page.wait_for_timeout(3000)
+
+    log("Step 2: 点击登录")
+    signed_in_clicked = await wait_click_any(main_page, [
+        "button[data-test-id='unav-profile--sign-in']",
+        "button.profile-comp.secondary-button",
+        "a:has-text('Sign in')",
+        "button:has-text('Sign in')",
+        "a:has-text('登录')",
+        "button:has-text('登录')",
+    ], timeout_ms=30000)
+    if not signed_in_clicked:
+        log("❌ 未找到 Adobe 首页登录按钮")
+        return False
+
+    await main_page.wait_for_load_state("domcontentloaded", timeout=30000)
+    await main_page.wait_for_timeout(3000)
+
+    auth_page = await pick_active_auth_page(ctx, main_page, timeout_ms=30000)
+
+    log("Step 3: 点击创建账户")
+    created_clicked = await wait_click_any(auth_page, [
+        "[data-id='EmailPage-CreateAccountLink']",
+        "span[role='link']:has-text('Create an account')",
+        "a:has-text('Create an account')",
+        "text=Create an account",
+        "span[role='link']:has-text('创建账户')",
+        "text=创建账户",
+    ], timeout_ms=30000)
+    if not created_clicked:
+        log("❌ 未找到 Create an account 入口")
+        return False
+
+    await auth_page.wait_for_timeout(2000)
+
+    log("Step 4: 选择 Microsoft 邮箱登录")
+    popup_task = asyncio.create_task(auth_page.wait_for_event("popup", timeout=8000))
+    microsoft_clicked = await wait_click_any(auth_page, [
+        "button[data-provider='microsoft']",
+        "button[data-social-provider='Microsoft']",
+        "button[data-id='Social-MicrosoftSignInButton']",
+        "button[aria-label*='Microsoft']",
+        "img[alt*='Microsoft']",
+    ], timeout_ms=30000)
+    if not microsoft_clicked:
+        popup_task.cancel()
+        log("❌ 未找到 Microsoft 登录按钮")
+        return False
+
+    ms_page = auth_page
+    try:
+        popup = await popup_task
+        if popup:
+            ms_page = popup
+            await ms_page.wait_for_load_state("domcontentloaded", timeout=30000)
+    except Exception:
+        ms_page = auth_page
+
+    ms_page = await pick_page_by_url_keywords(
+        ctx,
+        ms_page,
+        ["login.microsoftonline.com", "login.live.com"],
+        timeout_ms=45000,
+    )
+    if not await wait_for_url_keywords(ms_page, ["login.microsoftonline.com", "login.live.com"], timeout_ms=5000):
+        log("❌ 未跳转到 Microsoft 登录页")
+        return False
+
+    log("Step 4.1: 输入 Microsoft 邮箱")
+    ok = await wait_fill_any(ms_page, [
+        "#i0116",
+        "input[name='loginfmt']",
+        "input[type='email']",
+        "input[autocomplete*='username']",
+    ], email_addr, timeout_ms=45000)
+    if not ok:
+        log("❌ 未找到 Microsoft 邮箱输入框")
+        return False
+
+    log("Step 4.2: 点击下一步")
+    await wait_click_any(ms_page, [
+        "#idSIButton9",
+        "input[type='submit']",
+        "button[type='submit']:has-text('下一步')",
+        "button[type='submit']:has-text('Next')",
+    ], timeout_ms=30000)
+
+    log("Step 4.3: 输入 Microsoft 邮箱密码")
+    ok = await wait_fill_any(ms_page, [
+        "#passwordEntry",
+        "#i0118",
+        "input[name='passwd']",
+        "input[type='password']",
+        "input[autocomplete='current-password']",
+    ], account_password, timeout_ms=45000)
+    if not ok:
+        log("❌ 未找到 Microsoft 密码输入框")
+        return False
+
+    log("Step 4.4: 点击下一步")
+    await wait_click_any(ms_page, [
+        "button[data-testid='primaryButton']",
+        "#idSIButton9",
+        "input[type='submit']",
+        "button[type='submit']:has-text('下一步')",
+        "button[type='submit']:has-text('Next')",
+    ], timeout_ms=30000)
+    await ms_page.wait_for_timeout(3000)
+    await maybe_handle_microsoft_post_login(ms_page)
+
+    log("Step 5: 等待 Adobe 返回状态")
+    state, adobe_page = await wait_for_self_email_adobe_state(
+        ctx,
+        ms_page if not ms_page.is_closed() else main_page,
+        timeout_ms=120000,
+        allow_dob=True,
+    )
+
+    if state == "home":
+        log("Step 8: 已跳过生日和邮箱验证码，直接进入 Adobe home")
+        log("Step 9: 补齐并导出 Cookie")
+        return await export_cookies_and_result(ctx, adobe_page, email_addr, account_password)
+
+    if state == "dob":
+        log("Step 5.1: 补充生日信息")
+        ok = await wait_fill_any(adobe_page, DOB_YEAR_SELECTORS, BIRTH_YEAR, timeout_ms=45000)
+        if not ok:
+            log("❌ 未找到生日年份输入框")
+            return False
+        log(f"  年份: ✅ {BIRTH_YEAR}")
+
+        month_clicked = await wait_click_any(adobe_page, [
+            "#Signup-DateOfBirthChooser-Month",
+            "[data-id='DateOfBirthChooser-Month']",
+            "button[aria-labelledby*='DateOfBirthChooser']",
+            "span:has-text('Select')",
+            "span:has-text('选择')",
+        ], timeout_ms=30000)
+        if month_clicked:
+            await adobe_page.wait_for_timeout(800)
+            mi = int(BIRTH_MONTH)
+            for _ in range(mi):
+                await adobe_page.keyboard.press("ArrowDown")
+                await adobe_page.wait_for_timeout(100)
+            await adobe_page.keyboard.press("Enter")
+            log(f"  月份: ✅ {BIRTH_MONTH}")
+        else:
+            log("❌ 未找到生日月份选择框")
+            return False
+
+        log("Step 6: 点击 Create account")
+        before_create_url = adobe_page.url
+        create_ok = await wait_click_any(adobe_page, [
+            "button[data-id='Signup-CreateAccountBtn']",
+            "button:has-text('Create account')",
+            "button:has-text('创建账户')",
+        ], timeout_ms=30000)
+        if not create_ok:
+            log("❌ 未找到 Create account 提交按钮")
+            return False
+
+        try:
+            await adobe_page.wait_for_load_state("domcontentloaded", timeout=30000)
+        except Exception:
+            pass
+        if adobe_page.url == before_create_url:
+            log("  ⏳ 已点击 Create account，等待 Adobe 进入下一步...")
+            await adobe_page.wait_for_timeout(3000)
+
+        log("Step 6.5: 检查并处理图形验证码")
+        captcha_ok = await wait_for_captcha_solved(adobe_page, log, shot, max_wait=180)
+        if not captcha_ok:
+            log("❌ 图形验证码未能通过，注册失败")
+            return False
+
+        log("Step 7: 等待跳转到邮箱验证码页面")
+        state, adobe_page = await wait_for_self_email_adobe_state(
+            ctx,
+            adobe_page,
+            timeout_ms=120000,
+            allow_dob=False,
+        )
+        if state == "home":
+            log("Step 8: 已跳过邮箱验证码，直接进入 Adobe home")
+            log("Step 9: 补齐并导出 Cookie")
+            return await export_cookies_and_result(ctx, adobe_page, email_addr, account_password)
+        if state != "email":
+            log("❌ 未检测到邮箱验证码输入页面，注册失败")
+            return False
+    elif state == "email":
+        log("Step 6: 已跳过生日信息，直接进入邮箱验证码页面")
+    else:
+        log("❌ 未识别到生日页、邮箱验证码页或 Adobe home，注册失败")
+        return False
+
+    log("Step 7.1: 通过自备邮箱 API 获取验证码")
+    log("__SELF_EMAIL_VERIFICATION_SENT__")
+    code = await mail.wait_for_code(max_wait=120, interval=5)
+    if not code:
+        log("❌ 验证邮件超时，注册失败")
+        return False
+
+    log(f"Step 7.2: 输入验证码 [{code}]")
+    await adobe_page.wait_for_timeout(1000)
+    if await enter_email_verification_code(adobe_page, code):
+        log(f"  ✅ 验证码已逐位输入: {code}")
+    else:
+        log(f"  ⚠️ 未找到验证码输入框，验证码: {code}")
+        return False
+
+    await wait_click_any(adobe_page, [
+        "button:has-text('验证')", "button:has-text('Verify')",
+        "button:has-text('提交')", "button[type='submit']",
+    ], timeout_ms=30000)
+    log("  → 提交验证码")
+
+    log("Step 8: 等待 Adobe 登录态落地")
+    session_ready = await wait_for_login_session(ctx, adobe_page, timeout_seconds=45)
+    if not session_ready:
+        log("❌ Adobe 主登录态未完成落地，注册失败")
+        return False
+
+    log("Step 9: 补齐并导出 Cookie")
+    if not await export_cookies_and_result(ctx, adobe_page, email_addr, account_password):
+        return False
+
+    log("Step 10: 保存注册结果")
+    log("Step 11: 收尾清理")
+    return True
 
 
 # ════════════════════════ 注册页面 URL ════════════════════════
@@ -1214,6 +1887,13 @@ async def main():
         main_page.set_default_timeout(30000)
 
         try:
+            if EMAIL_SOURCE == "self":
+                ok = await run_self_email_microsoft_flow(ctx, main_page, mail, email_addr)
+                if ok:
+                    log("━" * 50)
+                    log("🎉 自备邮箱专属流程已完成!")
+                return
+
             # ══════════════════════════════════════
             # Step 1: 直接打开 Adobe 注册页面
             # ══════════════════════════════════════
