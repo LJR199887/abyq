@@ -1656,6 +1656,17 @@ async def maybe_click_continue_with_microsoft(page: Page) -> bool:
         "button[aria-label*='Microsoft']",
     ], timeout_ms=15000)
 
+async def click_email_verified_continue(page: Page) -> bool:
+    return await wait_click_any(page, [
+        "button:has-text('Continue')",
+        "[role='button']:has-text('Continue')",
+        "a:has-text('Continue')",
+        "input[type='submit'][value='Continue']",
+        "button:has-text('继续')",
+        "[role='button']:has-text('继续')",
+        "a:has-text('继续')",
+    ], timeout_ms=45000)
+
 async def run_self_email_microsoft_flow(ctx: BrowserContext, main_page: Page, mail, email_addr: str) -> bool:
     if not SELF_EMAIL_PASSWORD:
         log("❌ 自备邮箱缺少密码，无法走 Microsoft 登录专属模式")
@@ -1901,6 +1912,13 @@ async def run_self_email_microsoft_flow(ctx: BrowserContext, main_page: Page, ma
             log(f"❌ 打开邮箱验证链接失败: {e}")
             return False
 
+        clicked_verified_continue = await click_email_verified_continue(adobe_page)
+        if clicked_verified_continue:
+            log("  → 点击邮箱验证完成页 Continue")
+            await adobe_page.wait_for_timeout(3000)
+        else:
+            log("  ⚠️ 未找到邮箱验证完成页 Continue，继续尝试后续状态检测")
+
         clicked_continue = await maybe_click_continue_with_microsoft(adobe_page)
         if clicked_continue:
             log("  → 点击 Continue with Microsoft")
@@ -1917,13 +1935,6 @@ async def run_self_email_microsoft_flow(ctx: BrowserContext, main_page: Page, ma
             ):
                 await maybe_handle_microsoft_post_login(ms_followup_page)
                 adobe_page = await pick_active_auth_page(ctx, adobe_page, timeout_ms=30000)
-
-        await click_any(adobe_page, [
-            "button:has-text('Continue')",
-            "button:has-text('继续')",
-            "a:has-text('Continue')",
-            "a:has-text('继续')",
-        ])
 
         state, adobe_page = await wait_for_self_email_adobe_state(
             ctx,
