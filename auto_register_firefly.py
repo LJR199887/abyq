@@ -1061,6 +1061,35 @@ async def shot(page: Page, name: str):
     """截图已禁用，保留接口兼容"""
     pass
 
+async def goto_with_retries(
+    page: Page,
+    url: str,
+    *,
+    label: str = "页面",
+    attempts: int = 3,
+    timeout_ms: int = 50000,
+    wait_until: str = "domcontentloaded",
+) -> bool:
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            if attempt > 1:
+                try:
+                    await page.goto("about:blank", wait_until="load", timeout=10000)
+                except Exception:
+                    pass
+                delay_ms = min(10000, 2000 * attempt)
+                log(f"  ⏳ {label} 第 {attempt}/{attempts} 次重试前等待 {delay_ms // 1000}s")
+                await page.wait_for_timeout(delay_ms)
+            await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+            return True
+        except Exception as e:
+            last_error = e
+            message = str(e).splitlines()[0]
+            log(f"  ⚠️ {label} 打开失败，第 {attempt}/{attempts} 次: {message}")
+    log(f"❌ {label} 打开失败，已重试 {attempts} 次: {last_error}")
+    return False
+
 async def fill(page: Page, selectors: list, value: str) -> bool:
     for sel in selectors:
         try:
@@ -1091,6 +1120,34 @@ async def wait_click_any(page: Page, selectors: list, timeout_ms: int = 30000) -
         if await click_any(page, selectors):
             return True
         await page.wait_for_timeout(500)
+    return False
+
+async def wait_for_load_or_click(page: Page, selectors: list, timeout_ms: int = 60000) -> bool:
+    end_at = time.time() + timeout_ms / 1000
+    networkidle_task = asyncio.create_task(page.wait_for_load_state("networkidle", timeout=timeout_ms))
+    try:
+        while time.time() < end_at:
+            if page.is_closed():
+                return False
+            if await click_any(page, selectors):
+                return True
+            if networkidle_task.done():
+                # Give lazy UI a short moment after network idle, then keep polling.
+                await page.wait_for_timeout(500)
+            else:
+                await page.wait_for_timeout(250)
+    finally:
+        if not networkidle_task.done():
+            networkidle_task.cancel()
+            try:
+                await networkidle_task
+            except BaseException:
+                pass
+        else:
+            try:
+                networkidle_task.exception()
+            except BaseException:
+                pass
     return False
 
 async def wait_fill_any(page: Page, selectors: list, value: str, timeout_ms: int = 30000) -> bool:
@@ -1213,6 +1270,13 @@ def is_adobe_home_token_callback(url: str) -> bool:
     url = (url or "").lower()
     return is_adobe_home_url(url) and "#access_token=" in url
 
+def is_unsupported_browser_verify_url(url: str) -> bool:
+    url = (url or "").lower()
+    return (
+        "adobe.com/home/errors/unsupportedbrowser.html" in url
+        or "adobe.com/home/errors/unsupported-browser" in url
+    )
+
 DOB_YEAR_SELECTORS = [
     "#Signup-DateOfBirthChooser-Year",
     "input[data-id='DateOfBirthChooser-Year']",
@@ -1288,6 +1352,9 @@ async def wait_for_self_email_adobe_state(
         for candidate in pages:
             if await page_has_email_verification_marker(candidate):
                 return "email", candidate
+            if is_unsupported_browser_verify_url(candidate.url):
+                log("  ⚠️ 检测到 unsupportedBrowser 页面，需要通过邮件验证链接完成认证")
+                return "link", candidate
             if allow_dob and await page_has_visible_selector(candidate, DOB_YEAR_SELECTORS):
                 return "dob", candidate
 
@@ -1579,6 +1646,16 @@ async def maybe_handle_microsoft_post_login(page: Page):
         except Exception:
             return
 
+async def maybe_click_continue_with_microsoft(page: Page) -> bool:
+    return await wait_click_any(page, [
+        "button:has-text('Continue with Microsoft')",
+        "[role='button']:has-text('Continue with Microsoft')",
+        "text=Continue with Microsoft",
+        "button[data-provider='microsoft']",
+        "button[data-social-provider='Microsoft']",
+        "button[aria-label*='Microsoft']",
+    ], timeout_ms=15000)
+
 async def run_self_email_microsoft_flow(ctx: BrowserContext, main_page: Page, mail, email_addr: str) -> bool:
     if not SELF_EMAIL_PASSWORD:
         log("❌ 自备邮箱缺少密码，无法走 Microsoft 登录专属模式")
@@ -1590,18 +1667,35 @@ async def run_self_email_microsoft_flow(ctx: BrowserContext, main_page: Page, ma
     log("自备邮箱专属模式: Adobe 首页 Microsoft 注册")
 
     log("Step 1: 打开 Adobe 首页")
-    await main_page.goto("https://www.adobe.com/", wait_until="domcontentloaded", timeout=50000)
-    await main_page.wait_for_timeout(3000)
+    if not await goto_with_retries(
+        main_page,
+        "https://www.adobe.com/",
+        label="Adobe 首页",
+        attempts=3,
+        timeout_ms=80000,
+    ):
+        return False
 
     log("Step 2: 点击登录")
-    signed_in_clicked = await wait_click_any(main_page, [
+    sign_in_selectors = [
         "button[data-test-id='unav-profile--sign-in']",
         "button.profile-comp.secondary-button",
         "a:has-text('Sign in')",
         "button:has-text('Sign in')",
         "a:has-text('登录')",
         "button:has-text('登录')",
-    ], timeout_ms=30000)
+    ]
+    signed_in_clicked = await wait_for_load_or_click(main_page, sign_in_selectors, timeout_ms=60000)
+    if not signed_in_clicked:
+        log("  ⚠️ 首次未找到登录按钮，刷新 Adobe 首页后重试")
+        if await goto_with_retries(
+            main_page,
+            "https://www.adobe.com/",
+            label="Adobe 首页刷新",
+            attempts=2,
+            timeout_ms=80000,
+        ):
+            signed_in_clicked = await wait_for_load_or_click(main_page, sign_in_selectors, timeout_ms=60000)
     if not signed_in_clicked:
         log("❌ 未找到 Adobe 首页登录按钮")
         return False
@@ -1777,11 +1871,15 @@ async def run_self_email_microsoft_flow(ctx: BrowserContext, main_page: Page, ma
             log("Step 8: 已跳过邮箱验证码，直接进入 Adobe home")
             log("Step 9: 补齐并导出 Cookie")
             return await export_cookies_and_result(ctx, adobe_page, email_addr, account_password)
-        if state != "email":
+        if state == "link":
+            log("Step 7: 检测到 unsupportedBrowser 页面，改用邮箱验证链接")
+        elif state != "email":
             log("❌ 未检测到邮箱验证码输入页面，注册失败")
             return False
     elif state == "email":
         log("Step 6: 已跳过生日信息，直接进入邮箱验证码页面")
+    elif state == "link":
+        log("Step 6: 检测到 unsupportedBrowser 页面，改用邮箱验证链接")
     else:
         log("❌ 未识别到生日页、邮箱验证码页或 Adobe home，注册失败")
         return False
@@ -1802,6 +1900,23 @@ async def run_self_email_microsoft_flow(ctx: BrowserContext, main_page: Page, ma
         except Exception as e:
             log(f"❌ 打开邮箱验证链接失败: {e}")
             return False
+
+        clicked_continue = await maybe_click_continue_with_microsoft(adobe_page)
+        if clicked_continue:
+            log("  → 点击 Continue with Microsoft")
+            await adobe_page.wait_for_timeout(3000)
+            ms_followup_page = await pick_page_by_url_keywords(
+                ctx,
+                adobe_page,
+                ["login.microsoftonline.com", "login.live.com"],
+                timeout_ms=10000,
+            )
+            if not ms_followup_page.is_closed() and (
+                "login.microsoftonline.com" in (ms_followup_page.url or "")
+                or "login.live.com" in (ms_followup_page.url or "")
+            ):
+                await maybe_handle_microsoft_post_login(ms_followup_page)
+                adobe_page = await pick_active_auth_page(ctx, adobe_page, timeout_ms=30000)
 
         await click_any(adobe_page, [
             "button:has-text('Continue')",
