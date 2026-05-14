@@ -1126,7 +1126,27 @@ async def page_has_visible_selector(page: Page, selectors: list[str]) -> bool:
 
 def is_adobe_home_url(url: str) -> bool:
     url = (url or "").lower()
-    return "adobe.com/home" in url
+    try:
+        parsed = urlsplit(url)
+    except Exception:
+        return False
+    return (
+        parsed.netloc == "www.adobe.com"
+        and parsed.path.rstrip("/") == "/home"
+        and bool(parsed.query)
+    )
+
+def is_adobe_bare_home_url(url: str) -> bool:
+    url = (url or "").lower()
+    try:
+        parsed = urlsplit(url)
+    except Exception:
+        return False
+    return (
+        parsed.netloc == "www.adobe.com"
+        and parsed.path.rstrip("/") == "/home"
+        and not parsed.query
+    )
 
 def is_adobe_home_token_callback(url: str) -> bool:
     url = (url or "").lower()
@@ -1197,8 +1217,8 @@ async def wait_for_self_email_adobe_state(
     allow_dob: bool = True,
 ) -> tuple[str | None, Page]:
     end_at = time.time() + timeout_ms / 1000
-    home_page = None
-    home_since = None
+    bare_home_page = None
+    bare_home_since = None
     while time.time() < end_at:
         pages = [page for page in list(ctx.pages) if not page.is_closed()]
         if fallback and not fallback.is_closed() and fallback not in pages:
@@ -1210,24 +1230,31 @@ async def wait_for_self_email_adobe_state(
             if allow_dob and await page_has_visible_selector(candidate, DOB_YEAR_SELECTORS):
                 return "dob", candidate
 
-        current_home_page = None
+        success_home_page = None
+        current_bare_home_page = None
         for candidate in pages:
             if is_adobe_home_url(candidate.url):
-                current_home_page = candidate
+                success_home_page = candidate
                 break
+            if is_adobe_bare_home_url(candidate.url):
+                current_bare_home_page = candidate
 
         now = time.time()
-        if current_home_page:
-            if home_page != current_home_page:
-                home_page = current_home_page
-                home_since = now
-                log("  ⏳ 检测到 Adobe home，开始 22 秒稳定等待...")
-            elif home_since and now - home_since >= 22:
-                log("  ✅ Adobe home 已稳定停留 22 秒，判定注册成功")
-                return "home", current_home_page
+        if success_home_page:
+            log("  ✅ 检测到 Adobe home? 成功页，进入 Cookie 写入等待")
+            return "home", success_home_page
+
+        if current_bare_home_page:
+            if bare_home_page != current_bare_home_page:
+                bare_home_page = current_bare_home_page
+                bare_home_since = now
+                log("  ⏳ 检测到 Adobe home 中转页，最多等待 30 秒跳转验证码页...")
+            elif bare_home_since and now - bare_home_since >= 30:
+                log("  ⚠️ Adobe home 中转页停留超过 30 秒，未跳转到验证码页")
+                return None, current_bare_home_page
         else:
-            home_page = None
-            home_since = None
+            bare_home_page = None
+            bare_home_since = None
 
         if fallback and not fallback.is_closed():
             await fallback.wait_for_timeout(500)
@@ -1272,8 +1299,8 @@ async def wait_for_complete_core_cookies(ctx: BrowserContext, page: Page, cookie
         ("Adobe 账户页", "https://account.adobe.com"),
         ("Firefly 首页", "https://firefly.adobe.com"),
     ]
-    if is_adobe_home_token_callback(page.url):
-        log("  ✅ 当前为 Adobe home access_token 回调页，先等待会话写入")
+    if is_adobe_home_url(page.url):
+        log("  ✅ 当前为 Adobe home? 成功页，先等待 5 秒写入会话 Cookie")
         await page.wait_for_timeout(5000)
         cookie_by_name = await collect_core_cookies(ctx, cookie_keys)
         found_keys = [key for key in cookie_keys if key in cookie_by_name]
