@@ -415,11 +415,7 @@ class TaskManager:
                     t.status = "stopped"
                 elif t.status == "running":
                     t.status = "stopping"
-                    for async_task in list(t.asyncio_tasks):
-                        if not async_task.done():
-                            async_task.cancel()
-                    for process in list(t.active_processes.values()):
-                        await terminate_process(process)
+                    await self.broadcast(f"任务 #{tid} 已请求停止：正在进行的注册会先执行完，未开始的注册将跳过")
 
     async def broadcast(self, message: str):
         if message == "__STATE_UPDATE__":
@@ -780,18 +776,25 @@ async def import_cookie_to_token_pool(cookie_file: str, prefix: str) -> bool:
         "Content-Type": "application/json",
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(import_url, json=payload, headers=headers)
-        if 200 <= response.status_code < 300:
-            await task_manager.broadcast(f"{prefix} ✅ 已自动导入 Token 池")
-            return True
-        detail = response.text[:200].replace("\n", " ")
-        await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败：HTTP {response.status_code} {detail}")
-        return False
-    except Exception as e:
-        await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败：{e}")
-        return False
+    last_error = ""
+    for attempt in range(1, 4):
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(import_url, json=payload, headers=headers)
+            if 200 <= response.status_code < 300:
+                await task_manager.broadcast(f"{prefix} ✅ 已自动导入 Token 池")
+                return True
+            detail = response.text[:200].replace("\n", " ")
+            last_error = f"HTTP {response.status_code} {detail}"
+        except Exception as e:
+            last_error = str(e)
+
+        if attempt < 3:
+            await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败，第 {attempt}/3 次：{last_error}，2 秒后重试")
+            await asyncio.sleep(2)
+
+    await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败：{last_error}")
+    return False
 
 
 def parse_self_email_accounts(raw: str) -> list[dict]:
@@ -984,9 +987,8 @@ async def execute_single_worker(task: Task, worker_index: int):
             task.failed += 1
             await task_manager.broadcast(f"{prefix} ❌ 失败 (未导出完整 7 项 Cookie)")
     except asyncio.CancelledError:
-        await terminate_process(process)
         task.failed += 1
-        await task_manager.broadcast(f"{prefix} 🛑 操作已停止")
+        await task_manager.broadcast(f"{prefix} 🛑 操作已取消")
         raise
     finally:
         await finalize_output_task(output_task)
