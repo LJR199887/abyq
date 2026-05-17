@@ -221,6 +221,13 @@ h1 {
 }
 .btn-sm.danger:hover { background: rgba(239,68,68,0.25); }
 
+.btn-sm.warning {
+    background: rgba(245,158,11,0.15);
+    color: var(--warning);
+    border: 1px solid rgba(245,158,11,0.25);
+}
+.btn-sm.warning:hover { background: rgba(245,158,11,0.25); }
+
 .btn-sm:disabled {
     opacity: 0.4;
     cursor: not-allowed;
@@ -277,6 +284,7 @@ h1 {
 .record-meta .ok { color: var(--success); font-weight: 600; }
 .record-meta .fail { color: var(--danger); font-weight: 600; }
 .record-meta .pool { color: var(--primary-color); font-weight: 600; }
+.record-meta .unpooled { color: var(--warning); font-weight: 600; }
 
 /* ─── Glassmorphism Cards ─── */
 .glass-card {
@@ -534,6 +542,7 @@ textarea:focus {
 .task-item .task-counts .ok { color: var(--success); font-weight: 600; }
 .task-item .task-counts .fail { color: var(--danger); font-weight: 600; }
 .task-item .task-counts .pool { color: var(--primary-color); font-weight: 600; white-space: nowrap; }
+.task-item .task-counts .unpooled { color: var(--warning); font-weight: 600; white-space: nowrap; }
 
 .badge {
     display: inline-block;

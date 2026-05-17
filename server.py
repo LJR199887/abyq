@@ -293,6 +293,7 @@ class Task:
         self.completed = 0
         self.failed = 0
         self.token_pool_imported = 0
+        self.token_pool_imported_files = []
         self.created_at = datetime.now().strftime("%m-%d %H:%M")
         self.result_files = []
         self.asyncio_tasks = []
@@ -311,6 +312,10 @@ class Task:
             "completed": self.completed,
             "failed": self.failed,
             "token_pool_imported": self.token_pool_imported,
+            "token_pool_imported_files": self.token_pool_imported_files,
+            "token_pool_unpooled": max(0, len(self.result_files) - len(self.token_pool_imported_files))
+                if self.token_pool_imported_files
+                else max(0, len(self.result_files) - self.token_pool_imported),
             "created_at": self.created_at,
             "result_count": len(self.result_files),
             "result_files": self.result_files,
@@ -385,6 +390,7 @@ class TaskManager:
                         t.completed = t_data.get("completed", 0)
                         t.failed = t_data.get("failed", 0)
                         t.token_pool_imported = t_data.get("token_pool_imported", 0)
+                        t.token_pool_imported_files = t_data.get("token_pool_imported_files", [])
                         t.created_at = t_data.get("created_at", "")
                         t.result_files = t_data.get("result_files", [])
                         # Mark interrupted tasks as stopped
@@ -997,6 +1003,7 @@ async def execute_single_worker(task: Task, worker_index: int):
             if await import_cookie_to_token_pool(expected_cookie_file, prefix):
                 if config.get("token_pool_enabled"):
                     task.token_pool_imported += 1
+                    task.token_pool_imported_files.append(expected_cookie_file)
         else:
             task.failed += 1
             await task_manager.broadcast(f"{prefix} ❌ 失败 (未导出完整 7 项 Cookie)")
@@ -1061,6 +1068,58 @@ async def websocket_endpoint(websocket: WebSocket):
             task_manager.websockets.remove(websocket)
 
 # ─── Export ───
+def get_task_result_files(task: Task) -> list[str]:
+    files = []
+    if task.result_files:
+        files.extend(resolve_data_file(f) for f in task.result_files)
+    else:
+        files.extend(glob.glob(os.path.join(SCREENSHOT_DIR, f"cookie_task{task.id}_*.json")))
+
+    unique_files = []
+    seen = set()
+    for f in files:
+        resolved = os.path.abspath(resolve_data_file(f))
+        if resolved in seen:
+            continue
+        if os.path.exists(resolved):
+            seen.add(resolved)
+            unique_files.append(resolved)
+    return unique_files
+
+
+def get_task_unpooled_files(task: Task) -> list[str]:
+    result_files = get_task_result_files(task)
+    if not result_files:
+        return []
+
+    imported_files = [
+        os.path.abspath(resolve_data_file(f))
+        for f in getattr(task, "token_pool_imported_files", [])
+    ]
+    imported_set = {f for f in imported_files if f}
+    if imported_set:
+        return [f for f in result_files if os.path.abspath(f) not in imported_set]
+
+    imported_count = max(0, int(getattr(task, "token_pool_imported", 0) or 0))
+    if imported_count <= 0:
+        return result_files
+
+    return result_files[imported_count:]
+
+
+def load_cookie_exports(result_files: list[str]) -> list[dict]:
+    combined = []
+    for f in result_files:
+        try:
+            with open(f, "r", encoding="utf-8") as cookie_fp:
+                data = json.load(cookie_fp)
+            if "cookie" in data and "name" in data:
+                combined.append(data)
+        except Exception:
+            pass
+    return combined
+
+
 @app.get("/api/export")
 async def export_results(ids: str = ""):
     # Filter by task IDs if provided
@@ -1110,6 +1169,41 @@ async def export_results(ids: str = ""):
     content = json.dumps(combined, ensure_ascii=False, indent=4)
     if not export_filename:
         export_filename = f"批量导出_{len(selected_tasks)}个任务_{export_timestamp()}.json"
+    return Response(
+        content=content.encode("utf-8"),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(export_filename)}"
+        },
+    )
+
+
+@app.get("/api/export-unpooled")
+async def export_unpooled_results(ids: str = ""):
+    if ids:
+        target_ids = set(int(x) for x in ids.split(",") if x.strip().isdigit())
+        selected_tasks = [t for t in task_manager.tasks.values() if t.id in target_ids]
+    else:
+        selected_tasks = list(task_manager.tasks.values())
+
+    result_files = []
+    for task in selected_tasks:
+        result_files.extend(get_task_unpooled_files(task))
+
+    combined = load_cookie_exports(result_files)
+    if not combined:
+        return JSONResponse(status_code=404, content={"error": "暂无未入池记录可导出"})
+
+    if ids and len(selected_tasks) == 1:
+        task = selected_tasks[0]
+        export_filename = f"{sanitize_filename(task.name, f'任务_{task.id}')}_未入池_#{task.id}.json"
+    elif ids:
+        export_filename = f"未入池导出_{len(selected_tasks)}个任务_{export_timestamp()}.json"
+    else:
+        export_filename = f"全部未入池_{export_timestamp()}.json"
+
+    from fastapi.responses import Response
+    content = json.dumps(combined, ensure_ascii=False, indent=4)
     return Response(
         content=content.encode("utf-8"),
         media_type="application/json",

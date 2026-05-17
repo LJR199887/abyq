@@ -35,7 +35,9 @@
                         <button class="btn-sm danger" id="delete-selected-btn" disabled>删除选中</button>
                         <button class="btn-sm danger" id="stop-selected-btn" disabled>停止选中</button>
                         <button class="btn-sm success" id="export-selected-btn">导出选中</button>
+                        <button class="btn-sm warning" id="export-unpooled-selected-btn" disabled>导出未入池选中</button>
                         <button class="btn-sm primary" id="export-all-btn">导出全部</button>
+                        <button class="btn-sm warning" id="export-unpooled-all-btn">导出全部未入池</button>
                     </div>
                 </div>
                 <div id="records-list" class="records-list">
@@ -51,7 +53,9 @@
         const deleteBtn = document.getElementById("delete-selected-btn");
         const stopBtn = document.getElementById("stop-selected-btn");
         const exportSelectedBtn = document.getElementById("export-selected-btn");
+        const exportUnpooledSelectedBtn = document.getElementById("export-unpooled-selected-btn");
         const exportAllBtn = document.getElementById("export-all-btn");
+        const exportUnpooledAllBtn = document.getElementById("export-unpooled-all-btn");
 
         let tasks = [];
 
@@ -89,7 +93,7 @@
                                 <span class="badge ${badgeClass}">${badgeText}</span>
                             </div>
                             <div class="record-meta">
-                                #${t.id} · ${t.created_at} · ${emailSourceLabel(t.email_source)} · 数量 ${t.quantity} · 成功 <span class="ok">${t.completed}</span> · 失败 <span class="fail">${t.failed}</span> · 入池 <span class="pool">${t.token_pool_imported || 0}</span>
+                                #${t.id} · ${t.created_at} · ${emailSourceLabel(t.email_source)} · 数量 ${t.quantity} · 成功 <span class="ok">${t.completed}</span> · 失败 <span class="fail">${t.failed}</span> · 入池 <span class="pool">${t.token_pool_imported || 0}</span> · 未入池 <span class="unpooled">${t.token_pool_unpooled || 0}</span>
                             </div>
                         </div>
                     </div>
@@ -107,6 +111,7 @@
             deleteBtn.disabled = sel.length === 0;
             stopBtn.disabled = sel.length === 0;
             exportSelectedBtn.disabled = sel.length === 0;
+            exportUnpooledSelectedBtn.disabled = sel.length === 0;
         }
 
         listEl.addEventListener("change", (e) => {
@@ -158,8 +163,18 @@
             window.location.href = "/api/export?ids=" + ids.join(",");
         });
 
+        exportUnpooledSelectedBtn.addEventListener("click", () => {
+            const ids = getSelected();
+            if (ids.length === 0) return;
+            window.location.href = "/api/export-unpooled?ids=" + ids.join(",");
+        });
+
         exportAllBtn.addEventListener("click", () => {
             window.location.href = "/api/export";
+        });
+
+        exportUnpooledAllBtn.addEventListener("click", () => {
+            window.location.href = "/api/export-unpooled";
         });
 
         setInterval(refreshRecords, 3000);

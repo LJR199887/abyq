@@ -137,6 +137,7 @@ document.addEventListener("DOMContentLoaded", () => {
                                 <div class="task-counts">
                                     <span class="ok">${t.completed}</span> / <span class="fail">${t.failed}</span>
                                     <span class="pool">入池 ${t.token_pool_imported || 0}</span>
+                                    <span class="unpooled">未入池 ${t.token_pool_unpooled || 0}</span>
                                 </div>
                                 <span class="badge ${badgeClass}">${badgeText}</span>
                                 ${["pending", "running"].includes(t.status) ? `<button class="btn-sm danger stop-task-btn" data-id="${t.id}" style="margin-left: 8px;">停止</button>` : ''}
