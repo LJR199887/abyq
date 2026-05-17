@@ -8,6 +8,7 @@ import socket
 import ssl
 import sys
 import shutil
+import signal
 import uuid
 from contextlib import suppress
 from datetime import datetime
@@ -690,15 +691,27 @@ async def stop_tasks(req: TaskDeleteRequest):
 async def terminate_process(process: asyncio.subprocess.Process | None):
     if process is None or process.returncode is not None:
         return
-    with suppress(ProcessLookupError):
-        process.terminate()
+
+    if os.name != "nt" and process.pid:
+        with suppress(ProcessLookupError):
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+    else:
+        with suppress(ProcessLookupError):
+            process.terminate()
+
     try:
         await asyncio.wait_for(process.wait(), timeout=5)
         return
     except asyncio.TimeoutError:
         pass
-    with suppress(ProcessLookupError):
-        process.kill()
+
+    if os.name != "nt" and process.pid:
+        with suppress(ProcessLookupError):
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    else:
+        with suppress(ProcessLookupError):
+            process.kill()
+
     with suppress(asyncio.TimeoutError):
         await asyncio.wait_for(process.wait(), timeout=5)
 
@@ -960,7 +973,8 @@ async def execute_single_worker(task: Task, worker_index: int):
         sys.executable, "-u", "auto_register_firefly.py",
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        env=env
+        env=env,
+        start_new_session=(os.name != "nt"),
     )
     task.active_processes[worker_index] = process
     output_task = asyncio.create_task(stream_process_output(process, prefix, self_email, self_email_state))
