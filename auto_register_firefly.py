@@ -7,6 +7,7 @@ Adobe Firefly 自动注册 (直接注册模式)
 """
 
 import asyncio
+import html
 import json
 import os
 import re
@@ -35,6 +36,7 @@ EMAIL_SOURCE = os.getenv("EMAIL_SOURCE", "temp")
 SELF_EMAIL_ADDRESS = os.getenv("SELF_EMAIL_ADDRESS", "")
 SELF_EMAIL_PASSWORD = os.getenv("SELF_EMAIL_PASSWORD", "")
 SELF_EMAIL_API_URL = os.getenv("SELF_EMAIL_API_URL", "")
+INVITE_REGISTRATION = os.getenv("INVITE_REGISTRATION", "0") == "1"
 SHOW_BROWSER = os.getenv("SHOW_BROWSER", "0") == "1"
 PROXY_ENABLED = os.getenv("PROXY_ENABLED", "0") == "1"
 PROXY_SCHEME = os.getenv("PROXY_SCHEME", "http")
@@ -942,6 +944,49 @@ class SelfEmailMail:
         log("❌ 等待自备邮箱验证码或验证链接超时")
         return None
 
+    async def wait_for_invitation_link(self, attempts=5, interval=5) -> str | None:
+        log(f"⏳ 通过自备邮箱 API 等待 Download apps 邮件 (最多 {attempts} 次)...")
+        for attempt in range(1, attempts + 1):
+            try:
+                response = await self.client.get(self.api_url)
+                response.raise_for_status()
+                raw = response.text or ""
+                try:
+                    link = extract_invitation_link_from_api_payload(response.json())
+                except Exception:
+                    link = extract_invitation_link({"text": raw})
+                if link:
+                    log(f"🔗 Download apps 链接: {link[:100]}...")
+                    return link
+                log(f"  轮询 #{attempt}/{attempts}，暂未获取 Download apps 链接")
+            except Exception as exc:
+                log(f"  自备邮箱 API 轮询出错: {exc}")
+            if attempt < attempts:
+                await asyncio.sleep(interval)
+        log("❌ 5 次轮询后仍未获取 Download apps 链接")
+        return None
+
+    async def wait_for_invitation_code(self, attempts=5, interval=5) -> str | None:
+        log(f"⏳ 通过自备邮箱 API 等待身份验证码 (最多 {attempts} 次)...")
+        for attempt in range(1, attempts + 1):
+            try:
+                response = await self.client.get(self.api_url)
+                response.raise_for_status()
+                try:
+                    code = extract_code_from_api_payload(response.json())
+                except Exception:
+                    code = extract_code({"text": response.text or ""})
+                if code:
+                    log(f"🔐 身份验证码: {code}")
+                    return code
+                log(f"  轮询 #{attempt}/{attempts}，暂未获取验证码")
+            except Exception as exc:
+                log(f"  自备邮箱 API 轮询出错: {exc}")
+            if attempt < attempts:
+                await asyncio.sleep(interval)
+        log("❌ 5 次轮询后仍未获取身份验证码")
+        return None
+
     async def close(self):
         await self.client.aclose()
 
@@ -994,6 +1039,53 @@ def extract_verification_link_from_api_payload(data) -> str | None:
             found = extract_verification_link_from_api_payload(item)
             if found:
                 return found
+    return None
+
+
+def extract_invitation_link_from_api_payload(data) -> str | None:
+    if isinstance(data, dict):
+        for value in data.values():
+            found = extract_invitation_link_from_api_payload(value)
+            if found:
+                return found
+    elif isinstance(data, list):
+        for item in data:
+            found = extract_invitation_link_from_api_payload(item)
+            if found:
+                return found
+    elif data is not None:
+        return extract_invitation_link({"text": str(data)})
+    return None
+
+
+def extract_invitation_link(mail: dict) -> str | None:
+    body = mail.get("html") or mail.get("content") or mail.get("body") or mail.get("text") or ""
+    text = html.unescape(str(body))
+    for href, label in re.findall(
+        r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+        text,
+        re.I | re.S,
+    ):
+        label_text = re.sub(r"<[^>]+>", " ", label)
+        label_text = re.sub(r"\s+", " ", label_text).strip().lower()
+        if "download apps" in label_text:
+            return html.unescape(href).strip()
+
+    candidates = re.findall(r'https?://[^\s<>"\']+', text, re.I)
+    candidates += re.findall(r'https?%3A%2F%2F[^\s<>"\']+', text, re.I)
+    invitation_context = any(
+        marker in text.lower()
+        for marker in ("download apps", "your free trial starts now", "creative cloud pro")
+    )
+    for raw in candidates:
+        link = unquote(raw).strip().rstrip(').,;')
+        lowered = link.lower()
+        if "apo-prod.adobe.io/po-server/link/redirect" in lowered:
+            return link
+        if invitation_context and "postoffice.adobe.com/po-server/link/redirect" in lowered:
+            return link
+        if "adobe" in lowered and any(word in lowered for word in ("cc_download_app", "download_apps", "download-apps")):
+            return link
     return None
 
 def extract_verification_link(mail: dict) -> str | None:
@@ -1481,6 +1573,32 @@ async def wait_for_complete_core_cookies(ctx: BrowserContext, page: Page, cookie
 
     return await collect_core_cookies(ctx, cookie_keys)
 
+
+async def wait_for_passive_core_cookies(
+    ctx: BrowserContext,
+    page: Page,
+    cookie_keys: list[str],
+    timeout_seconds: int = 120,
+) -> dict:
+    log("  ⏳ 等待 Complete Account 自动跳转并写入 Cookie")
+    attempts = max(1, timeout_seconds // 2)
+    for attempt in range(1, attempts + 1):
+        cookie_by_name = await collect_core_cookies(ctx, cookie_keys)
+        found_keys = [key for key in cookie_keys if key in cookie_by_name]
+        missing_keys = [key for key in cookie_keys if key not in cookie_by_name]
+        if not missing_keys:
+            log(f"  ✅ 自动跳转页面已写入完整 Cookie ({len(found_keys)}/7)")
+            return cookie_by_name
+        if attempt == 1 or attempt % 5 == 0:
+            short_url = page.url[:100] if not page.is_closed() else "页面已关闭"
+            log(f"  ⏳ 被动检查 {attempt}/{attempts}: 已有 {len(found_keys)}/7 | 当前页: {short_url}")
+        if page.is_closed():
+            await asyncio.sleep(2)
+        else:
+            await page.wait_for_timeout(2000)
+    return await collect_core_cookies(ctx, cookie_keys)
+
+
 async def wait_for_login_session(ctx: BrowserContext, page: Page, timeout_seconds: int = 30) -> bool:
     log("Step 6.5: 等待 Adobe 登录态落地")
     session_keys = ["ims_sid", "aux_sid"]
@@ -1539,14 +1657,28 @@ async def wait_for_login_session(ctx: BrowserContext, page: Page, timeout_second
 
     return False
 
-async def export_cookies_and_result(ctx: BrowserContext, page: Page, email_addr: str, password: str) -> bool:
+async def export_cookies_and_result(
+    ctx: BrowserContext,
+    page: Page,
+    email_addr: str,
+    password: str,
+    passive: bool = False,
+) -> bool:
     log("━" * 50)
     AUTH_COOKIE_KEYS = [
         'ims_sid', 'aux_sid', 'fg', 'relay', 'ftrset',
         'filter-profile-map', 'filter-profile-map-permanent',
     ]
     try:
-        cookie_by_name = await wait_for_complete_core_cookies(ctx, page, AUTH_COOKIE_KEYS, timeout_seconds=24)
+        if passive:
+            cookie_by_name = await wait_for_passive_core_cookies(
+                ctx,
+                page,
+                AUTH_COOKIE_KEYS,
+                timeout_seconds=120,
+            )
+        else:
+            cookie_by_name = await wait_for_complete_core_cookies(ctx, page, AUTH_COOKIE_KEYS, timeout_seconds=24)
         if not cookie_by_name:
             log("  ❌ 未获取到 Cookie，注册失败")
             return False
@@ -1667,6 +1799,133 @@ async def click_email_verified_continue(page: Page) -> bool:
         "a:has-text('继续')",
     ], timeout_ms=45000)
 
+
+async def select_birth_month(page: Page) -> bool:
+    for selector in [
+        "select[name='month']",
+        "select[data-id='Signup-DateOfBirthChooser-Month']",
+        "#Signup-DateOfBirthChooser-Month select",
+    ]:
+        try:
+            element = await page.query_selector(selector)
+            if element and await element.is_visible():
+                await element.select_option(value=BIRTH_MONTH)
+                return True
+        except Exception:
+            pass
+
+    clicked = await wait_click_any(page, [
+        "#Signup-DateOfBirthChooser-Month",
+        "[data-id='Signup-DateOfBirthChooser-Month']",
+        "[data-id='DateOfBirthChooser-Month']",
+        "button[aria-labelledby*='Month']",
+        "button:has-text('Select')",
+    ], timeout_ms=30000)
+    if not clicked:
+        return False
+    await page.wait_for_timeout(500)
+    for _ in range(int(BIRTH_MONTH)):
+        await page.keyboard.press("ArrowDown")
+        await page.wait_for_timeout(80)
+    await page.keyboard.press("Enter")
+    return True
+
+
+async def retry_page_action(label: str, action, attempts: int = 2, delay_seconds: int = 2) -> bool:
+    for attempt in range(1, attempts + 1):
+        try:
+            if await action():
+                return True
+        except Exception as exc:
+            log(f"  ⚠️ {label} 第 {attempt}/{attempts} 次异常: {type(exc).__name__}: {exc}")
+        if attempt < attempts:
+            log(f"  ↻ {label} 未完成，{delay_seconds} 秒后重试 {attempt + 1}/{attempts}")
+            await asyncio.sleep(delay_seconds)
+    return False
+
+
+async def run_invite_registration_flow(ctx: BrowserContext, main_page: Page, mail, email_addr: str) -> bool:
+    log("━" * 50)
+    log("邀请模式: Download apps 注册流程")
+
+    log("Step 1: 轮询邀请邮件并打开 Download apps")
+    invitation_url = await mail.wait_for_invitation_link(attempts=5, interval=5)
+    if not invitation_url:
+        return False
+    if not await goto_with_retries(
+        main_page,
+        invitation_url,
+        label="Download apps",
+        attempts=3,
+        timeout_ms=80000,
+    ):
+        return False
+
+    auth_page = await pick_active_auth_page(ctx, main_page, timeout_ms=30000)
+    log("Step 2: 点击 Verify your identity 页面 Continue")
+    continue_selectors = [
+        "button[data-id='AdditionalAccountDetailsPage-ContinueButton']",
+        "button[data-click-event='ContinueClick']",
+        "button:has-text('Continue')",
+        "button:has-text('继续')",
+    ]
+    if not await retry_page_action(
+        "点击 Continue",
+        lambda: wait_click_any(auth_page, continue_selectors, timeout_ms=30000),
+        attempts=2,
+    ):
+        log("❌ 未找到 Verify your identity 页面 Continue")
+        return False
+
+    log("Step 3: 轮询验证码邮件并输入验证码")
+    code = await mail.wait_for_invitation_code(attempts=5, interval=5)
+    if not code:
+        return False
+    if not await retry_page_action(
+        "输入身份验证码",
+        lambda: enter_email_verification_code(auth_page, code),
+        attempts=2,
+    ):
+        log("❌ 未找到身份验证码输入框")
+        return False
+    await auth_page.wait_for_timeout(5000)
+
+    log("Step 4: 填写 Complete your account")
+    fields = [
+        ("名字", ["#Signup-FirstNameField", "input[name='firstName']", "input[autocomplete='given-name']"], FIRST_NAME),
+        ("姓氏", ["#Signup-LastNameField", "input[name='lastName']", "input[autocomplete='family-name']"], LAST_NAME),
+        ("密码", ["#Signup-PasswordField", "input[name='password']", "input[type='password']"], PASSWORD),
+        ("年份", ["#Signup-DateOfBirthChooser-Year", "input[name='year']", "input[autocomplete='bday-year']"], BIRTH_YEAR),
+    ]
+    for label, selectors, value in fields:
+        if not await retry_page_action(
+            f"填写{label}",
+            lambda selectors=selectors, value=value: wait_fill_any(auth_page, selectors, value, timeout_ms=30000),
+            attempts=2,
+        ):
+            log(f"❌ 未找到{label}输入框")
+            return False
+        log(f"  {label}: ✅")
+
+    if not await retry_page_action("选择月份", lambda: select_birth_month(auth_page), attempts=2):
+        log("❌ 未找到月份选择框")
+        return False
+    log(f"  月份: ✅ {BIRTH_MONTH}")
+    log("  地区: 使用页面默认值")
+
+    if not await wait_click_any(auth_page, [
+        "button[data-id='Signup-CreateAccountBtn']",
+        "button[data-click-event='CreateAccountClick']",
+        "button[type='submit']:has-text('Complete Account')",
+        "button[type='submit']:has-text('完成账户')",
+    ], timeout_ms=45000):
+        log("❌ 未找到 Complete Account 按钮")
+        return False
+
+    log("Step 5: 等待页面自动跳转并导出 Cookie")
+    return await export_cookies_and_result(ctx, auth_page, email_addr, PASSWORD, passive=True)
+
+
 async def run_self_email_microsoft_flow(ctx: BrowserContext, main_page: Page, mail, email_addr: str) -> bool:
     if not SELF_EMAIL_PASSWORD:
         log("❌ 自备邮箱缺少密码，无法走 Microsoft 登录专属模式")
@@ -1687,7 +1946,7 @@ async def run_self_email_microsoft_flow(ctx: BrowserContext, main_page: Page, ma
     ):
         return False
 
-    log("Step 2: 点击登录")
+    log("Step 2: 进入 Adobe 登录")
     sign_in_selectors = [
         "button[data-test-id='unav-profile--sign-in']",
         "button.profile-comp.secondary-button",
@@ -1696,7 +1955,14 @@ async def run_self_email_microsoft_flow(ctx: BrowserContext, main_page: Page, ma
         "a:has-text('登录')",
         "button:has-text('登录')",
     ]
-    signed_in_clicked = await wait_for_load_or_click(main_page, sign_in_selectors, timeout_ms=60000)
+    auth_page = await pick_active_auth_page(ctx, main_page, timeout_ms=15000)
+    auth_ready = await page_has_visible_selector(auth_page, [
+        "[data-id='EmailPage-CreateAccountLink']",
+        "button[data-provider='microsoft']",
+        "button[data-social-provider='Microsoft']",
+        "button[data-id='Social-MicrosoftSignInButton']",
+    ])
+    signed_in_clicked = auth_ready or await wait_for_load_or_click(auth_page, sign_in_selectors, timeout_ms=60000)
     if not signed_in_clicked:
         log("  ⚠️ 首次未找到登录按钮，刷新 Adobe 首页后重试")
         if await goto_with_retries(
@@ -1717,14 +1983,19 @@ async def run_self_email_microsoft_flow(ctx: BrowserContext, main_page: Page, ma
     auth_page = await pick_active_auth_page(ctx, main_page, timeout_ms=30000)
 
     log("Step 3: 点击创建账户")
-    created_clicked = await wait_click_any(auth_page, [
-        "[data-id='EmailPage-CreateAccountLink']",
-        "span[role='link']:has-text('Create an account')",
-        "a:has-text('Create an account')",
-        "text=Create an account",
-        "span[role='link']:has-text('创建账户')",
-        "text=创建账户",
-    ], timeout_ms=30000)
+    microsoft_ready = await page_has_visible_selector(auth_page, [
+        "button[data-provider='microsoft']",
+        "button[data-social-provider='Microsoft']",
+        "button[data-id='Social-MicrosoftSignInButton']",
+    ])
+    created_clicked = microsoft_ready or await wait_click_any(auth_page, [
+            "[data-id='EmailPage-CreateAccountLink']",
+            "span[role='link']:has-text('Create an account')",
+            "a:has-text('Create an account')",
+            "text=Create an account",
+            "span[role='link']:has-text('创建账户')",
+            "text=创建账户",
+        ], timeout_ms=30000)
     if not created_clicked:
         log("❌ 未找到 Create an account 入口")
         return False
@@ -2140,10 +2411,13 @@ async def main():
 
         try:
             if EMAIL_SOURCE == "self":
-                ok = await run_self_email_microsoft_flow(ctx, main_page, mail, email_addr)
+                if INVITE_REGISTRATION:
+                    ok = await run_invite_registration_flow(ctx, main_page, mail, email_addr)
+                else:
+                    ok = await run_self_email_microsoft_flow(ctx, main_page, mail, email_addr)
                 if ok:
                     log("━" * 50)
-                    log("🎉 自备邮箱专属流程已完成!")
+                    log("🎉 邀请注册流程已完成!" if INVITE_REGISTRATION else "🎉 自备邮箱专属流程已完成!")
                 return
 
             # ══════════════════════════════════════

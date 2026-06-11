@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>账号管理 - Firefly Registration</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="glass-bg"></div>
+    <div class="container">
+        <header>
+            <div class="header-row">
+                <div class="logo-box">
+                    <div class="logo-icon"></div>
+                    <h1>Firefly Registration</h1>
+                </div>
+                <nav class="nav-links">
+                    <a href="/" class="nav-link">🚀 任务</a>
+                    <a href="/records.html" class="nav-link">📋 记录</a>
+                    <a href="/self-emails.html" class="nav-link">📧 自备邮箱</a>
+                    <a href="/accounts.html" class="nav-link active">👤 账号</a>
+                    <a href="/settings.html" class="nav-link">⚙️ 设置</a>
+                </nav>
+            </div>
+        </header>
+
+        <main class="account-layout">
+            <section class="account-sidebar">
+                <div class="card glass-card">
+                    <div class="account-section-title">
+                        <div>
+                            <span class="eyebrow">ADOBE ADMIN</span>
+                            <h2>账号凭据</h2>
+                        </div>
+                        <button class="btn-sm primary" id="new-account-btn">新增</button>
+                    </div>
+                    <p class="card-desc">保存 Adobe Admin Console 登录 Cookie，用于执行团队管理操作。</p>
+                    <div id="account-list" class="account-list">
+                        <div class="empty-hint">暂未配置账号</div>
+                    </div>
+                </div>
+
+                <div class="card glass-card credential-card">
+                    <h2><span class="icon">🔐</span> 配置账号</h2>
+                    <input type="hidden" id="account-id">
+                    <div class="form-group">
+                        <label for="account-name">账号名称</label>
+                        <input id="account-name" type="text" placeholder="例如：主团队账号" maxlength="50">
+                    </div>
+                    <div class="form-group">
+                        <div class="cookie-field-header">
+                            <label for="account-cookie">Adobe Cookie</label>
+                            <label class="btn-sm primary json-import-btn" for="cookie-json-input">导入 Cookie JSON</label>
+                            <input type="file" id="cookie-json-input" accept=".json,application/json" hidden>
+                        </div>
+                        <textarea id="account-cookie" class="cookie-input" placeholder="粘贴 k1=v1; k2=v2 格式的完整 Cookie。编辑现有账号时留空可保留原 Cookie。"></textarea>
+                        <small class="field-helper">支持 {"cookie":"k1=v1; k2=v2"} 或 Cookie 数组 JSON。</small>
+                    </div>
+                    <div class="account-form-actions">
+                        <button class="btn primary" id="save-account-btn">保存账号</button>
+                        <button class="btn secondary" id="test-account-btn" disabled>检查 Cookie</button>
+                    </div>
+                    <button class="btn danger-action account-delete-btn" id="delete-account-btn" disabled>删除当前账号</button>
+                    <div class="status-msg" id="account-status"></div>
+                </div>
+            </section>
+
+            <section class="account-main">
+                <div class="account-hero card glass-card">
+                    <div>
+                        <span class="eyebrow">TEAM AUTOMATION</span>
+                        <h2>团队成员操作台</h2>
+                        <p>选择已配置账号，批量发送邀请邮件或移除成员。每行填写一个邮箱。</p>
+                    </div>
+                    <div class="selected-account-pill" id="selected-account-pill">未选择账号</div>
+                </div>
+
+                <div class="card glass-card member-panel">
+                    <div class="member-toolbar">
+                        <div>
+                            <span class="eyebrow">ORGANIZATION MEMBERS</span>
+                            <h2>组织成员</h2>
+                            <p class="card-desc" id="member-summary">选择账号后可读取 Adobe Admin Console 成员。</p>
+                        </div>
+                        <div class="member-toolbar-actions">
+                            <input id="member-search" type="search" placeholder="搜索成员邮箱或姓名">
+                            <button class="btn-sm danger" id="remove-selected-members-btn" disabled>移除选中</button>
+                            <button class="btn-sm primary" id="refresh-members-btn" disabled>刷新成员</button>
+                        </div>
+                    </div>
+                    <div class="member-table-wrap">
+                        <table class="member-table">
+                            <thead>
+                                <tr>
+                                    <th><input type="checkbox" id="select-all-members" aria-label="全选可移除成员"></th>
+                                    <th>成员</th>
+                                    <th>类型</th>
+                                    <th>产品</th>
+                                    <th>状态</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="member-rows">
+                                <tr><td colspan="6" class="empty-state">尚未读取成员</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="member-pagination">
+                        <button class="btn-sm primary" id="member-prev-btn" disabled>上一页</button>
+                        <span id="member-page-label">第 1 页</span>
+                        <button class="btn-sm primary" id="member-next-btn" disabled>下一页</button>
+                    </div>
+                </div>
+
+                <div class="invite-action-wrap">
+                    <div class="card glass-card action-panel invite-panel">
+                        <div class="panel-kicker">INVITE</div>
+                        <h2>发送邀请邮件</h2>
+                        <p class="card-desc">自动进入 Adobe Admin Console，逐个提交成员邀请。</p>
+                        <textarea id="invite-emails" placeholder="member1@example.com&#10;member2@example.com"></textarea>
+                        <button class="btn action" id="invite-btn" disabled>发送邀请</button>
+                    </div>
+
+                </div>
+
+                <div class="card glass-card operation-console">
+                    <div class="console-heading">
+                        <div>
+                            <span class="eyebrow">OPERATION LOG</span>
+                            <h2>执行结果</h2>
+                        </div>
+                        <button class="btn-sm primary" id="clear-log-btn">清空</button>
+                    </div>
+                    <div id="operation-log" class="operation-log">
+                        <div class="empty-hint">等待执行团队操作</div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+    <script src="accounts.js"></script>
+</body>
+</html>

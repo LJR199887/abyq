@@ -19,6 +19,7 @@
                     <a href="/" class="nav-link">🚀 任务</a>
                     <a href="/records.html" class="nav-link">📋 记录</a>
                     <a href="/self-emails.html" class="nav-link">📮 自备邮箱</a>
+                    <a href="/accounts.html" class="nav-link">👤 账号</a>
                     <a href="/settings.html" class="nav-link active">⚙️ 设置</a>
                 </nav>
             </div>
@@ -95,6 +96,33 @@
                 <div class="status-msg" id="proxy-status"></div>
             </div>
 
+            <!-- Adobe Account Operations Proxy -->
+            <div class="card glass-card">
+                <h2><span class="icon">🛡️</span> 账号操作代理</h2>
+                <p class="card-desc">仅用于账号凭证导入后的检查与刷新、获取成员、移除成员、邀请成员和产品分配。不会用于注册浏览器、邮箱 API 或 Token 池。</p>
+                <label class="proxy-toggle-row">
+                    <input type="checkbox" id="adobe_proxy_enabled">
+                    <span>启用账号操作代理</span>
+                </label>
+                <div class="form-group">
+                    <label>代理协议</label>
+                    <select id="adobe_proxy_scheme">
+                        <option value="http">http</option>
+                        <option value="https">https</option>
+                        <option value="socks5">socks5</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>代理地址</label>
+                    <input type="text" id="adobe_proxy_url" list="proxy-format-list" placeholder="hostname:port:username:password" autocomplete="off">
+                </div>
+                <div style="display: flex; gap: 10px;">
+                    <button class="btn secondary" id="test-adobe-proxy-btn" style="flex: 1;">检测出口 IP</button>
+                    <button class="btn primary" id="save-adobe-proxy-btn" style="flex: 2;">保存配置</button>
+                </div>
+                <div class="status-msg" id="adobe-proxy-status"></div>
+            </div>
+
             <!-- Token Pool Config -->
             <div class="card glass-card">
                 <h2><span class="icon">🔁</span> 自动入池配置</h2>
@@ -125,12 +153,16 @@
         const proxyEnabledInput = document.getElementById("proxy_enabled");
         const proxySchemeInput = document.getElementById("proxy_scheme");
         const proxyUrlInput = document.getElementById("proxy_url");
+        const adobeProxyEnabledInput = document.getElementById("adobe_proxy_enabled");
+        const adobeProxySchemeInput = document.getElementById("adobe_proxy_scheme");
+        const adobeProxyUrlInput = document.getElementById("adobe_proxy_url");
         const tokenPoolEnabledInput = document.getElementById("token_pool_enabled");
         const tokenPoolSiteInput = document.getElementById("token_pool_site");
         const tokenPoolKeyInput = document.getElementById("token_pool_key");
         const configStatus = document.getElementById("config-status");
         const captchaStatus = document.getElementById("captcha-status");
         const proxyStatus = document.getElementById("proxy-status");
+        const adobeProxyStatus = document.getElementById("adobe-proxy-status");
         const tokenPoolStatus = document.getElementById("token-pool-status");
 
         // Load config
@@ -143,6 +175,9 @@
             proxyEnabledInput.checked = Boolean(data.proxy_enabled);
             proxySchemeInput.value = data.proxy_scheme || "http";
             proxyUrlInput.value = data.proxy_url || "";
+            adobeProxyEnabledInput.checked = Boolean(data.adobe_proxy_enabled);
+            adobeProxySchemeInput.value = data.adobe_proxy_scheme || "http";
+            adobeProxyUrlInput.value = data.adobe_proxy_url || "";
             tokenPoolEnabledInput.checked = Boolean(data.token_pool_enabled);
             tokenPoolSiteInput.value = data.token_pool_site || "";
             tokenPoolKeyInput.value = data.token_pool_key || "";
@@ -166,6 +201,9 @@
                     proxy_enabled: proxyEnabledInput.checked,
                     proxy_scheme: proxySchemeInput.value,
                     proxy_url: proxyUrlInput.value,
+                    adobe_proxy_enabled: adobeProxyEnabledInput.checked,
+                    adobe_proxy_scheme: adobeProxySchemeInput.value,
+                    adobe_proxy_url: adobeProxyUrlInput.value,
                     token_pool_enabled: tokenPoolEnabledInput.checked,
                     token_pool_site: tokenPoolSiteInput.value,
                     token_pool_key: tokenPoolKeyInput.value,
@@ -257,6 +295,45 @@
                 setTimeout(() => proxyStatus.textContent = "", 2000);
             });
         });
+
+        adobeProxySchemeInput.addEventListener("change", () => {
+            if (!adobeProxyUrlInput.value) {
+                adobeProxyUrlInput.placeholder = adobeProxySchemeInput.value === "socks5"
+                    ? "socks5://username:password@host:port"
+                    : "hostname:port:username:password";
+            }
+        });
+
+        document.getElementById("test-adobe-proxy-btn").addEventListener("click", () => {
+            const btn = document.getElementById("test-adobe-proxy-btn");
+            if (!adobeProxyUrlInput.value.trim()) {
+                showStatus(adobeProxyStatus, "请先填写代理地址", false);
+                return;
+            }
+            btn.disabled = true; btn.textContent = "检测 IP 中...";
+            fetch("/api/test-adobe-proxy", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({
+                    proxy_scheme: adobeProxySchemeInput.value,
+                    proxy_url: adobeProxyUrlInput.value,
+                })
+            }).then(r => r.json()).then(data => {
+                btn.disabled = false; btn.textContent = "检测出口 IP";
+                showStatus(adobeProxyStatus, data.valid ? "✅ " + data.message : "❌ " + data.message, data.valid);
+            }).catch(() => {
+                btn.disabled = false; btn.textContent = "检测出口 IP";
+                showStatus(adobeProxyStatus, "❌ 网络错误", false);
+            });
+        });
+
+        document.getElementById("save-adobe-proxy-btn").addEventListener("click", () => {
+            saveAllConfig().then(() => {
+                showStatus(adobeProxyStatus, "✅ 账号操作代理已保存", true);
+                setTimeout(() => adobeProxyStatus.textContent = "", 2000);
+            });
+        });
+
         document.getElementById("save-token-pool-btn").addEventListener("click", () => {
             if (tokenPoolEnabledInput.checked && (!tokenPoolSiteInput.value.trim() || !tokenPoolKeyInput.value.trim())) {
                 showStatus(tokenPoolStatus, "请填写网站地址和 Token 池密钥", false);

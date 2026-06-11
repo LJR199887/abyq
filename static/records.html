@@ -19,6 +19,7 @@
                     <a href="/" class="nav-link">🚀 任务</a>
                     <a href="/records.html" class="nav-link active">📋 记录</a>
                     <a href="/self-emails.html" class="nav-link">📮 自备邮箱</a>
+                    <a href="/accounts.html" class="nav-link">👤 账号</a>
                     <a href="/settings.html" class="nav-link">⚙️ 设置</a>
                 </nav>
             </div>
@@ -63,6 +64,10 @@
             return source === "self" ? "自备邮箱" : "临时邮箱";
         }
 
+        function registrationModeLabel(task) {
+            return task.registration_mode === "invite" ? "邀请模式" : emailSourceLabel(task.email_source);
+        }
+
         function refreshRecords() {
             fetch("/api/tasks").then(r => r.json()).then(data => {
                 tasks = data;
@@ -93,7 +98,7 @@
                                 <span class="badge ${badgeClass}">${badgeText}</span>
                             </div>
                             <div class="record-meta">
-                                #${t.id} · ${t.created_at} · ${emailSourceLabel(t.email_source)} · 数量 ${t.quantity} · 成功 <span class="ok">${t.completed}</span> · 失败 <span class="fail">${t.failed}</span> · 入池 <span class="pool">${t.token_pool_imported || 0}</span> · 未入池 <span class="unpooled">${t.token_pool_unpooled || 0}</span>
+                                #${t.id} · ${t.created_at} · ${registrationModeLabel(t)} · 数量 ${t.quantity} · 成功 <span class="ok">${t.completed}</span> · 失败 <span class="fail">${t.failed}</span> · 入池 <span class="pool">${t.token_pool_imported || 0}</span> · 未入池 <span class="unpooled">${t.token_pool_unpooled || 0}</span>
                             </div>
                         </div>
                     </div>

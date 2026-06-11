@@ -15,6 +15,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     // Logs state
     let taskLogs = { "sys": [{text: "系统就绪，等待任务创建...", type: "sys"}] };
+    let loadedTaskLogs = new Set();
     let currentLogTaskId = "sys";
 
     function switchLogView(taskId) {
@@ -35,6 +36,23 @@ document.addEventListener("DOMContentLoaded", () => {
                 el.classList.remove("active-task");
             }
         });
+
+        if (taskId !== "sys" && !loadedTaskLogs.has(taskId)) {
+            fetch(`/api/tasks/${taskId}/logs?limit=5000`)
+                .then(response => response.ok ? response.json() : Promise.reject())
+                .then(data => {
+                    taskLogs[taskId] = (data.logs || []).map(text => ({
+                        text,
+                        type: logType(text),
+                    }));
+                    loadedTaskLogs.add(taskId);
+                    if (currentLogTaskId === taskId) {
+                        terminalBody.innerHTML = "";
+                        taskLogs[taskId].forEach(renderSingleLog);
+                    }
+                })
+                .catch(() => {});
+        }
     }
 
     function renderSingleLog(entry) {
@@ -43,7 +61,7 @@ document.addEventListener("DOMContentLoaded", () => {
         line.textContent = entry.text;
         terminalBody.appendChild(line);
         terminalBody.scrollTo({ top: terminalBody.scrollHeight, behavior: "smooth" });
-        if (terminalBody.childElementCount > 1000) {
+        if (terminalBody.childElementCount > 5000) {
             terminalBody.removeChild(terminalBody.firstChild);
         }
     }
@@ -52,17 +70,79 @@ document.addEventListener("DOMContentLoaded", () => {
     const concurrencyInput = document.getElementById("task_concurrency");
     const showBrowserCb = document.getElementById("show_browser");
     const emailSourceInput = document.getElementById("email_source");
+    const registrationModeInput = document.getElementById("registration_mode");
+    const emailSourceGroup = document.getElementById("email-source-group");
+    const inviteAccountGroup = document.getElementById("invite-account-group");
+    const inviteAccountList = document.getElementById("invite-account-list");
+    const inviteAccountCount = document.getElementById("invite-account-count");
 
     function emailSourceLabel(source) {
         return source === "self" ? "自备邮箱" : "临时邮箱";
     }
+
+    function registrationModeLabel(mode) {
+        return mode === "invite" ? "邀请模式" : "普通注册";
+    }
+
+    function logType(text) {
+        if (text.includes("❌") || text.includes("⚠️")) return "error";
+        if (text.includes("✅") || text.includes("🎉")) return "success";
+        if (text.includes("系统") || text.includes("📋") || text.includes("🏁")) return "sys";
+        return "info";
+    }
+
+    function selectedAdobeAccountIds() {
+        return Array.from(inviteAccountList.querySelectorAll("input[type='checkbox']:checked")).map(input => input.value);
+    }
+
+    function updateInviteAccountCount() {
+        const count = selectedAdobeAccountIds().length;
+        inviteAccountCount.textContent = count ? `已选 ${count} 个` : "请选择账号";
+    }
+
+    function loadInviteAccounts() {
+        fetch("/api/adobe-accounts")
+            .then(response => response.json())
+            .then(accounts => {
+                inviteAccountList.innerHTML = accounts.length ? accounts.map(account => `
+                    <label class="invite-account-option">
+                        <input type="checkbox" value="${account.id}">
+                        <span class="invite-account-avatar">${(account.name || "A").slice(0, 1).toUpperCase()}</span>
+                        <span class="invite-account-info">
+                            <strong>${account.name || "未命名账号"}</strong>
+                            <small>${account.organization_id || "尚未检测组织"}</small>
+                        </span>
+                    </label>
+                `).join("") : '<div class="empty-hint">暂无账号，请先前往账号页面配置</div>';
+                updateInviteAccountCount();
+            })
+            .catch(() => {
+                inviteAccountList.innerHTML = '<div class="empty-hint">账号读取失败</div>';
+            });
+    }
+
+    registrationModeInput.addEventListener("change", () => {
+        const invite = registrationModeInput.value === "invite";
+        inviteAccountGroup.hidden = !invite;
+        emailSourceGroup.hidden = invite;
+        if (invite) emailSourceInput.value = "self";
+    });
+    inviteAccountList.addEventListener("change", updateInviteAccountCount);
+    loadInviteAccounts();
 
     startBtn.addEventListener("click", () => {
         const qty = parseInt(qtyInput.value) || 1;
         const conc = parseInt(concurrencyInput.value) || 1;
         const showBrowser = showBrowserCb.checked;
         const taskName = (taskNameInput.value || "").trim();
-        const emailSource = emailSourceInput ? emailSourceInput.value : "temp";
+        const registrationMode = registrationModeInput ? registrationModeInput.value : "standard";
+        const emailSource = registrationMode === "invite" ? "self" : (emailSourceInput ? emailSourceInput.value : "temp");
+        const adobeAccountIds = registrationMode === "invite" ? selectedAdobeAccountIds() : [];
+        if (registrationMode === "invite" && !adobeAccountIds.length) {
+            taskStatus.style.color = "var(--danger)";
+            taskStatus.textContent = "邀请模式至少选择一个团队账号";
+            return;
+        }
 
         startBtn.disabled = true;
         startBtn.textContent = "加入中...";
@@ -70,18 +150,32 @@ document.addEventListener("DOMContentLoaded", () => {
         fetch("/api/tasks", {
             method: "POST",
             headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({ name: taskName, quantity: qty, concurrency: conc, show_browser: showBrowser, email_source: emailSource })
-        }).then(r => r.json()).then(data => {
+            body: JSON.stringify({
+                name: taskName,
+                quantity: qty,
+                concurrency: conc,
+                show_browser: showBrowser,
+                email_source: emailSource,
+                registration_mode: registrationMode,
+                adobe_account_ids: adobeAccountIds,
+            })
+        }).then(async r => {
+            const data = await r.json();
+            if (!r.ok) throw new Error(data.message || "任务创建失败");
+            return data;
+        }).then(data => {
             startBtn.disabled = false;
             startBtn.textContent = "加入队列";
             taskStatus.style.color = "var(--success)";
-            taskStatus.textContent = `✅ ${data.name} 已创建 (${data.quantity}个, 并发${data.concurrency} · ${emailSourceLabel(data.email_source)})`;
+            taskStatus.textContent = `✅ ${data.name} 已创建 (${data.quantity}个, 并发${data.concurrency} · ${registrationModeLabel(data.registration_mode)})`;
             setTimeout(() => taskStatus.textContent = "", 3000);
-            appendLog(`系统: ${data.name} 已加入队列 (#${data.id}, ${data.quantity}个注册, 并发${data.concurrency} · ${emailSourceLabel(data.email_source)})`, "sys");
+            appendLog(`系统: ${data.name} 已加入队列 (#${data.id}, ${data.quantity}个注册, 并发${data.concurrency} · ${registrationModeLabel(data.registration_mode)})`, "sys");
             refreshTaskList();
-        }).catch(() => {
+        }).catch(error => {
             startBtn.disabled = false;
             startBtn.textContent = "加入队列";
+            taskStatus.style.color = "var(--danger)";
+            taskStatus.textContent = error.message || "任务创建失败";
         });
     });
 
@@ -131,7 +225,7 @@ document.addEventListener("DOMContentLoaded", () => {
                         <div class="task-item${activeClass}" data-id="${t.id}" style="cursor: pointer;">
                             <div class="task-left">
                                 <span class="task-id">${t.name || `任务 #${t.id}`}</span>
-                                <span class="task-meta">#${t.id} · ${t.created_at} · ${emailSourceLabel(t.email_source)} · ${t.quantity}个 · 并发${t.concurrency}</span>
+                                <span class="task-meta">#${t.id} · ${t.created_at} · ${registrationModeLabel(t.registration_mode)} · ${t.quantity}个 · 并发${t.concurrency}</span>
                             </div>
                             <div class="task-right">
                                 <div class="task-counts">
@@ -186,11 +280,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 refreshTaskList();
                 return;
             }
-            let type = "info";
-            if (msg.includes("✅") || msg.includes("🎉")) type = "success";
-            if (msg.includes("❌") || msg.includes("⚠️")) type = "error";
-            if (msg.includes("系统") || msg.includes("📋") || msg.includes("🏁")) type = "sys";
-            appendLog(msg, type);
+            appendLog(msg, logType(msg));
         };
 
         ws.onclose = () => {
@@ -200,8 +290,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
     function appendLog(text, type = "info") {
         let tid = null;
-        let match = text.match(/\[任务#(\d+)-\d+\]/);
-        if (!match) match = text.match(/任务 #(\d+) /);
+        let match = text.match(/\[任务#(\d+)(?:[-\s·\]])/);
+        if (!match) match = text.match(/任务\s*#(\d+)/);
         if (match) tid = parseInt(match[1]);
 
         let entry = { text, type };

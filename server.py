@@ -10,15 +10,16 @@ import sys
 import shutil
 import signal
 import uuid
+from http.cookies import SimpleCookie
 from contextlib import suppress
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import quote, unquote, urljoin, urlsplit
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import glob
 import httpx
 
@@ -30,7 +31,9 @@ DATA_DIR = os.getenv("DATA_DIR", APP_DIR)
 SCREENSHOT_DIR = os.path.join(DATA_DIR, "screenshots")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 TASKS_FILE = os.path.join(DATA_DIR, "tasks.json")
+TASK_LOG_DIR = os.path.join(DATA_DIR, "task_logs")
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+os.makedirs(TASK_LOG_DIR, exist_ok=True)
 
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -41,15 +44,25 @@ DEFAULT_CONFIG = {
     "proxy_enabled": False,
     "proxy_scheme": "http",
     "proxy_url": "",
+    "adobe_proxy_enabled": False,
+    "adobe_proxy_scheme": "http",
+    "adobe_proxy_url": "",
     "token_pool_enabled": False,
     "token_pool_site": "",
     "token_pool_key": "",
     "self_email_accounts": "",
     "self_email_cursor": 0,
     "self_email_used": [],
+    "adobe_accounts": [],
 }
 
+ADOBE_INVITE_PRODUCT_NAMES = (
+    "Creative Cloud Pro",
+    "Complimentary Membership Teams",
+)
+
 WORKER_TIMEOUT_SECONDS = max(180, int(os.getenv("WORKER_TIMEOUT_SECONDS", "900")))
+INVITE_EMAIL_WAIT_SECONDS = max(0, int(os.getenv("INVITE_EMAIL_WAIT_SECONDS", "300")))
 STALE_PROFILE_SECONDS = max(300, int(os.getenv("STALE_PROFILE_SECONDS", "1800")))
 PROFILE_PREFIX = "chrome_profile_"
 ADMIN_USERNAME = "link"
@@ -66,6 +79,33 @@ PUBLIC_PATHS = {
     "/app.js",
     "/login.html",
 }
+
+
+def extract_task_id_from_log(message: str) -> int | None:
+    for pattern in (r"\[任务#(\d+)(?:[-\s·\]])", r"任务\s*#(\d+)"):
+        match = re.search(pattern, message)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def task_log_path(task_id: int) -> str:
+    return os.path.join(TASK_LOG_DIR, f"task_{task_id}.log")
+
+
+def append_task_log(task_id: int, message: str):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    with open(task_log_path(task_id), "a", encoding="utf-8") as log_file:
+        log_file.write(f"[{timestamp}] {message}\n")
+
+
+def read_task_logs(task_id: int, limit: int = 5000) -> list[str]:
+    path = task_log_path(task_id)
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8", errors="replace") as log_file:
+        lines = [line.rstrip("\r\n") for line in log_file]
+    return lines[-max(1, min(limit, 10000)):]
 
 
 def is_authenticated(request: Request) -> bool:
@@ -157,6 +197,35 @@ def normalize_proxy(proxy_url: str, proxy_scheme: str = "http") -> dict:
         "server": server,
         "url": url,
     }
+
+
+def adobe_proxy_config() -> dict | None:
+    if not config.get("adobe_proxy_enabled"):
+        return None
+    return normalize_proxy(
+        config.get("adobe_proxy_url", ""),
+        config.get("adobe_proxy_scheme", "http"),
+    )
+
+
+def adobe_httpx_client(**kwargs) -> httpx.AsyncClient:
+    proxy = adobe_proxy_config()
+    if proxy:
+        kwargs["proxy"] = proxy["url"]
+    return httpx.AsyncClient(**kwargs)
+
+
+def adobe_playwright_proxy() -> dict | None:
+    proxy = adobe_proxy_config()
+    if not proxy:
+        return None
+    result = {"server": proxy["server"]}
+    if proxy["username"]:
+        result["username"] = proxy["username"]
+    if proxy["password"]:
+        result["password"] = proxy["password"]
+    return result
+
 
 def _proxy_auth_header(username: str, password: str) -> str:
     if not username and not password:
@@ -279,15 +348,30 @@ def export_timestamp() -> str:
 config = load_config()
 self_email_lock = asyncio.Lock()
 self_email_reserved = set()
+adobe_account_lock = asyncio.Lock()
 
 # ─── Task Management ───
 class Task:
-    def __init__(self, task_id, quantity, concurrency=1, show_browser=False, name="", email_source="temp"):
+    def __init__(
+        self,
+        task_id,
+        quantity,
+        concurrency=1,
+        show_browser=False,
+        name="",
+        email_source="temp",
+        registration_mode="standard",
+        adobe_account_ids=None,
+        batch_quantity=None,
+    ):
         self.id = task_id
         self.quantity = quantity
+        self.batch_quantity = batch_quantity or quantity
         self.concurrency = concurrency
         self.show_browser = show_browser
         self.email_source = email_source if email_source in ("temp", "self") else "temp"
+        self.registration_mode = registration_mode if registration_mode in ("standard", "invite") else "standard"
+        self.adobe_account_ids = list(adobe_account_ids or [])
         self.name = (name or "").strip() or f"任务 #{task_id}"
         self.status = "pending"     # pending -> running -> stopping -> completed/stopped
         self.completed = 0
@@ -304,9 +388,12 @@ class Task:
         return {
             "id": self.id,
             "quantity": self.quantity,
+            "batch_quantity": self.batch_quantity,
             "concurrency": self.concurrency,
             "show_browser": self.show_browser,
             "email_source": self.email_source,
+            "registration_mode": self.registration_mode,
+            "adobe_account_ids": self.adobe_account_ids,
             "name": self.name,
             "status": self.status,
             "completed": self.completed,
@@ -385,6 +472,9 @@ class TaskManager:
                             t_data.get("show_browser", False),
                             t_data.get("name", ""),
                             t_data.get("email_source", "temp"),
+                            t_data.get("registration_mode", "standard"),
+                            t_data.get("adobe_account_ids", []),
+                            t_data.get("batch_quantity"),
                         )
                         t.status = t_data["status"]
                         t.completed = t_data.get("completed", 0)
@@ -400,8 +490,29 @@ class TaskManager:
             except Exception as e:
                 print(f"Failed to load tasks: {e}")
 
-    def create_task(self, quantity, concurrency=1, show_browser=False, name="", email_source="temp") -> Task:
-        task = Task(self.next_id, quantity, concurrency, show_browser, name, email_source)
+    def create_task(
+        self,
+        quantity,
+        concurrency=1,
+        show_browser=False,
+        name="",
+        email_source="temp",
+        registration_mode="standard",
+        adobe_account_ids=None,
+    ) -> Task:
+        account_ids = list(adobe_account_ids or [])
+        total_quantity = quantity * len(account_ids) if registration_mode == "invite" else quantity
+        task = Task(
+            self.next_id,
+            total_quantity,
+            concurrency,
+            show_browser,
+            name,
+            email_source,
+            registration_mode,
+            account_ids,
+            quantity,
+        )
         self.tasks[self.next_id] = task
         self.next_id += 1
         return task
@@ -413,6 +524,8 @@ class TaskManager:
                 # Only delete non-running tasks
                 if t.status not in ("running", "pending"):
                     del self.tasks[tid]
+                    with suppress(OSError):
+                        os.remove(task_log_path(tid))
 
     async def stop_tasks(self, ids: list[int]):
         for tid in ids:
@@ -427,6 +540,10 @@ class TaskManager:
     async def broadcast(self, message: str):
         if message == "__STATE_UPDATE__":
             self.save_tasks()
+        else:
+            task_id = extract_task_id_from_log(message)
+            if task_id:
+                append_task_log(task_id, message)
 
         disconnected = []
         for ws in self.websockets:
@@ -472,6 +589,9 @@ class ConfigUpdate(BaseModel):
     proxy_enabled: bool = False
     proxy_scheme: str = "http"
     proxy_url: str = ""
+    adobe_proxy_enabled: bool = False
+    adobe_proxy_scheme: str = "http"
+    adobe_proxy_url: str = ""
     token_pool_enabled: bool = False
     token_pool_site: str = ""
     token_pool_key: str = ""
@@ -495,9 +615,22 @@ class TaskStart(BaseModel):
     show_browser: bool = False
     name: str = ""
     email_source: str = "temp"
+    registration_mode: str = "standard"
+    adobe_account_ids: list[str] = Field(default_factory=list)
 
 class TaskDeleteRequest(BaseModel):
     ids: list[int]
+
+
+class AdobeAccountUpdate(BaseModel):
+    id: str = ""
+    name: str
+    cookie: str = ""
+
+
+class AdobeTeamActionRequest(BaseModel):
+    account_id: str
+    emails: list[str]
 
 # ─── Auth Endpoints ───
 @app.get(LOGIN_PATH)
@@ -526,6 +659,7 @@ async def logout(request: Request):
 async def update_config(item: ConfigUpdate):
     global config
     proxy_scheme = item.proxy_scheme if item.proxy_scheme in ("http", "https", "socks5") else "http"
+    adobe_proxy_scheme = item.adobe_proxy_scheme if item.adobe_proxy_scheme in ("http", "https", "socks5") else "http"
     config = {
         "api_key": item.api_key,
         "api_base": item.api_base,
@@ -535,12 +669,16 @@ async def update_config(item: ConfigUpdate):
         "proxy_enabled": item.proxy_enabled,
         "proxy_scheme": proxy_scheme,
         "proxy_url": item.proxy_url.strip(),
+        "adobe_proxy_enabled": item.adobe_proxy_enabled,
+        "adobe_proxy_scheme": adobe_proxy_scheme,
+        "adobe_proxy_url": item.adobe_proxy_url.strip(),
         "token_pool_enabled": item.token_pool_enabled,
         "token_pool_site": item.token_pool_site.strip(),
         "token_pool_key": item.token_pool_key.strip(),
         "self_email_accounts": config.get("self_email_accounts", ""),
         "self_email_cursor": config.get("self_email_cursor", 0),
         "self_email_used": config.get("self_email_used", []),
+        "adobe_accounts": config.get("adobe_accounts", []),
     }
     save_config(config)
     return {"status": "ok"}
@@ -597,7 +735,718 @@ async def test_captcha_config(data: dict):
 
 @app.get("/api/config")
 async def get_config():
-    return config
+    return {key: value for key, value in config.items() if key != "adobe_accounts"}
+
+
+def normalize_email_list(emails: list[str]) -> list[str]:
+    normalized = []
+    seen = set()
+    for value in emails:
+        email = (value or "").strip().lower()
+        if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) and email not in seen:
+            seen.add(email)
+            normalized.append(email)
+    return normalized
+
+
+def adobe_account_summary(account: dict) -> dict:
+    cookie = account.get("cookie", "")
+    try:
+        cookie_count = len(parse_adobe_cookies(cookie)) if cookie else 0
+    except ValueError:
+        cookie_count = 0
+    return {
+        "id": account.get("id", ""),
+        "name": account.get("name", ""),
+        "cookie_configured": bool(cookie),
+        "cookie_preview": f"已配置 · {cookie_count} 项" if cookie else "",
+        "product_count": len(account.get("invite_product_ids", [])),
+        "organization_id": account.get("organization_id", ""),
+        "subscriptions": account.get("subscriptions", []),
+        "last_token_check_at": account.get("last_token_check_at", ""),
+        "token_expires_at": account.get("token_expires_at", ""),
+        "updated_at": account.get("updated_at", ""),
+    }
+
+
+@app.post("/api/test-adobe-proxy")
+async def test_adobe_proxy(item: ProxyTestRequest):
+    ok, message, proxy = test_proxy_connectivity(item.proxy_url, item.proxy_scheme)
+    exit_ip = ""
+    if ok and proxy:
+        try:
+            async with httpx.AsyncClient(proxy=proxy["url"], timeout=15.0) as client:
+                response = await client.get("https://api.ipify.org", params={"format": "json"})
+                response.raise_for_status()
+                exit_ip = str(response.json().get("ip") or "").strip()
+        except Exception as exc:
+            return {
+                "valid": False,
+                "message": f"Adobe HTTPS 已连通，但出口 IP 检测失败: {type(exc).__name__}: {exc}",
+                "normalized": proxy["url"],
+                "exit_ip": "",
+                "scope": "仅用于账号凭证刷新与团队成员操作",
+            }
+    return {
+        "valid": ok,
+        "message": f"代理出口 IP: {exit_ip}" if exit_ip else message,
+        "normalized": proxy["url"] if proxy else "",
+        "exit_ip": exit_ip,
+        "scope": "仅用于账号凭证刷新与团队成员操作",
+    }
+
+
+def summarize_adobe_subscriptions(products: list[dict]) -> list[dict]:
+    subscriptions = []
+    for product in products:
+        quantities = product.get("licenseQuantities") or []
+        end_dates = [item.get("endDate") for item in quantities if item.get("endDate")]
+        end_date = min(end_dates) if end_dates else ""
+        remaining_days = None
+        if end_date:
+            with suppress(Exception):
+                expires_at = datetime.fromisoformat(end_date)
+                remaining_days = max(0, (expires_at - datetime.now(expires_at.tzinfo)).days)
+        subscriptions.append({
+            "name": product.get("longName") or product.get("shortName") or "Adobe 产品",
+            "created_date": (product.get("createdDate") or "")[:10],
+            "end_date": end_date[:10],
+            "remaining_days": remaining_days,
+            "status": product.get("licenseStatus", ""),
+            "offer_type": product.get("applicableOfferType", ""),
+        })
+    return subscriptions
+
+
+def find_adobe_account(account_id: str) -> dict | None:
+    return next(
+        (account for account in config.get("adobe_accounts", []) if account.get("id") == account_id),
+        None,
+    )
+
+
+def parse_adobe_cookies(cookie_header: str) -> list[dict]:
+    jar = SimpleCookie()
+    try:
+        jar.load(cookie_header or "")
+    except Exception as exc:
+        raise ValueError(f"Cookie 格式无效: {exc}") from exc
+    cookies = [
+        {
+            "name": name,
+            "value": morsel.value,
+            "domain": ".adobe.com",
+            "path": "/",
+            "secure": True,
+            "httpOnly": False,
+            "sameSite": "Lax",
+        }
+        for name, morsel in jar.items()
+    ]
+    if not cookies:
+        raise ValueError("Cookie 为空，请粘贴浏览器导出的完整 Cookie 字符串")
+    return cookies
+
+
+async def click_first_visible(page, selectors: list[str], timeout: int = 8000):
+    last_error = None
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            await locator.wait_for(state="visible", timeout=timeout)
+            await locator.click()
+            return locator
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"未找到可操作按钮: {selectors[0]}") from last_error
+
+
+async def open_adobe_admin(cookie_header: str, target_url: str = "https://adminconsole.adobe.com/", on_request=None):
+    from playwright.async_api import async_playwright
+
+    playwright = await async_playwright().start()
+    launch_options = {"headless": True}
+    proxy = adobe_playwright_proxy()
+    if proxy:
+        launch_options["proxy"] = proxy
+    browser = await playwright.chromium.launch(**launch_options)
+    context = await browser.new_context(locale="zh-CN")
+    await context.add_cookies(parse_adobe_cookies(cookie_header))
+    page = await context.new_page()
+    if on_request:
+        page.on("request", on_request)
+    await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+    await page.wait_for_timeout(2500)
+    if "auth.services.adobe.com" in page.url or "signin" in page.url.lower():
+        await browser.close()
+        await playwright.stop()
+        raise RuntimeError("Cookie 已失效或不包含 Adobe Admin Console 登录状态")
+    return playwright, browser, page
+
+
+async def get_adobe_api_session(account: dict, include_protected: bool = False) -> dict:
+    cookie = account.get("cookie", "")
+    try:
+        async with adobe_httpx_client() as client:
+            token_response = await client.post(
+                "https://adobeid-na1.services.adobe.com/ims/check/v6/token",
+                headers={
+                    "Cookie": cookie,
+                    "Origin": "https://firefly.adobe.com",
+                    "Referer": "https://firefly.adobe.com/",
+                    "User-Agent": "Mozilla/5.0",
+                },
+                data={
+                    "client_id": "clio-playground-web",
+                    "guest_allowed": "true",
+                    "scope": "AdobeID,openid",
+                },
+                timeout=30.0,
+            )
+            if token_response.status_code != 200:
+                raise RuntimeError(f"IMS Token 请求失败 ({token_response.status_code})")
+            token_data = token_response.json()
+            access_token = (token_data.get("access_token") or "").strip()
+            if not access_token:
+                raise RuntimeError("IMS 响应中没有 access_token")
+            headers = {
+                "authorization": f"Bearer {access_token}",
+                "x-api-key": "ONESIE1",
+                "x-jil-feature": "use_clam,pa_4280",
+                "accept": "application/json",
+                "referer": "https://adminconsole.adobe.com/",
+                "user-agent": "Mozilla/5.0",
+            }
+            organizations_response = await client.get(
+                "https://bps-il.adobe.io/jil-api/v2/organizations",
+                headers=headers,
+                timeout=30.0,
+            )
+            if organizations_response.status_code != 200:
+                raise RuntimeError(f"组织查询失败 ({organizations_response.status_code})")
+            organizations = organizations_response.json()
+            if not isinstance(organizations, list) or not organizations:
+                raise RuntimeError("当前账号没有可管理的 Adobe 组织")
+            organization_id = account.get("organization_id", "")
+            if not any(org.get("id") == organization_id for org in organizations):
+                organization_id = organizations[0].get("id", "")
+            protected_emails = set()
+            login_email = (token_data.get("email") or "").strip().lower()
+            if login_email:
+                protected_emails.add(login_email)
+            products_response = await client.get(
+                f"https://bps-il.adobe.io/jil-api/v2/organizations/{quote(organization_id, safe='@')}/products",
+                params={
+                    "include_created_date": "true",
+                    "include_expired": "true",
+                    "include_groups_quantity": "false",
+                    "include_inactive": "false",
+                    "include_legacy_ls_fields": "true",
+                    "include_license_activations": "true",
+                    "include_license_allocation_info": "false",
+                    "include_pricing_data": "false",
+                    "includeFulfillableItemCodesOnly": "true",
+                    "processing_instruction_codes": "administration",
+                },
+                headers=headers,
+                timeout=30.0,
+            )
+            if products_response.status_code == 200 and isinstance(products_response.json(), list):
+                products = products_response.json()
+                account["subscriptions"] = summarize_adobe_subscriptions(products)
+                by_name = {
+                    (product.get("longName") or product.get("shortName") or "").strip(): product.get("id")
+                    for product in products
+                    if product.get("id") and product.get("licenseStatus") == "ACTIVE"
+                }
+                account["invite_product_ids"] = [
+                    by_name[name] for name in ADOBE_INVITE_PRODUCT_NAMES if by_name.get(name)
+                ]
+
+        expires_in = float(token_data.get("expires_in") or 0)
+        if expires_in > 864000:
+            expires_in /= 1000
+        account["organization_id"] = organization_id
+        account["last_token_check_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        account["token_expires_at"] = (
+            datetime.now() + timedelta(seconds=max(0, expires_in))
+        ).strftime("%Y-%m-%d %H:%M")
+        if account in config.get("adobe_accounts", []):
+            save_config(config)
+        return {
+            "source": "ims",
+            "organization_id": organization_id,
+            "headers": headers,
+            "protected_emails": protected_emails,
+        }
+    except Exception as ims_error:
+        playwright = browser = None
+        captured_requests = []
+        try:
+            def capture_jil_request(request):
+                if "bps-il.adobe.io/jil-api/" in request.url and "/users/" in request.url:
+                    captured_requests.append(request)
+
+            playwright, browser, page = await open_adobe_admin(
+                cookie,
+                "https://adminconsole.adobe.com/users",
+                capture_jil_request,
+            )
+            await page.wait_for_timeout(10000)
+            if not captured_requests:
+                raise RuntimeError("未捕获到 Adobe JIL 鉴权请求")
+            captured = captured_requests[-1]
+            match = re.search(r"/organizations/([^/]+)/users/", captured.url)
+            if not match:
+                raise RuntimeError("无法识别 Adobe 组织 ID")
+            organization_id = unquote(match.group(1))
+            headers = {
+                key: value
+                for key, value in captured.headers.items()
+                if key in {
+                    "authorization", "x-api-key", "x-include-roles", "x-jil-feature",
+                    "accept", "referer", "user-agent",
+                }
+            }
+            protected_emails = await get_protected_adobe_member_emails(page) if include_protected else set()
+            return {
+                "source": "browser",
+                "organization_id": organization_id,
+                "headers": headers,
+                "protected_emails": protected_emails,
+            }
+        except Exception as fallback_error:
+            raise RuntimeError(f"Cookie 鉴权失败: IMS={ims_error}; Admin Console={fallback_error}") from fallback_error
+        finally:
+            if browser:
+                await browser.close()
+            if playwright:
+                await playwright.stop()
+
+
+async def test_adobe_account_cookie(account: dict) -> dict:
+    session = await get_adobe_api_session(account)
+    return {
+        "ok": True,
+        "message": f"Cookie 有效，已通过 {session['source'].upper()} 获取管理凭据",
+        "organization_id": session["organization_id"],
+    }
+
+
+async def get_protected_adobe_member_emails(page) -> set[str]:
+    protected = set()
+    checkboxes = page.locator('input[type="checkbox"]')
+    for index in range(await checkboxes.count()):
+        checkbox = checkboxes.nth(index)
+        if not await checkbox.is_disabled():
+            continue
+        row = checkbox.locator('xpath=ancestor::*[@role="row"]')
+        if not await row.count():
+            continue
+        text = await row.inner_text()
+        protected.update(email.lower() for email in re.findall(r"[^@\s]+@[^@\s]+\.[^@\s]+", text))
+    return protected
+
+
+def adobe_member_summary(member: dict, protected_emails: set[str] | None = None) -> dict:
+    products = member.get("products") or []
+    email = member.get("email") or member.get("userName") or ""
+    protected = email.strip().lower() in (protected_emails or set())
+    return {
+        "id": member.get("id", ""),
+        "email": email,
+        "first_name": member.get("firstName", ""),
+        "last_name": member.get("lastName", ""),
+        "type": member.get("type", ""),
+        "account_status": member.get("accountStatus", ""),
+        "protected": protected,
+        "protection_reason": "当前登录主账号" if protected else "",
+        "removable": bool(member.get("removable")) and not protected,
+        "editable": bool(member.get("editable")),
+        "products": len(products),
+    }
+
+
+async def fetch_adobe_members(account: dict, page_number: int = 0, page_size: int = 20, search: str = "") -> dict:
+    session = await get_adobe_api_session(account, include_protected=True)
+    organization_id = session["organization_id"]
+    allowed_headers = session["headers"]
+    protected_emails = session["protected_emails"]
+    try:
+        api_url = f"https://bps-il.adobe.io/jil-api/v2/organizations/{quote(organization_id, safe='@')}/users/"
+        params = {
+            "filter_exclude_domain": "techacct.adobe.com",
+            "page": max(0, page_number),
+            "page_size": min(max(1, page_size), 100),
+            "search_query": search.strip(),
+            "sort": "FNAME_LNAME",
+            "sort_order": "ASC",
+            "currentPage": max(0, page_number) + 1,
+            "filterQuery": "",
+            "include": "DOMAIN_ENFORCEMENT_EXCEPTION_INDICATOR",
+        }
+        response = None
+        last_error = ""
+        async with adobe_httpx_client() as client:
+            for attempt in range(1, 4):
+                try:
+                    response = await client.get(api_url, params=params, headers=allowed_headers, timeout=45.0)
+                    if response.status_code == 200 or response.status_code not in (429, 500, 502, 503, 504):
+                        break
+                    last_error = f"HTTP {response.status_code}"
+                except httpx.HTTPError as exc:
+                    last_error = f"{type(exc).__name__}: {exc}"
+                    response = None
+                if attempt < 3:
+                    await asyncio.sleep(attempt * 2)
+        if response is None:
+            raise RuntimeError(f"Adobe JIL API 请求失败: {last_error}")
+        if response.status_code != 200:
+            message = response.text[:300]
+            with suppress(Exception):
+                message = response.json().get("message", message)
+            raise RuntimeError(f"Adobe JIL API 返回 {response.status_code}: {message}")
+        members = response.json()
+        if not isinstance(members, list):
+            raise RuntimeError("Adobe JIL API 返回了未知成员数据格式")
+        return {
+            "organization_id": organization_id,
+            "page": params["page"],
+            "page_size": params["page_size"],
+            "has_more": len(members) >= params["page_size"],
+            "members": [adobe_member_summary(member, protected_emails) for member in members],
+        }
+    finally:
+        pass
+
+
+async def invite_adobe_members(account: dict, emails: list[str]) -> list[dict]:
+    results = []
+    session = await get_adobe_api_session(account)
+    organization_id = session["organization_id"]
+    allowed_headers = session["headers"]
+    try:
+        allowed_headers["content-type"] = "application/json"
+        jil_users_url = (
+            "https://bps-il.adobe.io/jil-api/v2/organizations/"
+            f"{quote(organization_id, safe='@')}/users"
+        )
+        invite_url = (
+            "https://abpapi.adobe.io/abpapi/organizations/"
+            f"{quote(organization_id, safe='@')}/users"
+        )
+        product_ids = account.get("invite_product_ids", [])
+        if not product_ids:
+            raise RuntimeError("当前组织未找到可用于邀请的有效产品")
+        async with adobe_httpx_client() as client:
+            async def lookup_member(email: str, email_key: str, attempts: int = 5) -> dict | None:
+                lookup_params = {
+                    "filter_exclude_domain": "techacct.adobe.com",
+                    "page": 0,
+                    "page_size": 20,
+                    "search_query": email,
+                    "sort": "FNAME_LNAME",
+                    "sort_order": "ASC",
+                    "currentPage": 1,
+                    "filterQuery": email,
+                }
+                for attempt in range(attempts):
+                    try:
+                        lookup = await client.get(
+                            jil_users_url + "/",
+                            params=lookup_params,
+                            headers=allowed_headers,
+                            timeout=45.0,
+                        )
+                        if lookup.status_code == 200:
+                            member = next(
+                                (
+                                    item for item in lookup.json()
+                                    if (item.get("email") or item.get("userName") or "").strip().lower() == email_key
+                                ),
+                                None,
+                            )
+                            if member:
+                                return member
+                    except httpx.HTTPError:
+                        pass
+                    if attempt < attempts - 1:
+                        await asyncio.sleep(2)
+                return None
+
+            for email in emails:
+                try:
+                    email_key = email.strip().lower()
+                    already_exists = False
+                    invite_error = ""
+                    try:
+                        response = await client.post(
+                            invite_url,
+                            json={"email": {"primary": email}},
+                            headers=allowed_headers,
+                            timeout=45.0,
+                        )
+                        already_exists = response.status_code == 400 and "user_already_exists" in response.text
+                        if response.status_code not in (200, 201, 202, 204) and not already_exists:
+                            message = response.text[:300]
+                            with suppress(Exception):
+                                body = response.json()
+                                message = body.get("message") or body.get("error_description") or message
+                            invite_error = f"邀请失败 ({response.status_code}): {message}"
+                    except httpx.HTTPError as exc:
+                        invite_error = f"邀请请求异常: {type(exc).__name__}: {exc}"
+
+                    member = await lookup_member(email, email_key, attempts=8)
+                    if not member:
+                        raise RuntimeError(invite_error or "邀请已提交，但暂未查询到新成员，无法分配产品")
+
+                    failures = []
+                    for product_id in product_ids:
+                        existing_ids = {
+                            str(product.get("id") or product)
+                            for product in member.get("products", [])
+                        }
+                        if product_id in existing_ids:
+                            continue
+
+                        assignment_error = ""
+                        for attempt in range(1, 4):
+                            try:
+                                assignment = await client.patch(
+                                    jil_users_url,
+                                    json=[{"op": "add", "path": f"/{member['id']}/products/{product_id}"}],
+                                    headers=allowed_headers,
+                                    timeout=60.0,
+                                )
+                                if assignment.status_code in (200, 202, 204):
+                                    assignment_error = ""
+                                    break
+                                message = assignment.text[:180]
+                                with suppress(Exception):
+                                    body = assignment.json()
+                                    message = body.get("message") or body.get("detail") or message
+                                assignment_error = f"HTTP {assignment.status_code}: {message}"
+                            except httpx.HTTPError as exc:
+                                assignment_error = f"{type(exc).__name__}: {exc}"
+
+                            member = await lookup_member(email, email_key, attempts=3) or member
+                            existing_ids = {
+                                str(product.get("id") or product)
+                                for product in member.get("products", [])
+                            }
+                            if product_id in existing_ids:
+                                assignment_error = ""
+                                break
+                            if attempt < 3:
+                                await asyncio.sleep(2)
+                        if assignment_error:
+                            failures.append(f"{product_id} ({assignment_error})")
+                    if failures:
+                        raise RuntimeError(f"成员已创建，但产品分配失败: {', '.join(failures)}")
+                    results.append({
+                        "email": email,
+                        "ok": True,
+                        "message": f"{'成员已存在' if already_exists else '邀请已提交'}，已分配 {len(product_ids)} 个产品",
+                    })
+                except Exception as exc:
+                    message = str(exc) or type(exc).__name__
+                    results.append({"email": email, "ok": False, "message": message})
+        return results
+    finally:
+        pass
+
+
+async def remove_adobe_members(account: dict, emails: list[str]) -> list[dict]:
+    results = []
+    session = await get_adobe_api_session(account, include_protected=True)
+    organization_id = session["organization_id"]
+    allowed_headers = session["headers"]
+    protected_emails = session["protected_emails"]
+    try:
+        allowed_headers["content-type"] = "application/json"
+        users_url = f"https://bps-il.adobe.io/jil-api/v2/organizations/{quote(organization_id, safe='@')}/users"
+
+        async with adobe_httpx_client() as client:
+            async def lookup_member(email: str, email_key: str, attempts: int = 3) -> dict | None:
+                lookup_params = {
+                    "filter_exclude_domain": "techacct.adobe.com",
+                    "page": 0,
+                    "page_size": 20,
+                    "search_query": email,
+                    "sort": "FNAME_LNAME",
+                    "sort_order": "ASC",
+                    "currentPage": 1,
+                    "filterQuery": email,
+                }
+                for attempt in range(1, attempts + 1):
+                    try:
+                        lookup = await client.get(
+                            users_url + "/",
+                            params=lookup_params,
+                            headers=allowed_headers,
+                            timeout=45.0,
+                        )
+                        if lookup.status_code == 200:
+                            return next(
+                                (
+                                    member for member in lookup.json()
+                                    if (member.get("email") or member.get("userName") or "").strip().lower() == email_key
+                                ),
+                                None,
+                            )
+                    except httpx.HTTPError:
+                        pass
+                    if attempt < attempts:
+                        await asyncio.sleep(attempt * 2)
+                return None
+
+            for email in emails:
+                try:
+                    email_key = email.strip().lower()
+                    if email_key in protected_emails:
+                        raise RuntimeError("当前登录主账号不可移除")
+                    member = await lookup_member(email, email_key)
+                    if not member:
+                        results.append({"email": email, "ok": True, "message": "成员已不存在"})
+                        continue
+                    if not member.get("removable", False):
+                        raise RuntimeError("该成员不可移除")
+                    removal_error = ""
+                    for attempt in range(1, 4):
+                        try:
+                            response = await client.patch(
+                                users_url,
+                                json=[{"op": "remove", "path": f"/{member['id']}"}],
+                                headers=allowed_headers,
+                                timeout=60.0,
+                            )
+                            if response.status_code in (200, 202, 204):
+                                removal_error = ""
+                                break
+                            message = response.text[:300]
+                            with suppress(Exception):
+                                message = response.json().get("message", message)
+                            removal_error = f"HTTP {response.status_code}: {message}"
+                        except httpx.HTTPError as exc:
+                            removal_error = f"{type(exc).__name__}: {exc}"
+
+                        if not await lookup_member(email, email_key, attempts=2):
+                            removal_error = ""
+                            break
+                        if attempt < 3:
+                            await asyncio.sleep(attempt * 2)
+                    if removal_error:
+                        raise RuntimeError(f"移除失败: {removal_error}")
+                    results.append({"email": email, "ok": True, "message": "成员已移除"})
+                except Exception as exc:
+                    results.append({"email": email, "ok": False, "message": str(exc) or type(exc).__name__})
+        return results
+    finally:
+        pass
+
+
+@app.get("/api/adobe-accounts")
+async def get_adobe_accounts():
+    return [adobe_account_summary(account) for account in config.get("adobe_accounts", [])]
+
+
+@app.post("/api/adobe-accounts")
+async def save_adobe_account(item: AdobeAccountUpdate):
+    global config
+    name = item.name.strip()
+    if not name:
+        return JSONResponse(status_code=400, content={"message": "请输入账号名称"})
+    accounts = config.setdefault("adobe_accounts", [])
+    account = find_adobe_account(item.id) if item.id else None
+    try:
+        if account:
+            account["name"] = name
+            account.pop("product_ids", None)
+            if item.cookie.strip():
+                parse_adobe_cookies(item.cookie.strip())
+                account["cookie"] = item.cookie.strip()
+        else:
+            parse_adobe_cookies(item.cookie.strip())
+            account = {
+                "id": uuid.uuid4().hex,
+                "name": name,
+                "cookie": item.cookie.strip(),
+            }
+            accounts.append(account)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"message": str(exc)})
+    account["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    save_config(config)
+    return adobe_account_summary(account)
+
+
+@app.delete("/api/adobe-accounts/{account_id}")
+async def delete_adobe_account(account_id: str):
+    global config
+    before = len(config.get("adobe_accounts", []))
+    config["adobe_accounts"] = [
+        account for account in config.get("adobe_accounts", []) if account.get("id") != account_id
+    ]
+    if len(config["adobe_accounts"]) == before:
+        return JSONResponse(status_code=404, content={"message": "账号不存在"})
+    save_config(config)
+    return {"ok": True}
+
+
+@app.post("/api/adobe-accounts/{account_id}/test")
+async def test_adobe_account(account_id: str):
+    account = find_adobe_account(account_id)
+    if not account:
+        return JSONResponse(status_code=404, content={"message": "账号不存在"})
+    try:
+        async with adobe_account_lock:
+            return await test_adobe_account_cookie(account)
+    except Exception as exc:
+        return JSONResponse(status_code=400, content={"ok": False, "message": str(exc)})
+
+
+@app.get("/api/adobe-accounts/{account_id}/members")
+async def get_adobe_account_members(account_id: str, page: int = 0, page_size: int = 20, search: str = ""):
+    account = find_adobe_account(account_id)
+    if not account:
+        return JSONResponse(status_code=404, content={"message": "账号不存在"})
+    try:
+        async with adobe_account_lock:
+            return await fetch_adobe_members(account, page, page_size, search)
+    except Exception as exc:
+        return JSONResponse(status_code=400, content={"message": str(exc)})
+
+
+@app.post("/api/adobe-team/invite")
+async def invite_adobe_team_members(item: AdobeTeamActionRequest):
+    account = find_adobe_account(item.account_id)
+    emails = normalize_email_list(item.emails)
+    if not account:
+        return JSONResponse(status_code=404, content={"message": "账号不存在"})
+    if not emails:
+        return JSONResponse(status_code=400, content={"message": "请输入有效邮箱"})
+    try:
+        async with adobe_account_lock:
+            results = await invite_adobe_members(account, emails)
+    except Exception as exc:
+        return JSONResponse(status_code=400, content={"message": str(exc)})
+    return {"ok": all(result["ok"] for result in results), "results": results}
+
+
+@app.post("/api/adobe-team/remove")
+async def remove_adobe_team_members(item: AdobeTeamActionRequest):
+    account = find_adobe_account(item.account_id)
+    emails = normalize_email_list(item.emails)
+    if not account:
+        return JSONResponse(status_code=404, content={"message": "账号不存在"})
+    if not emails:
+        return JSONResponse(status_code=400, content={"message": "请输入有效邮箱"})
+    try:
+        async with adobe_account_lock:
+            results = await remove_adobe_members(account, emails)
+    except Exception as exc:
+        return JSONResponse(status_code=400, content={"message": str(exc)})
+    return {"ok": all(result["ok"] for result in results), "results": results}
 
 
 @app.get("/api/self-emails")
@@ -668,8 +1517,34 @@ async def clean_used_self_emails():
 @app.post("/api/tasks")
 async def start_task(item: TaskStart):
     conc = max(1, min(item.concurrency, 10))
-    email_source = item.email_source if item.email_source in ("temp", "self") else "temp"
-    task = task_manager.create_task(item.quantity, conc, item.show_browser, item.name, email_source)
+    registration_mode = item.registration_mode if item.registration_mode in ("standard", "invite") else "standard"
+    account_ids = []
+    if registration_mode == "invite":
+        account_ids = [
+            account_id for account_id in dict.fromkeys(item.adobe_account_ids)
+            if find_adobe_account(account_id)
+        ]
+        if not account_ids:
+            return JSONResponse(status_code=400, content={"message": "邀请模式至少选择一个有效账号"})
+        available = build_self_email_overview()["available"]
+        required = max(1, item.quantity) * len(account_ids)
+        if available < required:
+            return JSONResponse(
+                status_code=400,
+                content={"message": f"自备邮箱不足，需要 {required} 个，当前可用 {available} 个"},
+            )
+        email_source = "self"
+    else:
+        email_source = item.email_source if item.email_source in ("temp", "self") else "temp"
+    task = task_manager.create_task(
+        max(1, item.quantity),
+        conc,
+        item.show_browser,
+        item.name,
+        email_source,
+        registration_mode,
+        account_ids,
+    )
     await task_manager.queue.put(task)
 
     # Ensure queue worker is running
@@ -680,6 +1555,13 @@ async def start_task(item: TaskStart):
 @app.get("/api/tasks")
 async def list_tasks():
     return [t.to_dict() for t in reversed(task_manager.tasks.values())]
+
+
+@app.get("/api/tasks/{task_id}/logs")
+async def get_task_logs(task_id: int, limit: int = 5000):
+    if task_id not in task_manager.tasks:
+        return JSONResponse(status_code=404, content={"message": "任务不存在"})
+    return {"task_id": task_id, "logs": read_task_logs(task_id, limit)}
 
 @app.post("/api/tasks/delete")
 async def delete_tasks(req: TaskDeleteRequest):
@@ -926,7 +1808,7 @@ async def release_self_email_account(email: str):
             save_config(config)
 
 
-async def execute_single_worker(task: Task, worker_index: int):
+async def execute_single_worker(task: Task, worker_index: int, assigned_self_email: dict | None = None):
     cleaned = cleanup_stale_profiles(collect_active_profile_paths(task_manager.tasks))
     if cleaned:
         await task_manager.broadcast(f"[任务#{task.id}-{worker_index}] 已清理 {cleaned} 个残留浏览器目录")
@@ -939,6 +1821,7 @@ async def execute_single_worker(task: Task, worker_index: int):
     env["EMAIL_DOMAINS"] = config.get("email_domains", "") or config.get("email_domain", "rossa.cfd")
     env["YESCAPTCHA_KEY"] = config.get("yescaptcha_key", "")
     env["EMAIL_SOURCE"] = task.email_source
+    env["INVITE_REGISTRATION"] = "1" if task.registration_mode == "invite" else "0"
     env["PROXY_ENABLED"] = "1" if config.get("proxy_enabled") else "0"
     env["PROXY_SCHEME"] = config.get("proxy_scheme", "http")
     env["PROXY_URL"] = config.get("proxy_url", "")
@@ -959,11 +1842,11 @@ async def execute_single_worker(task: Task, worker_index: int):
     task.active_profiles[worker_index] = user_data_dir
 
     self_email = ""
-    self_email_state = {"used_marked": False}
+    self_email_state = {"used_marked": bool(assigned_self_email)}
     prefix = f"[任务#{task.id}-{worker_index}]"
 
     if task.email_source == "self":
-        account = await allocate_self_email_account()
+        account = assigned_self_email or await allocate_self_email_account()
         if not account:
             task.failed += 1
             await task_manager.broadcast(f"{prefix} ❌ 自备邮箱模式未导入可用邮箱")
@@ -1020,6 +1903,123 @@ async def execute_single_worker(task: Task, worker_index: int):
         cleanup_stale_profiles(collect_active_profile_paths(task_manager.tasks))
         await task_manager.broadcast("__STATE_UPDATE__")
 
+async def collect_removable_adobe_member_emails(account: dict) -> list[str]:
+    removable = []
+    page = 0
+    while True:
+        result = await fetch_adobe_members(account, page_number=page, page_size=100)
+        removable.extend(
+            member["email"] for member in result["members"]
+            if member.get("removable") and member.get("email")
+        )
+        if not result["has_more"]:
+            break
+        page += 1
+    return list(dict.fromkeys(removable))
+
+
+async def allocate_self_email_batch(quantity: int) -> list[dict]:
+    accounts = []
+    for _ in range(quantity):
+        account = await allocate_self_email_account()
+        if not account:
+            break
+        accounts.append(account)
+    return accounts
+
+
+async def run_invite_task(task: Task):
+    worker_index = 0
+    for account_position, account_id in enumerate(task.adobe_account_ids, 1):
+        if task.status == "stopping":
+            break
+        account = find_adobe_account(account_id)
+        if not account:
+            task.failed += task.batch_quantity
+            await task_manager.broadcast(f"[任务#{task.id}] ❌ 所选 Adobe 账号已不存在，跳过本批")
+            continue
+
+        account_label = account.get("name") or account_id
+        prefix = f"[任务#{task.id} · {account_label}]"
+        batch = await allocate_self_email_batch(task.batch_quantity)
+        if len(batch) < task.batch_quantity:
+            for reserved in batch:
+                await release_self_email_account(reserved["email"])
+            task.failed += task.batch_quantity
+            await task_manager.broadcast(f"{prefix} ❌ 可用自备邮箱不足，跳过本批")
+            continue
+
+        await task_manager.broadcast(f"{prefix} 正在获取并清理全部可移除成员...")
+        try:
+            async with adobe_account_lock:
+                removable = await collect_removable_adobe_member_emails(account)
+                removal_results = await remove_adobe_members(account, removable) if removable else []
+            removal_failures = [result for result in removal_results if not result["ok"]]
+            await task_manager.broadcast(
+                f"{prefix} 已清理 {len(removal_results) - len(removal_failures)} 个成员"
+                + (f"，{len(removal_failures)} 个移除失败" if removal_failures else "")
+            )
+        except Exception as exc:
+            for reserved in batch:
+                await release_self_email_account(reserved["email"])
+            task.failed += task.batch_quantity
+            await task_manager.broadcast(f"{prefix} ❌ 清理成员失败，本批已取消: {exc}")
+            continue
+
+        emails = [reserved["email"] for reserved in batch]
+        await task_manager.broadcast(f"{prefix} 正在发送 {len(emails)} 封团队邀请...")
+        try:
+            async with adobe_account_lock:
+                invite_results = await invite_adobe_members(account, emails)
+        except Exception as exc:
+            invite_results = [{"email": email, "ok": False, "message": str(exc)} for email in emails]
+
+        successful = []
+        for reserved, result in zip(batch, invite_results):
+            if result["ok"]:
+                await mark_self_email_used(reserved["email"])
+                successful.append(reserved)
+                await task_manager.broadcast(f"{prefix} ✅ {reserved['email']} 邀请已发送")
+            else:
+                await release_self_email_account(reserved["email"])
+                task.failed += 1
+                await task_manager.broadcast(f"{prefix} ❌ {reserved['email']} 邀请失败: {result['message']}")
+
+        await task_manager.broadcast("__STATE_UPDATE__")
+        if not successful or task.status == "stopping":
+            continue
+
+        if INVITE_EMAIL_WAIT_SECONDS:
+            await task_manager.broadcast(
+                f"{prefix} 等待邀请邮件送达，{INVITE_EMAIL_WAIT_SECONDS} 秒后开始注册..."
+            )
+        else:
+            await task_manager.broadcast(f"{prefix} 开始轮询邀请邮件并执行注册...")
+        waited = 0
+        while waited < INVITE_EMAIL_WAIT_SECONDS and task.status != "stopping":
+            interval = min(5, INVITE_EMAIL_WAIT_SECONDS - waited)
+            await asyncio.sleep(interval)
+            waited += interval
+        if task.status == "stopping":
+            break
+
+        sem = asyncio.Semaphore(task.concurrency)
+
+        async def wrapper(reserved: dict):
+            nonlocal worker_index
+            worker_index += 1
+            index = worker_index
+            async with sem:
+                if task.status == "stopping":
+                    return
+                await execute_single_worker(task, index, reserved)
+
+        workers = [asyncio.create_task(wrapper(reserved)) for reserved in successful]
+        task.asyncio_tasks = workers
+        await asyncio.gather(*workers, return_exceptions=True)
+        task.asyncio_tasks = []
+
+
 async def run_task(task: Task):
     task.status = "running"
     task.asyncio_tasks = []
@@ -1027,19 +2027,22 @@ async def run_task(task: Task):
     task.active_profiles = {}
     await task_manager.broadcast("__STATE_UPDATE__")
 
-    sem = asyncio.Semaphore(task.concurrency)
+    if task.registration_mode == "invite":
+        await run_invite_task(task)
+    else:
+        sem = asyncio.Semaphore(task.concurrency)
 
-    async def wrapper(idx):
-        async with sem:
-            # 优雅停止：获取信号量后检查任务是否已标记停止
-            if task.status == "stopping":
-                await task_manager.broadcast(f"[任务#{task.id}-{idx}] ⏭️ 任务已停止，跳过")
-                return
-            await execute_single_worker(task, idx)
+        async def wrapper(idx):
+            async with sem:
+                # 优雅停止：获取信号量后检查任务是否已标记停止
+                if task.status == "stopping":
+                    await task_manager.broadcast(f"[任务#{task.id}-{idx}] ⏭️ 任务已停止，跳过")
+                    return
+                await execute_single_worker(task, idx)
 
-    workers = [asyncio.create_task(wrapper(i)) for i in range(1, task.quantity + 1)]
-    task.asyncio_tasks = workers
-    await asyncio.gather(*workers, return_exceptions=True)
+        workers = [asyncio.create_task(wrapper(i)) for i in range(1, task.quantity + 1)]
+        task.asyncio_tasks = workers
+        await asyncio.gather(*workers, return_exceptions=True)
     task.asyncio_tasks = []
     task.active_processes = {}
     task.active_profiles = {}
