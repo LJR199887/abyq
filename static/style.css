@@ -186,6 +186,41 @@ h1 {
     gap: 0.55rem;
 }
 
+.account-batch-toolbar,
+.account-batch-select {
+    display: flex;
+    align-items: center;
+}
+
+.account-batch-toolbar {
+    justify-content: space-between;
+    gap: 0.75rem;
+    margin: 0.8rem 0 0.65rem;
+}
+
+.account-batch-select {
+    gap: 0.45rem;
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: 0.78rem;
+    cursor: pointer;
+}
+
+.account-pagination {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.65rem;
+    margin-top: 0.8rem;
+}
+
+.account-pagination span {
+    min-width: 112px;
+    color: var(--text-secondary);
+    font-size: 0.72rem;
+    text-align: center;
+}
+
 .account-item {
     position: relative;
     width: 100%;
@@ -204,15 +239,34 @@ h1 {
 .account-select-btn {
     width: 100%;
     display: grid;
-    grid-template-columns: 38px 1fr 8px;
-    gap: 0.75rem;
+    grid-template-columns: 22px 38px 1fr 8px;
+    gap: 0.6rem;
     align-items: center;
-    padding: 0.75rem 2.7rem 0.75rem 0.75rem;
+    padding: 0.75rem 2.7rem 0.75rem 2.25rem;
     color: var(--text-primary);
     text-align: left;
     background: transparent;
     border: 0;
     cursor: pointer;
+}
+
+.account-batch-check-wrap {
+    position: absolute;
+    z-index: 2;
+    top: 50%;
+    left: 0.65rem;
+    display: grid;
+    place-items: center;
+    margin: 0;
+    transform: translateY(-50%);
+    cursor: pointer;
+}
+
+.account-sequence,
+.invite-account-sequence {
+    color: var(--text-secondary);
+    font: 700 0.7rem/1 'Consolas', monospace;
+    text-align: center;
 }
 
 .account-inline-delete {
@@ -1309,6 +1363,24 @@ textarea:focus {
     font-size: 0.72rem;
 }
 
+.invite-account-header-actions,
+.invite-select-all {
+    display: flex;
+    align-items: center;
+}
+
+.invite-account-header-actions {
+    gap: 10px;
+}
+
+.invite-select-all {
+    gap: 4px;
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: 0.72rem;
+    cursor: pointer;
+}
+
 .invite-account-list {
     display: grid;
     gap: 7px;
@@ -1380,6 +1452,38 @@ textarea:focus {
 }
 
 /* ─── Toggle Switch ─── */
+.invite-remove-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.8rem;
+    margin-top: 9px;
+    padding: 9px 10px;
+    border: 1px solid var(--border-color);
+    border-radius: 9px;
+    background: rgba(5, 7, 15, 0.3);
+}
+
+.invite-remove-toggle div {
+    display: grid;
+    gap: 3px;
+}
+
+.invite-remove-toggle strong {
+    color: var(--text-primary);
+    font-size: 0.76rem;
+}
+
+.invite-remove-toggle small {
+    color: var(--text-secondary);
+    font-size: 0.66rem;
+    line-height: 1.4;
+}
+
+.invite-remove-toggle .switch {
+    flex: 0 0 auto;
+}
+
 .toggle-row {
     display: flex;
     align-items: center;

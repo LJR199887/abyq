@@ -8,6 +8,11 @@ document.addEventListener("DOMContentLoaded", () => {
     const selectedPill = document.getElementById("selected-account-pill");
     const testBtn = document.getElementById("test-account-btn");
     const deleteBtn = document.getElementById("delete-account-btn");
+    const selectAllAccounts = document.getElementById("select-all-accounts");
+    const deleteSelectedAccountsBtn = document.getElementById("delete-selected-accounts-btn");
+    const accountPageLabel = document.getElementById("account-page-label");
+    const accountPrevBtn = document.getElementById("account-prev-btn");
+    const accountNextBtn = document.getElementById("account-next-btn");
     const inviteBtn = document.getElementById("invite-btn");
     const removeSelectedBtn = document.getElementById("remove-selected-members-btn");
     const selectAllMembers = document.getElementById("select-all-members");
@@ -24,6 +29,9 @@ document.addEventListener("DOMContentLoaded", () => {
     let memberPage = 0;
     let memberHasMore = false;
     let selectedMemberEmails = new Set();
+    let selectedAccountIds = new Set();
+    let accountPage = 0;
+    const accountPageSize = 10;
 
     function showStatus(message, ok) {
         statusEl.textContent = message;
@@ -61,13 +69,29 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function renderAccounts() {
+        const totalPages = Math.max(1, Math.ceil(accounts.length / accountPageSize));
+        accountPage = Math.min(accountPage, totalPages - 1);
         if (!accounts.length) {
+            selectedAccountIds.clear();
+            selectAllAccounts.disabled = true;
+            selectAllAccounts.checked = false;
+            selectAllAccounts.indeterminate = false;
+            deleteSelectedAccountsBtn.disabled = true;
+            deleteSelectedAccountsBtn.textContent = "删除选中";
             listEl.innerHTML = '<div class="empty-hint">暂未配置账号</div>';
+            updateAccountPagination();
             return;
         }
-        listEl.innerHTML = accounts.map(account => `
+        selectedAccountIds = new Set([...selectedAccountIds].filter(id => accounts.some(account => account.id === id)));
+        const pageStart = accountPage * accountPageSize;
+        const pageAccounts = accounts.slice(pageStart, pageStart + accountPageSize);
+        listEl.innerHTML = pageAccounts.map((account, index) => `
             <div class="account-item ${account.id === selectedId ? "active" : ""}" data-id="${account.id}">
+                <label class="account-batch-check-wrap" title="选择账号">
+                    <input class="account-batch-check" type="checkbox" value="${account.id}" ${selectedAccountIds.has(account.id) ? "checked" : ""} aria-label="选择 ${escapeHtml(account.name)}">
+                </label>
                 <button class="account-select-btn" data-id="${account.id}">
+                    <span class="account-sequence">${pageStart + index + 1}</span>
                     <span class="account-avatar">${escapeHtml(account.name.slice(0, 1).toUpperCase())}</span>
                     <span class="account-copy">
                         <strong>${escapeHtml(account.name)}</strong>
@@ -80,6 +104,27 @@ document.addEventListener("DOMContentLoaded", () => {
                 <button class="account-inline-delete" data-id="${account.id}" title="删除账号" aria-label="删除 ${escapeHtml(account.name)}">×</button>
             </div>
         `).join("");
+        updateAccountSelection();
+        updateAccountPagination();
+    }
+
+    function updateAccountPagination() {
+        const totalPages = Math.max(1, Math.ceil(accounts.length / accountPageSize));
+        accountPageLabel.textContent = `第 ${accountPage + 1} / ${totalPages} 页 · 共 ${accounts.length} 个`;
+        accountPrevBtn.disabled = accountPage <= 0;
+        accountNextBtn.disabled = accountPage >= totalPages - 1;
+    }
+
+    function updateAccountSelection() {
+        const checks = [...listEl.querySelectorAll(".account-batch-check")];
+        selectedAccountIds = new Set(checks.filter(input => input.checked).map(input => input.value));
+        selectAllAccounts.disabled = checks.length === 0;
+        selectAllAccounts.checked = checks.length > 0 && selectedAccountIds.size === checks.length;
+        selectAllAccounts.indeterminate = selectedAccountIds.size > 0 && selectedAccountIds.size < checks.length;
+        deleteSelectedAccountsBtn.disabled = selectedAccountIds.size === 0;
+        deleteSelectedAccountsBtn.textContent = selectedAccountIds.size
+            ? `删除选中 (${selectedAccountIds.size})`
+            : "删除选中";
     }
 
     function renderSubscriptionSummary(subscriptions = []) {
@@ -90,7 +135,13 @@ document.addEventListener("DOMContentLoaded", () => {
 
     async function loadAccounts(preferredId = "") {
         accounts = await api("/api/adobe-accounts");
-        const nextId = preferredId || selectedId || accounts[0]?.id || "";
+        const preferredIndex = accounts.findIndex(item => item.id === preferredId);
+        if (preferredIndex >= 0) accountPage = Math.floor(preferredIndex / accountPageSize);
+        const totalPages = Math.max(1, Math.ceil(accounts.length / accountPageSize));
+        accountPage = Math.min(accountPage, totalPages - 1);
+        const pageFirstAccount = accounts[accountPage * accountPageSize];
+        const currentStillExists = accounts.some(item => item.id === selectedId);
+        const nextId = preferredId || (currentStillExists ? selectedId : pageFirstAccount?.id) || accounts[0]?.id || "";
         setSelected(accounts.some(item => item.id === nextId) ? nextId : "");
     }
 
@@ -220,6 +271,10 @@ document.addEventListener("DOMContentLoaded", () => {
     });
 
     listEl.addEventListener("click", event => {
+        if (event.target.classList.contains("account-batch-check")) {
+            updateAccountSelection();
+            return;
+        }
         const deleteButton = event.target.closest(".account-inline-delete");
         if (deleteButton) {
             deleteAccount(deleteButton.dataset.id);
@@ -269,17 +324,22 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     });
 
-    async function deleteAccount(accountId) {
+    async function deleteAccount(accountId, askConfirmation = true, reload = true) {
         const account = accounts.find(item => item.id === accountId);
-        if (!account || !confirm(`确认删除账号“${account.name}”的 Cookie 配置吗？`)) return;
+        if (!account || (askConfirmation && !confirm(`确认删除账号“${account.name}”的 Cookie 配置吗？`))) return false;
         deleteBtn.disabled = true;
         try {
             await api(`/api/adobe-accounts/${accountId}`, {method: "DELETE"});
             if (accountId === selectedId) selectedId = "";
-            await loadAccounts(selectedId);
-            showStatus("账号配置已删除", true);
+            selectedAccountIds.delete(accountId);
+            if (reload) {
+                await loadAccounts(selectedId);
+                showStatus("账号配置已删除", true);
+            }
+            return true;
         } catch (error) {
             showStatus(error.message, false);
+            return false;
         } finally {
             deleteBtn.disabled = false;
         }
@@ -287,6 +347,39 @@ document.addEventListener("DOMContentLoaded", () => {
 
     deleteBtn.addEventListener("click", async () => {
         await deleteAccount(selectedId);
+    });
+
+    selectAllAccounts.addEventListener("change", () => {
+        listEl.querySelectorAll(".account-batch-check").forEach(input => {
+            input.checked = selectAllAccounts.checked;
+        });
+        updateAccountSelection();
+    });
+
+    accountPrevBtn.addEventListener("click", () => {
+        accountPage = Math.max(0, accountPage - 1);
+        selectedAccountIds.clear();
+        renderAccounts();
+    });
+
+    accountNextBtn.addEventListener("click", () => {
+        const totalPages = Math.max(1, Math.ceil(accounts.length / accountPageSize));
+        accountPage = Math.min(totalPages - 1, accountPage + 1);
+        selectedAccountIds.clear();
+        renderAccounts();
+    });
+
+    deleteSelectedAccountsBtn.addEventListener("click", async () => {
+        const ids = [...selectedAccountIds];
+        if (!ids.length || !confirm(`确认删除选中的 ${ids.length} 个账号凭据吗？此操作无法撤销。`)) return;
+        deleteSelectedAccountsBtn.disabled = true;
+        deleteSelectedAccountsBtn.textContent = "正在删除...";
+        let deleted = 0;
+        for (const id of ids) {
+            if (await deleteAccount(id, false, false)) deleted += 1;
+        }
+        await loadAccounts(selectedId);
+        showStatus(`已删除 ${deleted} 个账号凭据`, deleted === ids.length);
     });
 
     async function runTeamAction(kind, suppliedEmails = null) {

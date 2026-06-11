@@ -363,6 +363,7 @@ class Task:
         registration_mode="standard",
         adobe_account_ids=None,
         batch_quantity=None,
+        invite_remove_members=True,
     ):
         self.id = task_id
         self.quantity = quantity
@@ -372,6 +373,7 @@ class Task:
         self.email_source = email_source if email_source in ("temp", "self") else "temp"
         self.registration_mode = registration_mode if registration_mode in ("standard", "invite") else "standard"
         self.adobe_account_ids = list(adobe_account_ids or [])
+        self.invite_remove_members = bool(invite_remove_members)
         self.name = (name or "").strip() or f"任务 #{task_id}"
         self.status = "pending"     # pending -> running -> stopping -> completed/stopped
         self.completed = 0
@@ -394,6 +396,7 @@ class Task:
             "email_source": self.email_source,
             "registration_mode": self.registration_mode,
             "adobe_account_ids": self.adobe_account_ids,
+            "invite_remove_members": self.invite_remove_members,
             "name": self.name,
             "status": self.status,
             "completed": self.completed,
@@ -475,6 +478,7 @@ class TaskManager:
                             t_data.get("registration_mode", "standard"),
                             t_data.get("adobe_account_ids", []),
                             t_data.get("batch_quantity"),
+                            t_data.get("invite_remove_members", True),
                         )
                         t.status = t_data["status"]
                         t.completed = t_data.get("completed", 0)
@@ -499,6 +503,7 @@ class TaskManager:
         email_source="temp",
         registration_mode="standard",
         adobe_account_ids=None,
+        invite_remove_members=True,
     ) -> Task:
         account_ids = list(adobe_account_ids or [])
         total_quantity = quantity * len(account_ids) if registration_mode == "invite" else quantity
@@ -512,6 +517,7 @@ class TaskManager:
             registration_mode,
             account_ids,
             quantity,
+            invite_remove_members,
         )
         self.tasks[self.next_id] = task
         self.next_id += 1
@@ -617,6 +623,7 @@ class TaskStart(BaseModel):
     email_source: str = "temp"
     registration_mode: str = "standard"
     adobe_account_ids: list[str] = Field(default_factory=list)
+    invite_remove_members: bool = True
 
 class TaskDeleteRequest(BaseModel):
     ids: list[int]
@@ -1544,6 +1551,7 @@ async def start_task(item: TaskStart):
         email_source,
         registration_mode,
         account_ids,
+        item.invite_remove_members,
     )
     await task_manager.queue.put(task)
 
@@ -1949,22 +1957,25 @@ async def run_invite_task(task: Task):
             await task_manager.broadcast(f"{prefix} ❌ 可用自备邮箱不足，跳过本批")
             continue
 
-        await task_manager.broadcast(f"{prefix} 正在获取并清理全部可移除成员...")
-        try:
-            async with adobe_account_lock:
-                removable = await collect_removable_adobe_member_emails(account)
-                removal_results = await remove_adobe_members(account, removable) if removable else []
-            removal_failures = [result for result in removal_results if not result["ok"]]
-            await task_manager.broadcast(
-                f"{prefix} 已清理 {len(removal_results) - len(removal_failures)} 个成员"
-                + (f"，{len(removal_failures)} 个移除失败" if removal_failures else "")
-            )
-        except Exception as exc:
-            for reserved in batch:
-                await release_self_email_account(reserved["email"])
-            task.failed += task.batch_quantity
-            await task_manager.broadcast(f"{prefix} ❌ 清理成员失败，本批已取消: {exc}")
-            continue
+        if task.invite_remove_members:
+            await task_manager.broadcast(f"{prefix} 正在获取并清理全部可移除成员...")
+            try:
+                async with adobe_account_lock:
+                    removable = await collect_removable_adobe_member_emails(account)
+                    removal_results = await remove_adobe_members(account, removable) if removable else []
+                removal_failures = [result for result in removal_results if not result["ok"]]
+                await task_manager.broadcast(
+                    f"{prefix} 已清理 {len(removal_results) - len(removal_failures)} 个成员"
+                    + (f"，{len(removal_failures)} 个移除失败" if removal_failures else "")
+                )
+            except Exception as exc:
+                for reserved in batch:
+                    await release_self_email_account(reserved["email"])
+                task.failed += task.batch_quantity
+                await task_manager.broadcast(f"{prefix} ❌ 清理成员失败，本批已取消: {exc}")
+                continue
+        else:
+            await task_manager.broadcast(f"{prefix} 已关闭先移除成员，直接发送团队邀请...")
 
         emails = [reserved["email"] for reserved in batch]
         await task_manager.broadcast(f"{prefix} 正在发送 {len(emails)} 封团队邀请...")

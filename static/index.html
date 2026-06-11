@@ -75,12 +75,28 @@
                     <div class="form-group invite-account-group" id="invite-account-group" hidden>
                         <div class="invite-account-header">
                             <label>待选团队账号</label>
-                            <span id="invite-account-count">请选择账号</span>
+                            <div class="invite-account-header-actions">
+                                <label class="invite-select-all">
+                                    <input type="checkbox" id="select-all-invite-accounts" disabled>
+                                    <span>全选</span>
+                                </label>
+                                <span id="invite-account-count">请选择账号</span>
+                            </div>
                         </div>
                         <div id="invite-account-list" class="invite-account-list">
                             <div class="empty-hint">正在读取账号...</div>
                         </div>
-                        <div class="field-hint">每个所选账号会先清空可移除成员，再邀请对应数量的自备邮箱；邀请成功后固定等待 5 分钟，再每隔 5 秒轮询邮件，最多 5 次。</div>
+                        <div class="invite-remove-toggle">
+                            <div>
+                                <strong>先移除成员再邀请</strong>
+                                <small>开启后先清空全部可移除成员；关闭后直接发送邀请。</small>
+                            </div>
+                            <label class="switch">
+                                <input type="checkbox" id="invite_remove_members" checked>
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                        <div class="field-hint">邀请成功后固定等待 5 分钟，再每隔 5 秒轮询邮件，最多 5 次。</div>
                     </div>
                     <div class="task-grid">
                         <div class="form-group">

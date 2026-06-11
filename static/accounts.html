@@ -36,8 +36,20 @@
                         <button class="btn-sm primary" id="new-account-btn">新增</button>
                     </div>
                     <p class="card-desc">保存 Adobe Admin Console 登录 Cookie，用于执行团队管理操作。</p>
+                    <div class="account-batch-toolbar">
+                        <label class="account-batch-select">
+                            <input type="checkbox" id="select-all-accounts" disabled>
+                            <span>全选</span>
+                        </label>
+                        <button class="btn-sm danger" id="delete-selected-accounts-btn" disabled>删除选中</button>
+                    </div>
                     <div id="account-list" class="account-list">
                         <div class="empty-hint">暂未配置账号</div>
+                    </div>
+                    <div class="account-pagination">
+                        <button class="btn-sm primary" id="account-prev-btn" disabled>上一页</button>
+                        <span id="account-page-label">第 1 / 1 页</span>
+                        <button class="btn-sm primary" id="account-next-btn" disabled>下一页</button>
                     </div>
                 </div>
 

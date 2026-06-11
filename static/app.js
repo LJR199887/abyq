@@ -75,6 +75,8 @@ document.addEventListener("DOMContentLoaded", () => {
     const inviteAccountGroup = document.getElementById("invite-account-group");
     const inviteAccountList = document.getElementById("invite-account-list");
     const inviteAccountCount = document.getElementById("invite-account-count");
+    const selectAllInviteAccounts = document.getElementById("select-all-invite-accounts");
+    const inviteRemoveMembersInput = document.getElementById("invite_remove_members");
 
     function emailSourceLabel(source) {
         return source === "self" ? "自备邮箱" : "临时邮箱";
@@ -98,15 +100,20 @@ document.addEventListener("DOMContentLoaded", () => {
     function updateInviteAccountCount() {
         const count = selectedAdobeAccountIds().length;
         inviteAccountCount.textContent = count ? `已选 ${count} 个` : "请选择账号";
+        const checks = [...inviteAccountList.querySelectorAll("input[type='checkbox']")];
+        selectAllInviteAccounts.disabled = checks.length === 0;
+        selectAllInviteAccounts.checked = checks.length > 0 && count === checks.length;
+        selectAllInviteAccounts.indeterminate = count > 0 && count < checks.length;
     }
 
     function loadInviteAccounts() {
         fetch("/api/adobe-accounts")
             .then(response => response.json())
             .then(accounts => {
-                inviteAccountList.innerHTML = accounts.length ? accounts.map(account => `
+                inviteAccountList.innerHTML = accounts.length ? accounts.map((account, index) => `
                     <label class="invite-account-option">
                         <input type="checkbox" value="${account.id}">
+                        <span class="invite-account-sequence">${index + 1}</span>
                         <span class="invite-account-avatar">${(account.name || "A").slice(0, 1).toUpperCase()}</span>
                         <span class="invite-account-info">
                             <strong>${account.name || "未命名账号"}</strong>
@@ -118,6 +125,7 @@ document.addEventListener("DOMContentLoaded", () => {
             })
             .catch(() => {
                 inviteAccountList.innerHTML = '<div class="empty-hint">账号读取失败</div>';
+                updateInviteAccountCount();
             });
     }
 
@@ -128,6 +136,12 @@ document.addEventListener("DOMContentLoaded", () => {
         if (invite) emailSourceInput.value = "self";
     });
     inviteAccountList.addEventListener("change", updateInviteAccountCount);
+    selectAllInviteAccounts.addEventListener("change", () => {
+        inviteAccountList.querySelectorAll("input[type='checkbox']").forEach(input => {
+            input.checked = selectAllInviteAccounts.checked;
+        });
+        updateInviteAccountCount();
+    });
     loadInviteAccounts();
 
     startBtn.addEventListener("click", () => {
@@ -158,6 +172,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 email_source: emailSource,
                 registration_mode: registrationMode,
                 adobe_account_ids: adobeAccountIds,
+                invite_remove_members: registrationMode === "invite" ? inviteRemoveMembersInput.checked : false,
             })
         }).then(async r => {
             const data = await r.json();
