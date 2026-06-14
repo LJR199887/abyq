@@ -20,6 +20,7 @@ document.addEventListener("DOMContentLoaded", () => {
     let loadedTaskLogs = new Set();
     const savedLogTaskId = parseInt(localStorage.getItem(LAST_LOG_TASK_KEY));
     let currentLogTaskId = Number.isInteger(savedLogTaskId) ? savedLogTaskId : "sys";
+    let logRenderVersion = 0;
 
     function switchLogView(taskId) {
         currentLogTaskId = taskId;
@@ -28,9 +29,8 @@ document.addEventListener("DOMContentLoaded", () => {
         } else {
             localStorage.setItem(LAST_LOG_TASK_KEY, String(taskId));
         }
-        terminalBody.innerHTML = "";
         let logs = taskLogs[taskId] || [];
-        logs.forEach(renderSingleLog);
+        renderLogList(logs);
         
         const titleLabel = document.getElementById("current-task-label");
         if (titleLabel) {
@@ -58,20 +58,47 @@ document.addEventListener("DOMContentLoaded", () => {
                     }));
                     loadedTaskLogs.add(taskId);
                     if (currentLogTaskId === taskId) {
-                        terminalBody.innerHTML = "";
-                        taskLogs[taskId].forEach(renderSingleLog);
+                        renderLogList(taskLogs[taskId]);
                     }
                 })
                 .catch(() => {});
         }
     }
 
-    function renderSingleLog(entry) {
+    function renderLogList(logs) {
+        const version = ++logRenderVersion;
+        const chunkSize = 500;
+        let index = 0;
+        terminalBody.innerHTML = "";
+
+        function renderChunk() {
+            if (version !== logRenderVersion) return;
+            const fragment = document.createDocumentFragment();
+            const end = Math.min(index + chunkSize, logs.length);
+            for (; index < end; index++) {
+                fragment.appendChild(createLogLine(logs[index]));
+            }
+            terminalBody.appendChild(fragment);
+            if (index < logs.length) {
+                requestAnimationFrame(renderChunk);
+            } else {
+                terminalBody.scrollTop = terminalBody.scrollHeight;
+            }
+        }
+
+        renderChunk();
+    }
+
+    function createLogLine(entry) {
         const line = document.createElement("div");
         line.className = `log-line ${entry.type}`;
         line.textContent = entry.text;
-        terminalBody.appendChild(line);
-        terminalBody.scrollTo({ top: terminalBody.scrollHeight, behavior: "smooth" });
+        return line;
+    }
+
+    function renderSingleLog(entry) {
+        terminalBody.appendChild(createLogLine(entry));
+        terminalBody.scrollTop = terminalBody.scrollHeight;
     }
 
     // ────────────────── Create Task ──────────────────
