@@ -99,13 +99,15 @@ def append_task_log(task_id: int, message: str):
         log_file.write(f"[{timestamp}] {message}\n")
 
 
-def read_task_logs(task_id: int, limit: int = 5000) -> list[str]:
+def read_task_logs(task_id: int, limit: int | None = None) -> list[str]:
     path = task_log_path(task_id)
     if not os.path.exists(path):
         return []
     with open(path, "r", encoding="utf-8", errors="replace") as log_file:
         lines = [line.rstrip("\r\n") for line in log_file]
-    return lines[-max(1, min(limit, 10000)):]
+    if limit is None:
+        return lines
+    return lines[-max(1, limit):]
 
 
 def is_authenticated(request: Request) -> bool:
@@ -1566,10 +1568,27 @@ async def list_tasks():
 
 
 @app.get("/api/tasks/{task_id}/logs")
-async def get_task_logs(task_id: int, limit: int = 5000):
+async def get_task_logs(task_id: int, limit: int | None = None):
     if task_id not in task_manager.tasks:
         return JSONResponse(status_code=404, content={"message": "任务不存在"})
     return {"task_id": task_id, "logs": read_task_logs(task_id, limit)}
+
+
+@app.get("/api/tasks/{task_id}/logs/download")
+async def download_task_logs(task_id: int):
+    task = task_manager.tasks.get(task_id)
+    if not task:
+        return JSONResponse(status_code=404, content={"message": "任务不存在"})
+    path = task_log_path(task_id)
+    if not os.path.exists(path):
+        return JSONResponse(status_code=404, content={"message": "该任务暂无日志"})
+    filename = f"{sanitize_filename(task.name, f'任务_{task_id}')}_#{task_id}.log"
+    return FileResponse(
+        path,
+        media_type="text/plain; charset=utf-8",
+        filename=filename,
+    )
+
 
 @app.post("/api/tasks/delete")
 async def delete_tasks(req: TaskDeleteRequest):

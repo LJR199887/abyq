@@ -6,6 +6,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const taskStatus = document.getElementById("task-status");
     const taskListEl = document.getElementById("task-list");
     const terminalBody = document.getElementById("terminal-body");
+    const downloadTaskLogBtn = document.getElementById("download-task-log-btn");
 
     // Stats
     const statPending = document.getElementById("stat-pending");
@@ -14,12 +15,19 @@ document.addEventListener("DOMContentLoaded", () => {
     const statFailed = document.getElementById("stat-failed");
 
     // Logs state
+    const LAST_LOG_TASK_KEY = "lastLogTaskId";
     let taskLogs = { "sys": [{text: "系统就绪，等待任务创建...", type: "sys"}] };
     let loadedTaskLogs = new Set();
-    let currentLogTaskId = "sys";
+    const savedLogTaskId = parseInt(localStorage.getItem(LAST_LOG_TASK_KEY));
+    let currentLogTaskId = Number.isInteger(savedLogTaskId) ? savedLogTaskId : "sys";
 
     function switchLogView(taskId) {
         currentLogTaskId = taskId;
+        if (taskId === "sys") {
+            localStorage.removeItem(LAST_LOG_TASK_KEY);
+        } else {
+            localStorage.setItem(LAST_LOG_TASK_KEY, String(taskId));
+        }
         terminalBody.innerHTML = "";
         let logs = taskLogs[taskId] || [];
         logs.forEach(renderSingleLog);
@@ -27,6 +35,9 @@ document.addEventListener("DOMContentLoaded", () => {
         const titleLabel = document.getElementById("current-task-label");
         if (titleLabel) {
             titleLabel.textContent = taskId === "sys" ? " - 系统日志" : ` - 任务 #${taskId}`;
+        }
+        if (downloadTaskLogBtn) {
+            downloadTaskLogBtn.disabled = taskId === "sys";
         }
         
         document.querySelectorAll(".task-item").forEach(el => {
@@ -38,7 +49,7 @@ document.addEventListener("DOMContentLoaded", () => {
         });
 
         if (taskId !== "sys" && !loadedTaskLogs.has(taskId)) {
-            fetch(`/api/tasks/${taskId}/logs?limit=5000`)
+            fetch(`/api/tasks/${taskId}/logs`)
                 .then(response => response.ok ? response.json() : Promise.reject())
                 .then(data => {
                     taskLogs[taskId] = (data.logs || []).map(text => ({
@@ -61,9 +72,6 @@ document.addEventListener("DOMContentLoaded", () => {
         line.textContent = entry.text;
         terminalBody.appendChild(line);
         terminalBody.scrollTo({ top: terminalBody.scrollHeight, behavior: "smooth" });
-        if (terminalBody.childElementCount > 5000) {
-            terminalBody.removeChild(terminalBody.firstChild);
-        }
     }
 
     // ────────────────── Create Task ──────────────────
@@ -219,16 +227,17 @@ document.addEventListener("DOMContentLoaded", () => {
 
                 if (tasks.length === 0) {
                     taskListEl.innerHTML = '<div class="empty-hint">暂无任务</div>';
+                    localStorage.removeItem(LAST_LOG_TASK_KEY);
+                    if (currentLogTaskId !== "sys") switchLogView("sys");
                     return;
                 }
                 
-                // Auto switch focus to running task if current one is not active
+                // Keep the selected task across refreshes; fall back only if it was deleted.
                 let currentItem = tasks.find(t => t.id === currentLogTaskId);
-                if (!currentItem || !["running", "pending", "stopping"].includes(currentItem.status)) {
+                if (!currentItem) {
                     let activeTask = tasks.find(t => t.status === "running") || tasks.find(t => t.status === "stopping") || tasks.find(t => t.status === "pending");
-                    if (activeTask && currentLogTaskId !== activeTask.id) {
-                        switchLogView(activeTask.id);
-                    }
+                    let fallbackTask = activeTask || tasks[0];
+                    switchLogView(fallbackTask.id);
                 }
 
                 // Show latest 10
@@ -323,6 +332,13 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     const expandBtn = document.getElementById("expand-terminal-btn");
+    if (downloadTaskLogBtn) {
+        downloadTaskLogBtn.addEventListener("click", () => {
+            if (currentLogTaskId === "sys") return;
+            window.location.href = `/api/tasks/${currentLogTaskId}/logs/download`;
+        });
+    }
+
     if (expandBtn) {
         expandBtn.addEventListener("click", () => {
             const card = document.querySelector(".terminal-card");
@@ -334,6 +350,6 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     }
 
-    switchLogView("sys");
+    switchLogView(currentLogTaskId);
     connectWS();
 });
