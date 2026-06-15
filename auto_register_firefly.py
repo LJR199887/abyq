@@ -1844,7 +1844,7 @@ async def retry_page_action(label: str, action, attempts: int = 2, delay_seconds
     return False
 
 
-async def submit_invite_set_password(page: Page, password_selectors: list[str]) -> bool:
+async def submit_invite_set_password(page: Page, password_selectors: list[str], attempts: int = 3) -> bool:
     submit_selectors = [
         "button[data-id='PasswordRecovery-Set__ResetPasswordBtn']",
         "button[data-click-event='ResetPasswordClick']",
@@ -1853,35 +1853,50 @@ async def submit_invite_set_password(page: Page, password_selectors: list[str]) 
     await page.keyboard.press("Tab")
     await page.wait_for_timeout(1000)
 
-    end_at = time.time() + 30
-    while time.time() < end_at:
-        if page.is_closed():
-            return False
-        for selector in submit_selectors:
-            try:
-                button = page.locator(selector).first
-                if await button.count() and await button.is_visible() and await button.is_enabled():
-                    log("  → 点击 Set a password 页面 Continue 提交新密码")
-                    await button.click()
-                    transition_end = time.time() + 45
-                    while time.time() < transition_end:
-                        if page.is_closed():
-                            return False
-                        password_page_visible = False
-                        for password_selector in password_selectors:
-                            password_field = page.locator(password_selector).first
-                            if await password_field.count() and await password_field.is_visible():
-                                password_page_visible = True
-                                break
-                        if not password_page_visible:
-                            log("  ✅ Set a password 已提交，页面已进入下一步")
-                            return True
-                        await page.wait_for_timeout(500)
-                    log("  ⚠️ 已点击 Continue，但 Set a password 页面仍未离开")
-                    return False
-            except Exception:
-                continue
-        await page.wait_for_timeout(500)
+    for attempt in range(1, attempts + 1):
+        end_at = time.time() + 30
+        clicked = False
+        while time.time() < end_at and not clicked:
+            if page.is_closed():
+                return False
+            for selector in submit_selectors:
+                try:
+                    button = page.locator(selector).first
+                    if await button.count() and await button.is_visible() and await button.is_enabled():
+                        log(f"  → 第 {attempt}/{attempts} 次点击 Set a password 页面 Continue")
+                        await button.click()
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if not clicked:
+                await page.wait_for_timeout(500)
+
+        if not clicked:
+            log(f"  ⚠️ 第 {attempt}/{attempts} 次未找到可点击的 Continue")
+            continue
+
+        transition_end = time.time() + 15
+        while time.time() < transition_end:
+            if page.is_closed():
+                return False
+            password_page_visible = False
+            for password_selector in password_selectors:
+                password_field = page.locator(password_selector).first
+                if await password_field.count() and await password_field.is_visible():
+                    password_page_visible = True
+                    break
+            if not password_page_visible:
+                log("  ✅ Set a password 已提交，页面已进入下一步")
+                return True
+            await page.wait_for_timeout(500)
+
+        if attempt < attempts:
+            log(f"  ⚠️ 点击后页面仍未离开，2 秒后重试 {attempt + 1}/{attempts}")
+            await page.wait_for_timeout(2000)
+            await page.keyboard.press("Tab")
+        else:
+            log(f"  ❌ 已点击 {attempts} 次 Continue，Set a password 页面仍未离开")
     return False
 
 
