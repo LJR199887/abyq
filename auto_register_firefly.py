@@ -1844,6 +1844,72 @@ async def retry_page_action(label: str, action, attempts: int = 2, delay_seconds
     return False
 
 
+async def handle_invite_set_password(page: Page, original_password: str) -> str | None:
+    password_selectors = [
+        "#SetPassword-PasswordField",
+        "input[data-id='SetPassword-PasswordField']",
+        "input[name='new-password']",
+    ]
+    repeat_selectors = [
+        "#SetPassword-PasswordRepeatField",
+        "input[data-id='SetPassword-PasswordRepeatField']",
+        "input[name='repeat-password']",
+    ]
+
+    set_password_detected = False
+    end_at = time.time() + 30
+    while time.time() < end_at:
+        if page.is_closed():
+            return None
+        for selector in password_selectors:
+            try:
+                field = await page.query_selector(selector)
+                if field and await field.is_visible():
+                    set_password_detected = True
+                    break
+            except Exception:
+                continue
+        if set_password_detected:
+            break
+        await page.wait_for_timeout(500)
+
+    if not set_password_detected:
+        log("  ℹ️ 未出现 Set a password 页面，继续等待登录跳转")
+        return original_password
+
+    log("Step 4.1: 检测到 Set a password，设置新的登录密码")
+    new_password = random_password()
+    while new_password == original_password:
+        new_password = random_password()
+
+    if not await wait_fill_any(page, password_selectors, new_password, timeout_ms=30000):
+        log("❌ 未找到 Set a password 密码输入框")
+        return None
+    if not await wait_fill_any(page, repeat_selectors, new_password, timeout_ms=30000):
+        log("❌ 未找到 Set a password 重复密码输入框")
+        return None
+    if not await wait_click_any(page, [
+        "button[data-id='PasswordRecovery-Set__ResetPasswordBtn']",
+        "button[data-click-event='ResetPasswordClick']",
+        "button[type='submit']:has-text('Continue')",
+        "button[type='submit']:has-text('继续')",
+    ], timeout_ms=30000):
+        log("❌ 未找到 Set a password 页面 Continue")
+        return None
+
+    log("Step 4.2: 等待 You're all set 页面并点击 Continue")
+    if not await wait_click_any(page, [
+        "button[data-id='Page-PrimaryButton']",
+        "button[type='button']:has-text('Continue')",
+        "button[type='button']:has-text('继续')",
+    ], timeout_ms=45000):
+        log("❌ 未找到 You're all set 页面 Continue")
+        return None
+
+    log("  ✅ 新密码设置完成，继续等待登录跳转")
+    return new_password
+
+
 async def run_invite_registration_flow(ctx: BrowserContext, main_page: Page, mail, email_addr: str) -> bool:
     log("━" * 50)
     log("邀请模式: Download apps 注册流程")
@@ -1922,8 +1988,12 @@ async def run_invite_registration_flow(ctx: BrowserContext, main_page: Page, mai
         log("❌ 未找到 Complete Account 按钮")
         return False
 
+    final_password = await handle_invite_set_password(auth_page, PASSWORD)
+    if not final_password:
+        return False
+
     log("Step 5: 等待页面自动跳转并导出 Cookie")
-    return await export_cookies_and_result(ctx, auth_page, email_addr, PASSWORD, passive=True)
+    return await export_cookies_and_result(ctx, auth_page, email_addr, final_password, passive=True)
 
 
 async def run_self_email_microsoft_flow(ctx: BrowserContext, main_page: Page, mail, email_addr: str) -> bool:
