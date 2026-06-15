@@ -1844,6 +1844,47 @@ async def retry_page_action(label: str, action, attempts: int = 2, delay_seconds
     return False
 
 
+async def submit_invite_set_password(page: Page, password_selectors: list[str]) -> bool:
+    submit_selectors = [
+        "button[data-id='PasswordRecovery-Set__ResetPasswordBtn']",
+        "button[data-click-event='ResetPasswordClick']",
+        "button.PasswordRecovery__reset-password-btn[type='submit']",
+    ]
+    await page.keyboard.press("Tab")
+    await page.wait_for_timeout(1000)
+
+    end_at = time.time() + 30
+    while time.time() < end_at:
+        if page.is_closed():
+            return False
+        for selector in submit_selectors:
+            try:
+                button = page.locator(selector).first
+                if await button.count() and await button.is_visible() and await button.is_enabled():
+                    log("  → 点击 Set a password 页面 Continue 提交新密码")
+                    await button.click()
+                    transition_end = time.time() + 45
+                    while time.time() < transition_end:
+                        if page.is_closed():
+                            return False
+                        password_page_visible = False
+                        for password_selector in password_selectors:
+                            password_field = page.locator(password_selector).first
+                            if await password_field.count() and await password_field.is_visible():
+                                password_page_visible = True
+                                break
+                        if not password_page_visible:
+                            log("  ✅ Set a password 已提交，页面已进入下一步")
+                            return True
+                        await page.wait_for_timeout(500)
+                    log("  ⚠️ 已点击 Continue，但 Set a password 页面仍未离开")
+                    return False
+            except Exception:
+                continue
+        await page.wait_for_timeout(500)
+    return False
+
+
 async def handle_invite_set_password(page: Page, original_password: str) -> str | None:
     password_selectors = [
         "#SetPassword-PasswordField",
@@ -1888,13 +1929,8 @@ async def handle_invite_set_password(page: Page, original_password: str) -> str 
     if not await wait_fill_any(page, repeat_selectors, new_password, timeout_ms=30000):
         log("❌ 未找到 Set a password 重复密码输入框")
         return None
-    if not await wait_click_any(page, [
-        "button[data-id='PasswordRecovery-Set__ResetPasswordBtn']",
-        "button[data-click-event='ResetPasswordClick']",
-        "button[type='submit']:has-text('Continue')",
-        "button[type='submit']:has-text('继续')",
-    ], timeout_ms=30000):
-        log("❌ 未找到 Set a password 页面 Continue")
+    if not await submit_invite_set_password(page, password_selectors):
+        log("❌ Set a password 页面 Continue 提交失败")
         return None
 
     log("Step 4.2: 等待 You're all set 页面并点击 Continue")
