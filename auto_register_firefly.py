@@ -1844,7 +1844,7 @@ async def retry_page_action(label: str, action, attempts: int = 2, delay_seconds
     return False
 
 
-async def submit_invite_set_password(page: Page, password_selectors: list[str], attempts: int = 3) -> bool:
+async def submit_invite_set_password(page: Page, password_selectors: list[str], attempts: int = 2) -> bool:
     submit_selectors = [
         "button[data-id='PasswordRecovery-Set__ResetPasswordBtn']",
         "button[data-click-event='ResetPasswordClick']",
