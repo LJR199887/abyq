@@ -53,6 +53,8 @@ DEFAULT_CONFIG = {
     "token_pool_enabled": False,
     "token_pool_site": "",
     "token_pool_key": "",
+    "token_pools": [],
+    "token_pool_cursor": 0,
     "self_email_accounts": "",
     "self_email_cursor": 0,
     "self_email_used": [],
@@ -363,6 +365,7 @@ config = load_config()
 self_email_lock = asyncio.Lock()
 self_email_reserved = set()
 adobe_account_lock = asyncio.Lock()
+token_pool_lock = asyncio.Lock()
 
 # ─── Task Management ───
 class Task:
@@ -615,6 +618,7 @@ class ConfigUpdate(BaseModel):
     token_pool_enabled: bool = False
     token_pool_site: str = ""
     token_pool_key: str = ""
+    token_pools: list[dict] = Field(default_factory=list)
 
 
 class SelfEmailUpdate(BaseModel):
@@ -691,6 +695,23 @@ async def update_config(item: ConfigUpdate):
     global config
     proxy_scheme = item.proxy_scheme if item.proxy_scheme in ("http", "https", "socks5") else "http"
     adobe_proxy_scheme = item.adobe_proxy_scheme if item.adobe_proxy_scheme in ("http", "https", "socks5") else "http"
+    token_pools = normalize_token_pools(item.token_pools)
+    legacy_site = item.token_pool_site.strip()
+    legacy_key = item.token_pool_key.strip()
+    if not token_pools and (legacy_site or legacy_key):
+        token_pools.append({
+            "id": "legacy",
+            "name": "1号池",
+            "site": legacy_site,
+            "key": legacy_key,
+            "enabled": True,
+            "success": 0,
+            "failed": 0,
+        })
+    legacy_pool = next((pool for pool in token_pools if pool.get("site") and pool.get("key")), None)
+    if legacy_pool:
+        legacy_site = legacy_pool.get("site", "")
+        legacy_key = legacy_pool.get("key", "")
     config = {
         "api_key": item.api_key,
         "api_base": item.api_base,
@@ -704,8 +725,10 @@ async def update_config(item: ConfigUpdate):
         "adobe_proxy_scheme": adobe_proxy_scheme,
         "adobe_proxy_url": item.adobe_proxy_url.strip(),
         "token_pool_enabled": item.token_pool_enabled,
-        "token_pool_site": item.token_pool_site.strip(),
-        "token_pool_key": item.token_pool_key.strip(),
+        "token_pool_site": legacy_site,
+        "token_pool_key": legacy_key,
+        "token_pools": token_pools,
+        "token_pool_cursor": config.get("token_pool_cursor", 0),
         "self_email_accounts": config.get("self_email_accounts", ""),
         "self_email_cursor": config.get("self_email_cursor", 0),
         "self_email_used": config.get("self_email_used", []),
@@ -2011,15 +2034,110 @@ def build_token_pool_import_url(site: str) -> str:
     return urljoin(raw.rstrip("/") + "/", "api/v1/automation/import-cookie")
 
 
+def normalize_token_pools(raw_pools=None) -> list[dict]:
+    pools = raw_pools if raw_pools is not None else config.get("token_pools")
+    normalized: list[dict] = []
+    if isinstance(pools, list):
+        for index, pool in enumerate(pools, 1):
+            if not isinstance(pool, dict):
+                continue
+            site = (pool.get("site") or pool.get("url") or "").strip()
+            key = (pool.get("key") or pool.get("token_pool_key") or "").strip()
+            if not site and not key:
+                continue
+            normalized.append({
+                "id": (pool.get("id") or uuid.uuid4().hex).strip(),
+                "name": (pool.get("name") or f"{index}号池").strip(),
+                "site": site,
+                "key": key,
+                "enabled": bool(pool.get("enabled", True)),
+                "success": int(pool.get("success", 0) or 0),
+                "failed": int(pool.get("failed", 0) or 0),
+            })
+
+    legacy_site = (config.get("token_pool_site") or "").strip()
+    legacy_key = (config.get("token_pool_key") or "").strip()
+    if not normalized and (legacy_site or legacy_key):
+        normalized.append({
+            "id": "legacy",
+            "name": "1号池",
+            "site": legacy_site,
+            "key": legacy_key,
+            "enabled": True,
+            "success": 0,
+            "failed": 0,
+        })
+    return normalized
+
+
+def save_token_pool_stats(pools: list[dict], cursor: int) -> None:
+    config["token_pools"] = pools
+    config["token_pool_cursor"] = cursor
+    save_config(config)
+
+
+async def reserve_token_pool_order() -> list[dict]:
+    async with token_pool_lock:
+        pools = normalize_token_pools()
+        enabled_pools = [pool for pool in pools if pool.get("enabled")]
+        if not enabled_pools:
+            return []
+
+        cursor = int(config.get("token_pool_cursor", 0) or 0)
+        start = cursor % len(enabled_pools)
+        ordered = enabled_pools[start:] + enabled_pools[:start]
+        next_cursor = (start + 1) % len(enabled_pools)
+        save_token_pool_stats(pools, next_cursor)
+        return [dict(pool) for pool in ordered]
+
+
+async def record_token_pool_result(pool_id: str, success: bool) -> None:
+    async with token_pool_lock:
+        pools = normalize_token_pools()
+        source_pool = next((item for item in pools if item.get("id") == pool_id), None)
+        if not source_pool:
+            return
+        stat_key = "success" if success else "failed"
+        source_pool[stat_key] = int(source_pool.get(stat_key, 0) or 0) + 1
+        save_token_pool_stats(pools, int(config.get("token_pool_cursor", 0) or 0))
+
+
+async def import_cookie_to_single_token_pool(prefix: str, pool: dict, payload: dict) -> tuple[bool, str]:
+    import_url = build_token_pool_import_url(pool.get("site", ""))
+    token_pool_key = (pool.get("key") or "").strip()
+    pool_name = pool.get("name") or "Token 池"
+    if not import_url or not token_pool_key:
+        return False, "网站地址或 Token 池密钥未配置"
+
+    headers = {
+        "Authorization": f"Bearer {token_pool_key}",
+        "X-Token-Pool-Key": token_pool_key,
+        "Content-Type": "application/json",
+    }
+
+    last_error = ""
+    for attempt in range(1, 4):
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(import_url, json=payload, headers=headers)
+            if 200 <= response.status_code < 300:
+                return True, ""
+            detail = response.text[:200].replace("\n", " ")
+            last_error = f"HTTP {response.status_code} {detail}"
+        except Exception as e:
+            last_error = str(e)
+
+        if attempt < 3:
+            await task_manager.broadcast(
+                f"{prefix} ⚠️ {pool_name} 入池失败，第 {attempt}/3 次：{last_error}，2 秒后重试"
+            )
+            await asyncio.sleep(2)
+    return False, last_error
+
+
 async def import_cookie_to_token_pool(cookie_file: str, prefix: str) -> bool:
     if not config.get("token_pool_enabled"):
         return True
-
-    import_url = build_token_pool_import_url(config.get("token_pool_site", ""))
-    token_pool_key = (config.get("token_pool_key") or "").strip()
-    if not import_url or not token_pool_key:
-        await task_manager.broadcast(f"{prefix} ⚠️ 自动入池已开启，但网站地址或 Token 池密钥未配置")
-        return False
 
     try:
         with open(cookie_file, "r", encoding="utf-8") as f:
@@ -2036,30 +2154,25 @@ async def import_cookie_to_token_pool(cookie_file: str, prefix: str) -> bool:
         await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败：Cookie 内容为空")
         return False
 
-    headers = {
-        "Authorization": f"Bearer {token_pool_key}",
-        "X-Token-Pool-Key": token_pool_key,
-        "Content-Type": "application/json",
-    }
+    ordered = await reserve_token_pool_order()
+    if not ordered:
+        await task_manager.broadcast(f"{prefix} ⚠️ 自动入池已开启，但没有启用的 Token 池")
+        return False
 
     last_error = ""
-    for attempt in range(1, 4):
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(import_url, json=payload, headers=headers)
-            if 200 <= response.status_code < 300:
-                await task_manager.broadcast(f"{prefix} ✅ 已自动导入 Token 池")
-                return True
-            detail = response.text[:200].replace("\n", " ")
-            last_error = f"HTTP {response.status_code} {detail}"
-        except Exception as e:
-            last_error = str(e)
+    for pool in ordered:
+        pool_name = pool.get("name") or "Token 池"
+        await task_manager.broadcast(f"{prefix} 正在自动入池：{pool_name}")
+        ok, error = await import_cookie_to_single_token_pool(prefix, pool, payload)
+        if ok:
+            await record_token_pool_result(pool.get("id", ""), True)
+            await task_manager.broadcast(f"{prefix} ✅ 已自动导入 {pool_name}")
+            return True
+        await record_token_pool_result(pool.get("id", ""), False)
+        last_error = error
+        await task_manager.broadcast(f"{prefix} ⚠️ {pool_name} 入池失败，尝试下一个池：{error}")
 
-        if attempt < 3:
-            await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败，第 {attempt}/3 次：{last_error}，2 秒后重试")
-            await asyncio.sleep(2)
-
-    await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败：{last_error}")
+    await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败：全部 Token 池均失败；最后错误：{last_error}")
     return False
 
 

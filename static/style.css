@@ -1563,6 +1563,114 @@ textarea:focus {
     box-shadow: 0 0 8px rgba(99, 102, 241, 0.5);
 }
 
+.token-pool-list {
+    display: grid;
+    gap: 10px;
+    margin: 14px 0 16px;
+}
+
+.token-pool-card {
+    background: rgba(255, 255, 255, 0.035);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 12px 14px;
+    transition: border-color 0.2s ease, background 0.2s ease;
+}
+
+.token-pool-card.expanded {
+    background: rgba(255, 255, 255, 0.055);
+    border-color: rgba(99, 102, 241, 0.22);
+}
+
+.token-pool-summary {
+    align-items: center;
+    display: flex;
+    gap: 12px;
+    justify-content: space-between;
+}
+
+.token-pool-title {
+    align-items: center;
+    color: var(--text-secondary);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 7px;
+    line-height: 1.35;
+}
+
+.token-pool-title strong {
+    color: var(--text-primary);
+    font-size: 1rem;
+}
+
+.token-pool-state {
+    font-weight: 700;
+}
+
+.token-pool-state.enabled {
+    color: var(--success);
+}
+
+.token-pool-state.disabled {
+    color: var(--text-secondary);
+}
+
+.token-pool-url {
+    color: var(--text-secondary);
+    font-size: 0.82rem;
+    margin-top: 5px;
+    overflow-wrap: anywhere;
+}
+
+.token-pool-actions {
+    align-items: center;
+    display: flex;
+    flex: 0 0 auto;
+    gap: 8px;
+}
+
+.token-pool-check {
+    align-items: center;
+    color: var(--text-primary);
+    display: flex;
+    font-weight: 600;
+    gap: 6px;
+    white-space: nowrap;
+}
+
+.token-pool-detail {
+    border-top: 1px solid var(--border-color);
+    display: grid;
+    gap: 11px;
+    margin-top: 12px;
+    padding-top: 12px;
+}
+
+.token-pool-key-row {
+    display: grid;
+    grid-template-columns: 1fr 88px;
+}
+
+.token-pool-key-row input {
+    border-bottom-right-radius: 0;
+    border-top-right-radius: 0;
+}
+
+.token-pool-key-row .btn {
+    border-bottom-left-radius: 0;
+    border-top-left-radius: 0;
+}
+
+.token-pool-delete {
+    width: 100%;
+}
+
+.token-pool-footer {
+    display: grid;
+    gap: 10px;
+    margin-top: 10px;
+}
+
 @media (max-width: 760px) {
     .container {
         padding: 1rem;
@@ -1627,5 +1735,20 @@ textarea:focus {
 
     .modal-actions {
         grid-template-columns: 1fr;
+    }
+
+    .token-pool-summary,
+    .token-pool-actions {
+        align-items: stretch;
+        flex-direction: column;
+    }
+
+    .token-pool-key-row {
+        grid-template-columns: 1fr;
+    }
+
+    .token-pool-key-row input,
+    .token-pool-key-row .btn {
+        border-radius: 8px;
     }
 }
