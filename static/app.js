@@ -92,7 +92,7 @@ document.addEventListener("DOMContentLoaded", () => {
     function createLogLine(entry) {
         const line = document.createElement("div");
         line.className = `log-line ${entry.type}`;
-        line.textContent = entry.text;
+        line.textContent = formatLogText(entry.text);
         return line;
     }
 
@@ -122,10 +122,19 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function logType(text) {
-        if (text.includes("❌") || text.includes("⚠️")) return "error";
-        if (text.includes("✅") || text.includes("🎉")) return "success";
+        if (text.includes("❌") || text.includes("⚠️") || text.includes("ERROR") || text.includes("失败") || text.includes("failed")) return "error";
+        if (text.includes("✅") || text.includes("🎉") || text.includes("成功") || text.includes("succeeded")) return "success";
         if (text.includes("系统") || text.includes("📋") || text.includes("🏁")) return "sys";
         return "info";
+    }
+
+    function formatLogText(text) {
+        return String(text || "")
+            .replace(/\[Task#(\d+)-(\d+):\s*([^\]]+)\]/g, "[任务#$1-$2 · $3]")
+            .replace(/\[Task#(\d+):\s*([^\]]+)\]/g, "[任务#$1 · $2]")
+            .replace(/\[Task#(\d+)\]/g, "[任务#$1]")
+            .replace(/\bERROR:\s*/g, "❌ ")
+            .replace(/Step\s+([123])\/3：/g, "第 $1 步：");
     }
 
     function selectedAdobeAccountIds() {
@@ -343,6 +352,8 @@ document.addEventListener("DOMContentLoaded", () => {
         let tid = null;
         let match = text.match(/\[任务#(\d+)(?:[-\s·\]])/);
         if (!match) match = text.match(/任务\s*#(\d+)/);
+        if (!match) match = text.match(/\[Task#(\d+)(?:[-:\s\]])/);
+        if (!match) match = text.match(/Task\s*#(\d+)/);
         if (match) tid = parseInt(match[1]);
 
         let entry = { text, type };

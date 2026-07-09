@@ -30,7 +30,7 @@
                 <div class="self-email-header">
                     <div>
                         <h2><span class="icon">📮</span> 自备邮箱配置</h2>
-                        <p class="card-desc">每行一条，格式：邮箱----密码----取件api链接。任务使用后会自动标记为已使用。</p>
+                        <p class="card-desc">每行一条，支持：邮箱-密码-api取件链接，或 邮箱----密码----ClientID----RefreshToken。任务使用后会自动标记为已使用。</p>
                     </div>
                     <div class="self-email-stats">
                         <div class="mini-stat">
@@ -73,7 +73,7 @@
                                 <th>#</th>
                                 <th>邮箱</th>
                                 <th>密码</th>
-                                <th>取件 API</th>
+                                <th>收码方式</th>
                                 <th>状态</th>
                             </tr>
                         </thead>
@@ -96,12 +96,12 @@
                 <h2><span class="icon">📮</span> 输入自备邮箱</h2>
                 <button class="icon-btn" id="close-editor-btn" aria-label="关闭">×</button>
             </div>
-            <p class="card-desc">每行一条，格式：邮箱----密码----取件api链接。</p>
+            <p class="card-desc">每行一条，支持两种格式：邮箱-密码-api取件链接，或 邮箱----密码----ClientID----RefreshToken。</p>
             <div class="editor-helper">
                 <span id="editor-line-count">0 行</span>
                 <span>一行一个邮箱，支持直接粘贴整批列表</span>
             </div>
-            <textarea id="self_email_accounts" rows="14" placeholder="JamesMartin214180@hotmail.com----mszyw41195----https://xiaoheiapi.top/m/xxx/JamesMartin214180%40hotmail.com"></textarea>
+            <textarea id="self_email_accounts" rows="14" placeholder="JamesMartin214180@hotmail.com-mszyw41195-https://xiaoheiapi.top/m/xxx/JamesMartin214180%40hotmail.com&#10;JamesMartin214180@hotmail.com----mszyw41195----ClientID----RefreshToken"></textarea>
             <div class="modal-actions">
                 <button class="btn primary" id="save-self-email-btn">保存配置</button>
                 <button class="btn secondary" id="cancel-editor-btn">取消</button>
@@ -212,7 +212,7 @@
                     <td>${item.index}</td>
                     <td>${escapeHtml(item.email)}</td>
                     <td>${escapeHtml(item.password_mask)}</td>
-                    <td class="api-url">${escapeHtml(item.api_url)}</td>
+                    <td class="api-url">${escapeHtml(item.receive_mode || (item.api_url ? "API" : "Graph/IMAP"))}<small>${escapeHtml(item.api_url || item.client_id || "")}</small></td>
                     <td><span class="badge ${item.used ? "stopped" : "completed"}">${item.used ? "已使用" : "未使用"}</span></td>
                 </tr>
             `).join("");

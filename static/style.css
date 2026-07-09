@@ -595,6 +595,23 @@ h1 {
     font-size: 0.72rem;
 }
 
+.operation-detail {
+    width: 100%;
+    max-height: 220px;
+    overflow: auto;
+    margin: 0.25rem 0 0;
+    padding: 0.55rem 0.7rem;
+    border: 1px solid var(--card-border);
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.22);
+    color: var(--text-secondary);
+    font-family: "Cascadia Mono", "Consolas", "SFMono-Regular", monospace;
+    font-size: 0.72rem;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
 .card-desc {
     color: var(--text-secondary);
     font-size: 0.8rem;
@@ -1327,6 +1344,9 @@ textarea:focus {
 .log-line {
     margin-bottom: 0.2rem;
     word-break: break-all;
+    white-space: pre-wrap;
+    line-height: 1.7;
+    font-family: "Cascadia Mono", "Consolas", "SFMono-Regular", monospace;
 }
 
 .log-line.sys { color: var(--text-secondary); font-style: italic; }

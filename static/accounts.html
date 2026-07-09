@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>账号管理 - Firefly Registration</title>
+    <title>母号凭证管理 - Firefly Registration</title>
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -16,11 +16,11 @@
                     <h1>Firefly Registration</h1>
                 </div>
                 <nav class="nav-links">
-                    <a href="/" class="nav-link">🚀 任务</a>
-                    <a href="/records.html" class="nav-link">📋 记录</a>
-                    <a href="/self-emails.html" class="nav-link">📧 自备邮箱</a>
-                    <a href="/accounts.html" class="nav-link active">👤 账号</a>
-                    <a href="/settings.html" class="nav-link">⚙️ 设置</a>
+                    <a href="/" class="nav-link">任务</a>
+                    <a href="/records.html" class="nav-link">记录</a>
+                    <a href="/self-emails.html" class="nav-link">自备邮箱</a>
+                    <a href="/accounts.html" class="nav-link active">母号</a>
+                    <a href="/settings.html" class="nav-link">设置</a>
                 </nav>
             </div>
         </header>
@@ -31,20 +31,13 @@
                     <div class="account-section-title">
                         <div>
                             <span class="eyebrow">ADOBE ADMIN</span>
-                            <h2>账号凭据</h2>
+                            <h2>母号凭证</h2>
                         </div>
                         <button class="btn-sm primary" id="new-account-btn">新增</button>
                     </div>
-                    <p class="card-desc">保存 Adobe Admin Console 登录 Cookie，用于执行团队管理操作。</p>
-                    <div class="account-batch-toolbar">
-                        <label class="account-batch-select">
-                            <input type="checkbox" id="select-all-accounts" disabled>
-                            <span>全选</span>
-                        </label>
-                        <button class="btn-sm danger" id="delete-selected-accounts-btn" disabled>删除选中</button>
-                    </div>
+                    <p class="card-desc">导入邮箱、邮箱密码、Adobe 密码、ClientID、RefreshToken 后，系统会自动收验证码并获取管理权限。</p>
                     <div id="account-list" class="account-list">
-                        <div class="empty-hint">暂未配置账号</div>
+                        <div class="empty-hint">尚未导入母号</div>
                     </div>
                     <div class="account-pagination">
                         <button class="btn-sm primary" id="account-prev-btn" disabled>上一页</button>
@@ -54,27 +47,44 @@
                 </div>
 
                 <div class="card glass-card credential-card">
-                    <h2><span class="icon">🔐</span> 配置账号</h2>
+                    <h2>配置母号</h2>
                     <input type="hidden" id="account-id">
                     <div class="form-group">
-                        <label for="account-name">账号名称</label>
-                        <input id="account-name" type="text" placeholder="例如：主团队账号" maxlength="50">
+                        <label for="account-email">邮箱</label>
+                        <input id="account-email" type="email" placeholder="admin@example.com">
                     </div>
                     <div class="form-group">
-                        <div class="cookie-field-header">
-                            <label for="account-cookie">Adobe Cookie</label>
-                            <label class="btn-sm primary json-import-btn" for="cookie-json-input">导入 Cookie JSON</label>
-                            <input type="file" id="cookie-json-input" accept=".json,application/json" hidden>
-                        </div>
-                        <textarea id="account-cookie" class="cookie-input" placeholder="粘贴 k1=v1; k2=v2 格式的完整 Cookie。编辑现有账号时留空可保留原 Cookie。"></textarea>
-                        <small class="field-helper">支持 {"cookie":"k1=v1; k2=v2"} 或 Cookie 数组 JSON。</small>
+                        <label for="hotmail-password">邮箱密码</label>
+                        <input id="hotmail-password" type="password" placeholder="可选，主要用于记录">
+                    </div>
+                    <div class="form-group">
+                        <label for="adobe-password">Adobe 密码</label>
+                        <input id="adobe-password" type="password" placeholder="母号 Adobe 密码">
+                    </div>
+                    <div class="form-group">
+                        <label for="client-id">ClientID</label>
+                        <input id="client-id" type="text" placeholder="Microsoft OAuth Client ID">
+                    </div>
+                    <div class="form-group">
+                        <label for="refresh-token">RefreshToken</label>
+                        <textarea id="refresh-token" rows="4" placeholder="Microsoft Refresh Token"></textarea>
                     </div>
                     <div class="account-form-actions">
-                        <button class="btn primary" id="save-account-btn">保存账号</button>
-                        <button class="btn secondary" id="test-account-btn" disabled>检查 Cookie</button>
+                        <button class="btn primary" id="save-account-btn">保存母号</button>
+                        <button class="btn secondary" id="test-account-btn" disabled>协议检测</button>
                     </div>
-                    <button class="btn danger-action account-delete-btn" id="delete-account-btn" disabled>删除当前账号</button>
+                    <button class="btn danger-action account-delete-btn" id="delete-account-btn" disabled>删除当前母号</button>
                     <div class="status-msg" id="account-status"></div>
+                </div>
+
+                <div class="card glass-card credential-card">
+                    <h2>批量导入</h2>
+                    <p class="card-desc">每行一个：邮箱----邮箱密码----Adobe密码----ClientID----RefreshToken</p>
+                    <textarea id="batch-import-content" rows="8" placeholder="admin@example.com----mailPass----adobePass----clientId----refreshToken"></textarea>
+                    <div class="account-form-actions">
+                        <button class="btn primary" id="batch-import-btn">导入/跳过重复</button>
+                        <button class="btn secondary" id="batch-overwrite-btn">导入/覆盖重复</button>
+                    </div>
                 </div>
             </section>
 
@@ -82,10 +92,10 @@
                 <div class="account-hero card glass-card">
                     <div>
                         <span class="eyebrow">TEAM AUTOMATION</span>
-                        <h2>团队成员操作台</h2>
-                        <p>选择已配置账号，批量发送邀请邮件或移除成员。每行填写一个邮箱。</p>
+                        <h2>协议成员操作</h2>
+                        <p>选择母号后可读取成员、协议授权邀请，或移除可删除成员。</p>
                     </div>
-                    <div class="selected-account-pill" id="selected-account-pill">未选择账号</div>
+                    <div class="selected-account-pill" id="selected-account-pill">未选择母号</div>
                 </div>
 
                 <div class="card glass-card member-panel">
@@ -93,10 +103,10 @@
                         <div>
                             <span class="eyebrow">ORGANIZATION MEMBERS</span>
                             <h2>组织成员</h2>
-                            <p class="card-desc" id="member-summary">选择账号后可读取 Adobe Admin Console 成员。</p>
+                            <p class="card-desc" id="member-summary">选择母号后可读取成员。</p>
                         </div>
                         <div class="member-toolbar-actions">
-                            <input id="member-search" type="search" placeholder="搜索成员邮箱或姓名">
+                            <input id="member-search" type="search" placeholder="搜索邮箱">
                             <button class="btn-sm danger" id="remove-selected-members-btn" disabled>移除选中</button>
                             <button class="btn-sm primary" id="refresh-members-btn" disabled>刷新成员</button>
                         </div>
@@ -105,7 +115,7 @@
                         <table class="member-table">
                             <thead>
                                 <tr>
-                                    <th><input type="checkbox" id="select-all-members" aria-label="全选可移除成员"></th>
+                                    <th><input type="checkbox" id="select-all-members" aria-label="全选"></th>
                                     <th>成员</th>
                                     <th>类型</th>
                                     <th>产品</th>
@@ -127,13 +137,12 @@
 
                 <div class="invite-action-wrap">
                     <div class="card glass-card action-panel invite-panel">
-                        <div class="panel-kicker">INVITE</div>
-                        <h2>发送邀请邮件</h2>
-                        <p class="card-desc">自动进入 Adobe Admin Console，逐个提交成员邀请。</p>
+                        <div class="panel-kicker">GRANT</div>
+                        <h2>协议授权子号</h2>
+                        <p class="card-desc">每行一个邮箱。后端会使用 JIL users:batch 添加成员并分配产品。</p>
                         <textarea id="invite-emails" placeholder="member1@example.com&#10;member2@example.com"></textarea>
-                        <button class="btn action" id="invite-btn" disabled>发送邀请</button>
+                        <button class="btn action" id="invite-btn" disabled>发送授权</button>
                     </div>
-
                 </div>
 
                 <div class="card glass-card operation-console">
@@ -145,7 +154,7 @@
                         <button class="btn-sm primary" id="clear-log-btn">清空</button>
                     </div>
                     <div id="operation-log" class="operation-log">
-                        <div class="empty-hint">等待执行团队操作</div>
+                        <div class="empty-hint">等待操作</div>
                     </div>
                 </div>
             </section>

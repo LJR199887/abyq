@@ -23,6 +23,9 @@ from pydantic import BaseModel, Field
 import glob
 import httpx
 
+import adobe_admin
+import firefly_protocol
+
 app = FastAPI()
 
 # Config storage
@@ -82,7 +85,16 @@ PUBLIC_PATHS = {
 
 
 def extract_task_id_from_log(message: str) -> int | None:
-    for pattern in (r"\[任务#(\d+)(?:[-\s·\]])", r"任务\s*#(\d+)"):
+    for pattern in (
+        r"\[任务#(\d+)(?:[-\s·\]])",
+        r"任务\s*#(\d+)",
+        r"\[Task#(\d+)(?:[-:\s\]])",
+        r"Task\s*#(\d+)",
+        r"\[??#(\d+)(?:[-:\s?\]])",
+        r"??\s*#(\d+)",
+        r"\[???#(\d+)(?:[-\s?\]])",
+        r"???\s*#(\d+)",
+    ):
         match = re.search(pattern, message)
         if match:
             return int(match.group(1))
@@ -633,8 +645,18 @@ class TaskDeleteRequest(BaseModel):
 
 class AdobeAccountUpdate(BaseModel):
     id: str = ""
-    name: str
+    name: str = ""
+    email: str = ""
+    hotmail_password: str = ""
+    adobe_password: str = ""
+    client_id: str = ""
+    refresh_token: str = ""
     cookie: str = ""
+
+
+class AdobeAccountBatchImport(BaseModel):
+    content: str = ""
+    on_duplicate: str = "skip"
 
 
 class AdobeTeamActionRequest(BaseModel):
@@ -759,21 +781,42 @@ def normalize_email_list(emails: list[str]) -> list[str]:
 
 
 def adobe_account_summary(account: dict) -> dict:
+    normalize_adobe_account(account)
     cookie = account.get("cookie", "")
     try:
         cookie_count = len(parse_adobe_cookies(cookie)) if cookie else 0
     except ValueError:
         cookie_count = 0
+    has_protocol = bool(account.get("client_id") and account.get("refresh_token"))
+    display_name = account.get("name") or account.get("email") or ""
+    assignment_count = len(account.get("product_assignments") or [])
     return {
         "id": account.get("id", ""),
-        "name": account.get("name", ""),
+        "name": display_name,
+        "email": account.get("email", ""),
+        "hotmail_password": account.get("hotmail_password", ""),
+        "adobe_password": account.get("adobe_password", ""),
+        "client_id": account.get("client_id", ""),
+        "refresh_token": account.get("refresh_token", ""),
         "cookie_configured": bool(cookie),
-        "cookie_preview": f"已配置 · {cookie_count} 项" if cookie else "",
-        "product_count": len(account.get("invite_product_ids", [])),
-        "organization_id": account.get("organization_id", ""),
+        "credential_configured": has_protocol,
+        "cookie_preview": (
+            "protocol credentials configured"
+            if has_protocol else (f"cookie configured ? {cookie_count} items" if cookie else "")
+        ),
+        "product_count": assignment_count or (1 if account.get("product_id") else len(account.get("invite_product_ids", []))),
+        "organization_id": account.get("org_id") or account.get("organization_id", ""),
+        "org_id": account.get("org_id", ""),
+        "product_name": account.get("product_name", ""),
+        "member_count": account.get("member_count", 0),
+        "has_org": account.get("has_org"),
+        "is_valid": account.get("is_valid"),
+        "check_message": account.get("check_message", ""),
         "subscriptions": account.get("subscriptions", []),
         "last_token_check_at": account.get("last_token_check_at", ""),
         "token_expires_at": account.get("token_expires_at", ""),
+        "last_login_at": account.get("last_login_at", ""),
+        "last_checked_at": account.get("last_checked_at", ""),
         "updated_at": account.get("updated_at", ""),
     }
 
@@ -832,6 +875,161 @@ def find_adobe_account(account_id: str) -> dict | None:
         (account for account in config.get("adobe_accounts", []) if account.get("id") == account_id),
         None,
     )
+
+
+def adobe_proxy_url() -> str:
+    proxy = adobe_proxy_config()
+    return proxy["url"] if proxy else ""
+
+
+def adobe_account_email(account: dict) -> str:
+    return (account.get("email") or account.get("name") or "").strip()
+
+
+def normalize_adobe_account(account: dict) -> dict:
+    email = adobe_account_email(account)
+    if email:
+        account["email"] = email
+    account.setdefault("name", email or account.get("id", ""))
+    for key in (
+        "hotmail_password", "adobe_password", "client_id", "refresh_token",
+        "admin_token", "admin_cookie", "org_id", "product_id", "product_name",
+        "license_group_id", "check_message", "last_login_at", "last_checked_at",
+    ):
+        account.setdefault(key, "")
+    account.setdefault("product_assignments", [])
+    account.setdefault("member_count", 0)
+    account.setdefault("has_org", False)
+    account.setdefault("is_valid", None)
+    return account
+
+
+def protocol_account_ready(account: dict) -> bool:
+    normalize_adobe_account(account)
+    return bool(account.get("email") and account.get("client_id") and account.get("refresh_token"))
+
+
+def apply_admin_login_result(account: dict, result: dict) -> None:
+    rotated = result.get("rotated_refresh_token") or ""
+    if rotated and rotated != account.get("refresh_token"):
+        account["refresh_token"] = rotated
+    account["admin_token"] = result.get("token") or ""
+    account["admin_cookie"] = result.get("cookie") or ""
+    account["org_id"] = result.get("org_id") or ""
+    account["organization_id"] = account["org_id"]
+    account["product_id"] = result.get("product_id") or ""
+    account["product_name"] = result.get("product_name") or ""
+    account["license_group_id"] = result.get("license_group_id") or ""
+    assignments = result.get("product_assignments") or []
+    account["product_assignments"] = assignments if isinstance(assignments, list) else []
+    account["has_org"] = bool(result.get("has_org"))
+    account["is_valid"] = bool(result.get("has_org"))
+    account["last_login_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    account["last_checked_at"] = account["last_login_at"]
+    account["check_message"] = (
+        f"组织 {result.get('org_count', 0)} 个 / 产品 {result.get('product_count', 0)} 个"
+        if result.get("has_org") else result.get("message", "")
+    )
+
+
+async def ensure_protocol_admin(account: dict, log=None) -> dict:
+    normalize_adobe_account(account)
+    proxy_url = adobe_proxy_url()
+
+    def emit(message: str) -> None:
+        if callable(log):
+            log(message)
+
+    has_cached = bool(
+        account.get("admin_token") and account.get("org_id")
+        and account.get("product_id") and account.get("license_group_id")
+    )
+    if has_cached:
+        try:
+            check_result = await asyncio.to_thread(
+                adobe_admin.check_admin,
+                token=account["admin_token"],
+                org_id=account["org_id"],
+                proxy_url=proxy_url,
+            )
+            for key in ("product_id", "product_name", "license_group_id", "product_assignments"):
+                if key in check_result:
+                    account[key] = check_result.get(key) or ([] if key == "product_assignments" else "")
+            account["has_org"] = bool(check_result.get("has_org", True))
+            account["is_valid"] = True
+            account["last_checked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+            account["check_message"] = (
+                f"组织 {check_result.get('org_count', 0)} 个 / 产品 {check_result.get('product_count', 0)} 个"
+            )
+            save_config(config)
+            return account
+        except Exception as exc:
+            emit(f"管理 token 已失效，重新协议登录: {str(exc)[:160]}")
+
+    if not protocol_account_ready(account):
+        raise RuntimeError("账号缺少 email / ClientID / RefreshToken，无法协议登录")
+
+    result = await asyncio.to_thread(
+        adobe_admin.login_account,
+        email=account["email"],
+        adobe_password=account.get("adobe_password", ""),
+        refresh_token=account.get("refresh_token", ""),
+        client_id=account.get("client_id", ""),
+        proxy_url=proxy_url,
+        otp_timeout=180,
+        log=emit,
+    )
+    apply_admin_login_result(account, result)
+    save_config(config)
+    if not account.get("has_org"):
+        raise RuntimeError(account.get("check_message") or "登录成功但未发现可用组织/产品")
+    return account
+
+
+def parse_adobe_account_import(content: str, on_duplicate: str = "skip") -> dict:
+    result = {"created": 0, "updated": 0, "skipped": 0, "failed": 0, "errors": []}
+    accounts = config.setdefault("adobe_accounts", [])
+    by_email = {
+        adobe_account_email(normalize_adobe_account(account)).lower(): account
+        for account in accounts
+        if adobe_account_email(account)
+    }
+    overwrite = on_duplicate == "overwrite"
+    for line_no, raw in enumerate((content or "").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [part.strip() for part in line.split("----")]
+        if len(parts) < 5 or not parts[0] or "@" not in parts[0]:
+            result["failed"] += 1
+            result["errors"].append(f"第 {line_no} 行格式应为 邮箱----邮箱密码----Adobe密码----ClientID----RefreshToken")
+            continue
+        email = parts[0]
+        fields = {
+            "email": email,
+            "name": email,
+            "hotmail_password": parts[1],
+            "adobe_password": parts[2],
+            "client_id": parts[3],
+            "refresh_token": "----".join(parts[4:]).strip(),
+        }
+        key = email.lower()
+        existing = by_email.get(key)
+        if existing:
+            if not overwrite:
+                result["skipped"] += 1
+                continue
+            existing.update(fields)
+            existing["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+            result["updated"] += 1
+            continue
+        account = {"id": uuid.uuid4().hex, **fields, "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M")}
+        normalize_adobe_account(account)
+        accounts.append(account)
+        by_email[key] = account
+        result["created"] += 1
+    save_config(config)
+    return result
 
 
 def parse_adobe_cookies(cookie_header: str) -> list[dict]:
@@ -1354,6 +1552,111 @@ async def remove_adobe_members(account: dict, emails: list[str]) -> list[dict]:
         pass
 
 
+def protocol_member_summary(item: dict, protected: set[str] | None = None) -> dict:
+    raw = item.get("raw") if isinstance(item.get("raw"), dict) else item
+    email = (item.get("email") or raw.get("email") or raw.get("userName") or "").strip()
+    member_id = item.get("member_id") or raw.get("id") or raw.get("memberId") or ""
+    protected = protected or set()
+    return {
+        "id": member_id,
+        "email": email,
+        "first_name": raw.get("firstName", ""),
+        "last_name": raw.get("lastName", ""),
+        "type": raw.get("type", ""),
+        "account_status": raw.get("accountStatus", raw.get("status", "")),
+        "protected": email.lower() in protected,
+        "protection_reason": "admin account" if email.lower() in protected else "",
+        "removable": bool(member_id) and email.lower() not in protected,
+        "editable": True,
+        "products": len(raw.get("products") or []),
+    }
+
+
+async def fetch_adobe_members(account: dict, page_number: int = 0, page_size: int = 20, search: str = "") -> dict:
+    await ensure_protocol_admin(account)
+    proxy_url = adobe_proxy_url()
+    members = await asyncio.to_thread(
+        adobe_admin.fetch_members,
+        token=account["admin_token"],
+        org_id=account["org_id"],
+        proxy_url=proxy_url,
+        search=search.strip(),
+        pages=max(1, page_number + 1),
+    )
+    protected = {adobe_account_email(account).lower()}
+    start = max(0, page_number) * min(max(1, page_size), 100)
+    size = min(max(1, page_size), 100)
+    page_members = members[start:start + size]
+    account["member_count"] = len(members)
+    save_config(config)
+    return {
+        "organization_id": account.get("org_id", ""),
+        "page": max(0, page_number),
+        "page_size": size,
+        "has_more": start + size < len(members),
+        "members": [protocol_member_summary(member, protected) for member in page_members],
+    }
+
+
+async def invite_adobe_members(account: dict, emails: list[str]) -> list[dict]:
+    await ensure_protocol_admin(account)
+    assignments = account.get("product_assignments") or []
+    if not assignments and account.get("product_id") and account.get("license_group_id"):
+        assignments = [{
+            "product_id": account["product_id"],
+            "license_group_id": account["license_group_id"],
+            "product_name": account.get("product_name", ""),
+        }]
+    if not assignments:
+        raise RuntimeError("账号尚未发现可用产品或授权组，请先协议检测母号")
+    proxy_url = adobe_proxy_url()
+
+    async def grant(email: str) -> dict:
+        result = await asyncio.to_thread(
+            adobe_admin.grant_member,
+            token=account["admin_token"],
+            org_id=account["org_id"],
+            product_id=account["product_id"],
+            license_group_id=account["license_group_id"],
+            product_assignments=assignments,
+            email=email,
+            proxy_url=proxy_url,
+        )
+        ok = bool(result.get("ok"))
+        return {
+            "email": email,
+            "ok": ok,
+            "member_id": result.get("member_id", ""),
+            "message": result.get("message") or ("authorized" if ok else "authorization failed"),
+        }
+
+    return [await grant(email) for email in emails]
+
+
+async def remove_adobe_members(account: dict, emails: list[str]) -> list[dict]:
+    await ensure_protocol_admin(account)
+    proxy_url = adobe_proxy_url()
+    protected = {adobe_account_email(account).lower()}
+    results = []
+    for email in emails:
+        if email.strip().lower() in protected:
+            results.append({"email": email, "ok": False, "message": "cannot remove admin account"})
+            continue
+        result = await asyncio.to_thread(
+            adobe_admin.remove_member,
+            token=account["admin_token"],
+            org_id=account["org_id"],
+            email=email,
+            proxy_url=proxy_url,
+        )
+        results.append({
+            "email": email,
+            "ok": bool(result.get("ok")),
+            "message": result.get("message") or "",
+        })
+    return results
+
+
 @app.get("/api/adobe-accounts")
 async def get_adobe_accounts():
     return [adobe_account_summary(account) for account in config.get("adobe_accounts", [])]
@@ -1362,31 +1665,48 @@ async def get_adobe_accounts():
 @app.post("/api/adobe-accounts")
 async def save_adobe_account(item: AdobeAccountUpdate):
     global config
-    name = item.name.strip()
-    if not name:
-        return JSONResponse(status_code=400, content={"message": "请输入账号名称"})
+    email = (item.email or item.name).strip()
+    name = (item.name or email).strip()
+    if not email or "@" not in email:
+        return JSONResponse(status_code=400, content={"message": "请输入有效的母号邮箱"})
     accounts = config.setdefault("adobe_accounts", [])
     account = find_adobe_account(item.id) if item.id else None
-    try:
-        if account:
-            account["name"] = name
-            account.pop("product_ids", None)
-            if item.cookie.strip():
-                parse_adobe_cookies(item.cookie.strip())
-                account["cookie"] = item.cookie.strip()
-        else:
+    if not account:
+        existing = next(
+            (acc for acc in accounts if adobe_account_email(normalize_adobe_account(acc)).lower() == email.lower()),
+            None,
+        )
+        if existing:
+            account = existing
+    if not account:
+        account = {"id": uuid.uuid4().hex}
+        accounts.append(account)
+
+    account.update({
+        "name": name,
+        "email": email,
+        "hotmail_password": item.hotmail_password.strip(),
+        "adobe_password": item.adobe_password.strip(),
+        "client_id": item.client_id.strip(),
+        "refresh_token": item.refresh_token.strip(),
+    })
+    if item.cookie.strip():
+        try:
             parse_adobe_cookies(item.cookie.strip())
-            account = {
-                "id": uuid.uuid4().hex,
-                "name": name,
-                "cookie": item.cookie.strip(),
-            }
-            accounts.append(account)
-    except ValueError as exc:
-        return JSONResponse(status_code=400, content={"message": str(exc)})
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"message": str(exc)})
+        account["cookie"] = item.cookie.strip()
+    normalize_adobe_account(account)
     account["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
     save_config(config)
     return adobe_account_summary(account)
+
+
+@app.post("/api/adobe-accounts/batch-import")
+async def batch_import_adobe_accounts(item: AdobeAccountBatchImport):
+    if item.on_duplicate not in ("skip", "overwrite"):
+        return JSONResponse(status_code=400, content={"message": "on_duplicate must be skip or overwrite"})
+    return parse_adobe_account_import(item.content, item.on_duplicate)
 
 
 @app.delete("/api/adobe-accounts/{account_id}")
@@ -1407,11 +1727,29 @@ async def test_adobe_account(account_id: str):
     account = find_adobe_account(account_id)
     if not account:
         return JSONResponse(status_code=404, content={"message": "账号不存在"})
+    logs: list[str] = []
     try:
         async with adobe_account_lock:
-            return await test_adobe_account_cookie(account)
+            await ensure_protocol_admin(account, log=logs.append)
+            account["last_checked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+            account["is_valid"] = True
+            save_config(config)
+            return {
+                "ok": True,
+                "message": account.get("check_message") or "协议登录成功，已获取管理权限",
+                "organization_id": account.get("org_id", ""),
+                "product_name": account.get("product_name", ""),
+                "logs": logs[-80:],
+            }
     except Exception as exc:
-        return JSONResponse(status_code=400, content={"ok": False, "message": str(exc)})
+        account["is_valid"] = False
+        account["check_message"] = str(exc)[:500]
+        account["last_checked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        save_config(config)
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "message": str(exc), "logs": logs[-80:]},
+        )
 
 
 @app.get("/api/adobe-accounts/{account_id}/members")
@@ -1725,19 +2063,90 @@ async def import_cookie_to_token_pool(cookie_file: str, prefix: str) -> bool:
     return False
 
 
+def write_protocol_cookie_result(cookie_id: str, email: str, password: str, record: dict) -> str:
+    cookie_file = os.path.join(SCREENSHOT_DIR, f"cookie_{cookie_id}.json")
+    data = {
+        "cookie": record.get("cookie", ""),
+        "name": email,
+        "email": email,
+        "password": password,
+        "access_token": record.get("access_token", ""),
+        "credits": record.get("credits"),
+        "expires_at": record.get("expires_at"),
+        "display_name": record.get("display_name", ""),
+        "user_id": record.get("user_id", ""),
+        "refresh_token": record.get("rotated_refresh_token", ""),
+    }
+    with open(cookie_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+    return cookie_file
+
+
+async def register_invited_self_email(account: dict, reserved: dict, cookie_id: str, prefix: str) -> str:
+    email = reserved["email"]
+    password = reserved.get("password", "")
+    mail_url = reserved.get("api_url", "")
+    refresh_token = reserved.get("refresh_token", "")
+    client_id = reserved.get("client_id", "")
+    if not mail_url and not (refresh_token and client_id):
+        raise RuntimeError("子号缺少 API 取件链接，且没有 ClientID / RefreshToken 可用于 Graph/IMAP 收码")
+
+    loop = asyncio.get_running_loop()
+
+    def log(message: str) -> None:
+        loop.call_soon_threadsafe(
+            asyncio.create_task,
+            task_manager.broadcast(f"{prefix} {message}"),
+        )
+
+    record = await asyncio.to_thread(
+        firefly_protocol.register_account,
+        email=email,
+        refresh_token=refresh_token,
+        client_id=client_id,
+        mail_url=mail_url,
+        proxy_url=adobe_proxy_url(),
+        otp_timeout=180,
+        log=log,
+    )
+    rotated = record.get("rotated_refresh_token") or ""
+    if rotated:
+        await update_self_email_refresh_token(email, rotated)
+    return write_protocol_cookie_result(cookie_id, email, password, record)
+
+
 def parse_self_email_accounts(raw: str) -> list[dict]:
     accounts = []
     for line in (raw or "").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        parts = [part.strip() for part in line.split("----")]
-        if len(parts) < 3 or not parts[0] or not parts[1] or not parts[2]:
+        if "----" in line:
+            parts = [part.strip() for part in line.split("----")]
+        else:
+            parts = [part.strip() for part in line.split("-", 2)]
+        if len(parts) < 3 or not parts[0] or not parts[1]:
+            continue
+        api_url = ""
+        client_id = ""
+        refresh_token = ""
+        if len(parts) >= 5:
+            client_id = parts[2]
+            refresh_token = parts[3]
+            api_url = "----".join(parts[4:]).strip()
+        elif len(parts) >= 4:
+            client_id = parts[2]
+            refresh_token = "----".join(parts[3:]).strip()
+        elif parts[2].startswith(("http://", "https://", "moemail://")):
+            api_url = parts[2]
+        else:
             continue
         accounts.append({
             "email": parts[0],
             "password": parts[1],
-            "api_url": "----".join(parts[2:]).strip(),
+            "api_url": api_url,
+            "client_id": client_id,
+            "refresh_token": refresh_token,
         })
     return accounts
 
@@ -1762,6 +2171,9 @@ def build_self_email_overview() -> dict:
             "email": account["email"],
             "password_mask": "*" * min(max(len(password), 6), 12),
             "api_url": account["api_url"],
+            "client_id": account.get("client_id", ""),
+            "has_refresh_token": bool(account.get("refresh_token")),
+            "receive_mode": "API" if account["api_url"] else ("Graph/IMAP" if account.get("client_id") and account.get("refresh_token") else ""),
             "used": email_key in used,
         })
     used_count = sum(1 for row in rows if row["used"])
@@ -1775,10 +2187,34 @@ def build_self_email_overview() -> dict:
 
 
 def serialize_self_email_accounts(accounts: list[dict]) -> str:
-    return "\n".join(
-        f"{account['email']}----{account['password']}----{account['api_url']}"
-        for account in accounts
-    )
+    lines = []
+    for account in accounts:
+        if account.get("client_id") or account.get("refresh_token"):
+            lines.append(
+                f"{account['email']}----{account['password']}----"
+                f"{account.get('client_id', '')}----{account.get('refresh_token', '')}----"
+                f"{account.get('api_url', '')}"
+            )
+        else:
+            lines.append(f"{account['email']}----{account['password']}----{account.get('api_url', '')}")
+    return "\n".join(lines)
+
+
+async def update_self_email_refresh_token(email: str, refresh_token: str):
+    global config
+    if not email or not refresh_token:
+        return
+    email_key = email.strip().lower()
+    async with self_email_lock:
+        accounts = parse_self_email_accounts(config.get("self_email_accounts", ""))
+        changed = False
+        for account in accounts:
+            if account["email"].strip().lower() == email_key and account.get("refresh_token") != refresh_token:
+                account["refresh_token"] = refresh_token
+                changed = True
+        if changed:
+            config["self_email_accounts"] = serialize_self_email_accounts(accounts)
+            save_config(config)
 
 
 async def allocate_self_email_account() -> dict | None:
@@ -1956,98 +2392,152 @@ async def allocate_self_email_batch(quantity: int) -> list[dict]:
 
 
 async def run_invite_task(task: Task):
-    worker_index = 0
     for account_position, account_id in enumerate(task.adobe_account_ids, 1):
         if task.status == "stopping":
             break
         account = find_adobe_account(account_id)
         if not account:
             task.failed += task.batch_quantity
-            await task_manager.broadcast(f"[任务#{task.id}] ❌ 所选 Adobe 账号已不存在，跳过本批")
+            await task_manager.broadcast(f"[Task#{task.id}] ERROR: selected Adobe admin account no longer exists; skipping")
             continue
 
-        account_label = account.get("name") or account_id
-        prefix = f"[任务#{task.id} · {account_label}]"
-        batch = await allocate_self_email_batch(task.batch_quantity)
-        if len(batch) < task.batch_quantity:
-            for reserved in batch:
-                await release_self_email_account(reserved["email"])
-            task.failed += task.batch_quantity
-            await task_manager.broadcast(f"{prefix} ❌ 可用自备邮箱不足，跳过本批")
-            continue
+        account_label = account.get("email") or account.get("name") or account_id
+        prefix = f"[Task#{task.id}: {account_label}]"
+        target_success = max(1, int(task.batch_quantity or task.quantity or 1))
+        account_success = 0
+        registration_attempts = 0
+        max_registration_attempts = target_success * 5
+        await task_manager.broadcast(
+            f"{prefix} 目标 {target_success} 个成功账号；每个目标最多换邮箱 5 次，直到凑满或邮箱池耗尽"
+        )
 
         if task.invite_remove_members:
-            await task_manager.broadcast(f"{prefix} 正在获取并清理全部可移除成员...")
+            await task_manager.broadcast(f"{prefix} Step 1/3：读取并清理全部可移除成员...")
             try:
                 async with adobe_account_lock:
                     removable = await collect_removable_adobe_member_emails(account)
                     removal_results = await remove_adobe_members(account, removable) if removable else []
                 removal_failures = [result for result in removal_results if not result["ok"]]
-                await task_manager.broadcast(
-                    f"{prefix} 已清理 {len(removal_results) - len(removal_failures)} 个成员"
-                    + (f"，{len(removal_failures)} 个移除失败" if removal_failures else "")
-                )
+                removed_count = len(removal_results) - len(removal_failures)
+                suffix = f"，{len(removal_failures)} 个移除失败" if removal_failures else ""
+                await task_manager.broadcast(f"{prefix} 成员清理完成：已移除 {removed_count} 个{suffix}")
             except Exception as exc:
-                for reserved in batch:
-                    await release_self_email_account(reserved["email"])
-                task.failed += task.batch_quantity
-                await task_manager.broadcast(f"{prefix} ❌ 清理成员失败，本批已取消: {exc}")
+                task.failed += target_success
+                await task_manager.broadcast(f"{prefix} ❌ 成员清理失败，本母号取消：{exc}")
                 continue
         else:
-            await task_manager.broadcast(f"{prefix} 已关闭先移除成员，直接发送团队邀请...")
+            await task_manager.broadcast(f"{prefix} Step 1/3：已关闭清理成员，直接开始授权")
 
-        emails = [reserved["email"] for reserved in batch]
-        await task_manager.broadcast(f"{prefix} 正在发送 {len(emails)} 封团队邀请...")
-        try:
-            async with adobe_account_lock:
-                invite_results = await invite_adobe_members(account, emails)
-        except Exception as exc:
-            invite_results = [{"email": email, "ok": False, "message": str(exc)} for email in emails]
+        sem = asyncio.Semaphore(max(1, task.concurrency))
 
-        successful = []
-        for reserved, result in zip(batch, invite_results):
-            if result["ok"]:
-                await mark_self_email_used(reserved["email"])
-                successful.append(reserved)
-                await task_manager.broadcast(f"{prefix} ✅ {reserved['email']} 邀请已发送")
-            else:
-                await release_self_email_account(reserved["email"])
-                task.failed += 1
-                await task_manager.broadcast(f"{prefix} ❌ {reserved['email']} 邀请失败: {result['message']}")
-
-        await task_manager.broadcast("__STATE_UPDATE__")
-        if not successful or task.status == "stopping":
-            continue
-
-        if INVITE_EMAIL_WAIT_SECONDS:
-            await task_manager.broadcast(
-                f"{prefix} 等待邀请邮件送达，{INVITE_EMAIL_WAIT_SECONDS} 秒后开始注册..."
-            )
-        else:
-            await task_manager.broadcast(f"{prefix} 开始轮询邀请邮件并执行注册...")
-        waited = 0
-        while waited < INVITE_EMAIL_WAIT_SECONDS and task.status != "stopping":
-            interval = min(5, INVITE_EMAIL_WAIT_SECONDS - waited)
-            await asyncio.sleep(interval)
-            waited += interval
-        if task.status == "stopping":
-            break
-
-        sem = asyncio.Semaphore(task.concurrency)
-
-        async def wrapper(reserved: dict):
-            nonlocal worker_index
-            worker_index += 1
-            index = worker_index
+        async def run_invite_slot(slot_index: int) -> bool | None:
+            nonlocal account_success, registration_attempts
+            worker_prefix = f"[Task#{task.id}-{slot_index}: {account_label}]"
             async with sem:
-                if task.status == "stopping":
-                    return
-                await execute_single_worker(task, index, reserved)
+                for attempt in range(1, 6):
+                    if task.status == "stopping":
+                        return False
 
-        workers = [asyncio.create_task(wrapper(reserved)) for reserved in successful]
+                    reserved = await allocate_self_email_account()
+                    if not reserved:
+                        await task_manager.broadcast(
+                            f"{worker_prefix} ⚠️ 自备邮箱池已耗尽，子任务停止于第 {attempt}/5 次"
+                        )
+                        return None
+
+                    registration_attempts += 1
+                    email = reserved["email"]
+                    await task_manager.broadcast(
+                        f"{worker_prefix} Step 2/3：第 {attempt}/5 次尝试，授权 {email}"
+                    )
+
+                    try:
+                        async with adobe_account_lock:
+                            invite_results = await invite_adobe_members(account, [email])
+                        invite_result = invite_results[0] if invite_results else {
+                            "email": email, "ok": False, "message": "授权接口无返回"
+                        }
+                    except Exception as exc:
+                        invite_result = {"email": email, "ok": False, "message": str(exc)}
+
+                    if not invite_result.get("ok"):
+                        await release_self_email_account(email)
+                        task.failed += 1
+                        await task_manager.broadcast(
+                            f"{worker_prefix} ❌ [{email}] 授权失败：{invite_result.get('message', '')}，释放邮箱"
+                        )
+                        await task_manager.broadcast("__STATE_UPDATE__")
+                        continue
+
+                    reserved["_member_id"] = invite_result.get("member_id", "")
+                    await task_manager.broadcast(f"{worker_prefix} ✅ [{email}] 授权成功")
+
+                    if task.status == "stopping":
+                        await mark_self_email_used(email)
+                        with suppress(Exception):
+                            async with adobe_account_lock:
+                                await remove_adobe_members(account, [email])
+                        await task_manager.broadcast("__STATE_UPDATE__")
+                        return False
+
+                    try:
+                        await task_manager.broadcast(
+                            f"{worker_prefix} Step 3/3：[{email}] 收码、补全资料并登录 Firefly"
+                        )
+                        cookie_id = f"task{task.id}_slot{slot_index}_try{attempt}"
+                        cookie_file = await register_invited_self_email(
+                            account, reserved, cookie_id, worker_prefix
+                        )
+                        await mark_self_email_used(email)
+                        task.completed += 1
+                        task.result_files.append(cookie_file)
+                        account_success += 1
+                        await task_manager.broadcast(
+                            f"{worker_prefix} ✅ [{email}] 子任务完成，已导出 Firefly cookie/token；"
+                            f"累计成功 {account_success}/{target_success}"
+                        )
+                        if await import_cookie_to_token_pool(cookie_file, worker_prefix):
+                            if config.get("token_pool_enabled"):
+                                task.token_pool_imported += 1
+                                task.token_pool_imported_files.append(cookie_file)
+                        await task_manager.broadcast("__STATE_UPDATE__")
+                        return True
+                    except Exception as exc:
+                        task.failed += 1
+                        await mark_self_email_used(email)
+                        await task_manager.broadcast(
+                            f"{worker_prefix} ❌ [{email}] 注册失败：{exc}，"
+                            f"邮箱标记已使用并尝试移除成员，准备换邮箱"
+                        )
+                        with suppress(Exception):
+                            async with adobe_account_lock:
+                                await remove_adobe_members(account, [email])
+                        await task_manager.broadcast("__STATE_UPDATE__")
+
+                await task_manager.broadcast(f"{worker_prefix} ⚠️ 子任务已达到 5 次尝试上限")
+                return False
+
+        await task_manager.broadcast(
+            f"{prefix} Step 2/3：启动 {target_success} 个子任务，并发 {max(1, task.concurrency)}，每个最多 5 次"
+        )
+        workers = [
+            asyncio.create_task(run_invite_slot(slot_index))
+            for slot_index in range(1, target_success + 1)
+        ]
         task.asyncio_tasks = workers
-        await asyncio.gather(*workers, return_exceptions=True)
+        results = await asyncio.gather(*workers, return_exceptions=True)
         task.asyncio_tasks = []
+        account_success = sum(1 for result in results if result is True)
+
+        if account_success >= target_success:
+            await task_manager.broadcast(f"{prefix} ✅ 已凑满目标 {target_success}/{target_success}")
+        elif registration_attempts >= max_registration_attempts:
+            await task_manager.broadcast(
+                f"{prefix} ⚠️ 已达到重试上限，最终成功 {account_success}/{target_success}，"
+                f"总尝试 {registration_attempts}/{max_registration_attempts}"
+            )
+        elif task.status != "stopping":
+            await task_manager.broadcast(f"{prefix} ⚠️ 未凑满目标，最终成功 {account_success}/{target_success}")
 
 
 async def run_task(task: Task):
