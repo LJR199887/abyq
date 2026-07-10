@@ -3680,9 +3680,10 @@ async def run_invite_task(task: Task):
         target_success = max(1, int(task.batch_quantity or task.quantity or 1))
         account_success = 0
         registration_attempts = 0
-        max_registration_attempts = target_success * 5
+        max_attempts_per_slot = 8
+        max_registration_attempts = target_success * max_attempts_per_slot
         await task_manager.broadcast(
-            f"{prefix} 目标 {target_success} 个成功账号；每个目标最多换邮箱 5 次，直到凑满或邮箱池耗尽"
+            f"{prefix} 目标 {target_success} 个成功账号；每个目标最多换邮箱 {max_attempts_per_slot} 次，直到凑满或邮箱池耗尽"
         )
 
         if task.invite_remove_members:
@@ -3708,21 +3709,21 @@ async def run_invite_task(task: Task):
             nonlocal account_success, registration_attempts
             worker_prefix = f"[Task#{task.id}-{slot_index}: {account_label}]"
             async with sem:
-                for attempt in range(1, 6):
+                for attempt in range(1, max_attempts_per_slot + 1):
                     if task.status == "stopping":
                         return False
 
                     reserved = await allocate_self_email_account()
                     if not reserved:
                         await task_manager.broadcast(
-                            f"{worker_prefix} ⚠️ 自备邮箱池已耗尽，子任务停止于第 {attempt}/5 次"
+                            f"{worker_prefix} ⚠️ 自备邮箱池已耗尽，子任务停止于第 {attempt}/{max_attempts_per_slot} 次"
                         )
                         return None
 
                     registration_attempts += 1
                     email = reserved["email"]
                     await task_manager.broadcast(
-                        f"{worker_prefix} Step 2/3：第 {attempt}/5 次尝试，授权 {email}"
+                        f"{worker_prefix} Step 2/3：第 {attempt}/{max_attempts_per_slot} 次尝试，授权 {email}"
                     )
 
                     try:
@@ -3819,11 +3820,11 @@ async def run_invite_task(task: Task):
                                 await remove_adobe_members(account, [email])
                         await task_manager.broadcast("__STATE_UPDATE__")
 
-                await task_manager.broadcast(f"{worker_prefix} ⚠️ 子任务已达到 5 次尝试上限")
+                await task_manager.broadcast(f"{worker_prefix} ⚠️ 子任务已达到 {max_attempts_per_slot} 次尝试上限")
                 return False
 
         await task_manager.broadcast(
-            f"{prefix} Step 2/3：启动 {target_success} 个子任务，并发 {max(1, task.concurrency)}，每个最多 5 次"
+            f"{prefix} Step 2/3：启动 {target_success} 个子任务，并发 {max(1, task.concurrency)}，每个最多 {max_attempts_per_slot} 次"
         )
         workers = [
             asyncio.create_task(run_invite_slot(slot_index))
