@@ -121,6 +121,16 @@ document.addEventListener("DOMContentLoaded", () => {
         return mode === "invite" ? "邀请模式" : "普通注册";
     }
 
+    function taskRemainingCount(task) {
+        const quantity = Number(task.quantity || 0);
+        const completed = Number(task.completed || 0);
+        const failed = Number(task.failed || 0);
+        if (task.registration_mode === "invite") {
+            return Math.max(0, quantity - completed);
+        }
+        return Math.max(0, quantity - completed - failed);
+    }
+
     function logType(text) {
         if (text.includes("❌") || text.includes("⚠️") || text.includes("ERROR") || text.includes("失败") || text.includes("failed")) return "error";
         if (text.includes("✅") || text.includes("🎉") || text.includes("成功") || text.includes("succeeded")) return "success";
@@ -248,7 +258,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 tasks.forEach(t => {
                     if (t.status === "pending") pending += t.quantity;
                     else if (t.status === "running") {
-                        running += (t.quantity - t.completed - t.failed);
+                        running += taskRemainingCount(t);
                         completed += t.completed;
                         failed += t.failed;
                     } else {
