@@ -2266,6 +2266,8 @@ async def get_child_accounts(
                 str(record.get("product_name", "")),
                 str(record.get("failure_reason", "")),
                 str(record.get("exhausted_token_delete_error", "")),
+                " ".join(str(item) for item in (record.get("exhausted_pool_ids") or [])),
+                " ".join(str(item) for item in (record.get("abnormal_pool_ids") or [])),
                 str(record.get("source_task_id", "")),
                 str(record.get("replacement_task_id", "")),
             ]).lower()
@@ -2617,7 +2619,22 @@ def build_token_pool_exhausted_url(site: str) -> str:
         raw = f"http://{raw}"
     if "/api/v1/automation/exhausted-accounts" in raw:
         return raw
+    if "/api/v1/automation/abnormal-accounts" in raw:
+        return raw.replace("/api/v1/automation/abnormal-accounts", "/api/v1/automation/exhausted-accounts")
     return urljoin(raw.rstrip("/") + "/", "api/v1/automation/exhausted-accounts")
+
+
+def build_token_pool_abnormal_url(site: str) -> str:
+    raw = (site or "").strip()
+    if not raw:
+        return ""
+    if not raw.startswith(("http://", "https://")):
+        raw = f"http://{raw}"
+    if "/api/v1/automation/abnormal-accounts" in raw:
+        return raw
+    if "/api/v1/automation/exhausted-accounts" in raw:
+        return raw.replace("/api/v1/automation/exhausted-accounts", "/api/v1/automation/abnormal-accounts")
+    return urljoin(raw.rstrip("/") + "/", "api/v1/automation/abnormal-accounts")
 
 
 def normalize_token_pools(raw_pools=None) -> list[dict]:
@@ -3215,8 +3232,21 @@ def monitored_token_pools() -> list[dict]:
     return pools
 
 
-async def fetch_exhausted_emails_from_pool(pool: dict) -> tuple[set[str], str, int]:
-    url = build_token_pool_exhausted_url(pool.get("site", ""))
+def token_issue_status_label(status: str) -> str:
+    return {
+        "exhausted": "耗尽",
+        "abnormal": "异常",
+    }.get(status, status or "未知")
+
+
+def build_token_pool_issue_url(site: str, status: str) -> str:
+    if status == "abnormal":
+        return build_token_pool_abnormal_url(site)
+    return build_token_pool_exhausted_url(site)
+
+
+async def fetch_token_issue_emails_from_pool(pool: dict, status: str) -> tuple[set[str], str, int]:
+    url = build_token_pool_issue_url(pool.get("site", ""), status)
     key = (pool.get("key") or "").strip()
     if not url or not key:
         return set(), "Token 池地址或密钥未配置", 1
@@ -3253,41 +3283,68 @@ async def fetch_exhausted_emails_from_pool(pool: dict) -> tuple[set[str], str, i
     return set(), last_error, max_attempts
 
 
-async def fetch_exhausted_email_index() -> tuple[dict[str, set[str]], dict[str, str], list[dict]]:
-    exhausted: dict[str, set[str]] = {}
+async def fetch_exhausted_emails_from_pool(pool: dict) -> tuple[set[str], str, int]:
+    return await fetch_token_issue_emails_from_pool(pool, "exhausted")
+
+
+async def fetch_token_issue_email_index() -> tuple[dict[str, dict[str, set[str]]], dict[str, str], list[dict]]:
+    issues: dict[str, dict[str, set[str]]] = {}
     errors: dict[str, str] = {}
     pool_results: list[dict] = []
     for pool in monitored_token_pools():
         pool_id = pool.get("id") or ""
-        emails, error, attempts = await fetch_exhausted_emails_from_pool(pool)
-        if error:
-            errors[pool_id] = error
-            pool_results.append({
-                "pool_id": pool_id,
-                "pool_name": pool.get("name") or "Token 池",
-                "site": pool.get("site", ""),
-                "ok": False,
-                "count": 0,
-                "error": error,
-                "attempts": attempts,
-            })
-            continue
-        pool_results.append({
+        result = {
             "pool_id": pool_id,
             "pool_name": pool.get("name") or "Token 池",
             "site": pool.get("site", ""),
             "ok": True,
-            "count": len(emails),
+            "count": 0,
             "error": "",
-            "attempts": attempts,
+            "attempts": 0,
+            "exhausted_count": 0,
+            "abnormal_count": 0,
+            "exhausted_ok": True,
+            "abnormal_ok": True,
+            "exhausted_error": "",
+            "abnormal_error": "",
+        }
+        for status in ("exhausted", "abnormal"):
+            emails, error, attempts = await fetch_token_issue_emails_from_pool(pool, status)
+            result["attempts"] = max(int(result.get("attempts", 0) or 0), attempts)
+            result[f"{status}_count"] = len(emails)
+            result["count"] = int(result.get("count", 0) or 0) + len(emails)
+            if error:
+                result["ok"] = False
+                result[f"{status}_ok"] = False
+                result[f"{status}_error"] = error
+                errors[f"{pool_id}:{status}"] = error
+                continue
+            for email in emails:
+                issues.setdefault(email, {}).setdefault(status, set()).add(pool_id)
+        error_parts = [
+            f"{token_issue_status_label(status)}：{result.get(f'{status}_error')}"
+            for status in ("exhausted", "abnormal")
+            if result.get(f"{status}_error")
+        ]
+        result["error"] = "；".join(error_parts)
+        pool_results.append({
+            **result,
         })
-        for email in emails:
-            exhausted.setdefault(email, set()).add(pool_id)
+    return issues, errors, pool_results
+
+
+async def fetch_exhausted_email_index() -> tuple[dict[str, set[str]], dict[str, str], list[dict]]:
+    issues, errors, pool_results = await fetch_token_issue_email_index()
+    exhausted = {
+        email: set(statuses.get("exhausted", set()))
+        for email, statuses in issues.items()
+        if statuses.get("exhausted")
+    }
     return exhausted, errors, pool_results
 
 
-async def delete_exhausted_email_from_pool(pool: dict, email: str) -> dict:
-    url = build_token_pool_exhausted_url(pool.get("site", ""))
+async def delete_token_issue_email_from_pool(pool: dict, email: str, status: str) -> dict:
+    url = build_token_pool_issue_url(pool.get("site", ""), status)
     key = (pool.get("key") or "").strip()
     pool_id = pool.get("id") or ""
     pool_name = pool.get("name") or "Token 池"
@@ -3296,6 +3353,8 @@ async def delete_exhausted_email_from_pool(pool: dict, email: str) -> dict:
         "pool_name": pool_name,
         "ok": False,
         "status": "failed",
+        "issue_status": status,
+        "issue_label": token_issue_status_label(status),
         "deleted_count": 0,
         "missing_emails": [],
         "error": "",
@@ -3333,44 +3392,81 @@ async def delete_exhausted_email_from_pool(pool: dict, email: str) -> dict:
         return result
 
 
+async def delete_exhausted_email_from_pool(pool: dict, email: str) -> dict:
+    return await delete_token_issue_email_from_pool(pool, email, "exhausted")
+
+
+def collect_token_issue_sources(record: dict) -> list[dict]:
+    sources: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    for item in record.get("token_issue_sources") or []:
+        if not isinstance(item, dict):
+            continue
+        pool_id = str(item.get("pool_id") or "").strip()
+        status = str(item.get("status") or "exhausted").strip() or "exhausted"
+        if not pool_id or status not in ("exhausted", "abnormal"):
+            continue
+        key = (pool_id, status)
+        if key in seen:
+            continue
+        seen.add(key)
+        sources.append({"pool_id": pool_id, "status": status})
+
+    for status, field in (("exhausted", "exhausted_pool_ids"), ("abnormal", "abnormal_pool_ids")):
+        for pool_id in record.get(field) or []:
+            pool_id = str(pool_id).strip()
+            key = (pool_id, status)
+            if not pool_id or key in seen:
+                continue
+            seen.add(key)
+            sources.append({"pool_id": pool_id, "status": status})
+    return sources
+
+
 async def cleanup_replaced_child_token(child_id: str, prefix: str = "[子账号池]") -> list[dict]:
     records = await list_child_accounts_raw()
     record = find_child_record(records, child_id)
     if not record:
         return []
     email = (record.get("email") or "").strip()
-    pool_ids = [str(pool_id) for pool_id in (record.get("exhausted_pool_ids") or []) if str(pool_id)]
-    if not email or not pool_ids:
+    sources = collect_token_issue_sources(record)
+    if not email or not sources:
         await update_child_account(
             child_id,
             exhausted_token_delete_status="skipped",
-            exhausted_token_delete_error="未记录耗尽来源池，跳过号池删除",
+            exhausted_token_delete_error="未记录旧 token 来源池，跳过号池删除",
         )
         return []
 
-    selected = set(pool_ids)
-    pools = [pool for pool in monitored_token_pools() if pool.get("id") in selected]
-    if not pools:
+    pools_by_id = {str(pool.get("id") or ""): pool for pool in monitored_token_pools()}
+    cleanup_items = [
+        (pools_by_id[source["pool_id"]], source["status"])
+        for source in sources
+        if source.get("pool_id") in pools_by_id
+    ]
+    if not cleanup_items:
         await update_child_account(
             child_id,
             exhausted_token_delete_status="skipped",
-            exhausted_token_delete_error="耗尽来源池未启用或不存在",
+            exhausted_token_delete_error="旧 token 来源池未启用或不存在",
         )
         return []
 
     results = []
-    for pool in pools:
+    for pool, issue_status in cleanup_items:
         pool_name = pool.get("name") or "Token 池"
-        await task_manager.broadcast(f"{prefix} 清理旧耗尽 token：{pool_name} / {email}")
-        result = await delete_exhausted_email_from_pool(pool, email)
+        issue_label = token_issue_status_label(issue_status)
+        await task_manager.broadcast(f"{prefix} 清理旧{issue_label} token：{pool_name} / {email}")
+        result = await delete_token_issue_email_from_pool(pool, email, issue_status)
         results.append(result)
         if result.get("ok"):
             await task_manager.broadcast(
-                f"{prefix} ✅ 已从 {pool_name} 删除旧耗尽 token：{email}，删除 {result.get('deleted_count', 0)} 个"
+                f"{prefix} ✅ 已从 {pool_name} 删除旧{issue_label} token：{email}，删除 {result.get('deleted_count', 0)} 个"
             )
         else:
             await task_manager.broadcast(
-                f"{prefix} ⚠️ {pool_name} 删除旧耗尽 token 失败：{result.get('error', '')}"
+                f"{prefix} ⚠️ {pool_name} 删除旧{issue_label} token 失败：{result.get('error', '')}"
             )
 
     failed = [item for item in results if not item.get("ok")]
@@ -3393,18 +3489,27 @@ async def check_child_exhausted(child_id: str) -> dict:
     record = find_child_record(records, child_id)
     if not record:
         raise RuntimeError("子账号不存在")
-    exhausted, errors, _pool_results = await fetch_exhausted_email_index()
+    issues, errors, _pool_results = await fetch_token_issue_email_index()
     email = (record.get("email") or "").strip().lower()
-    pool_ids = sorted(exhausted.get(email, set()))
+    issue_statuses = issues.get(email, {})
+    exhausted_pool_ids = sorted(issue_statuses.get("exhausted", set()))
+    abnormal_pool_ids = sorted(issue_statuses.get("abnormal", set()))
+    issue_sources = [
+        {"pool_id": pool_id, "status": status}
+        for status, pool_ids in (("exhausted", exhausted_pool_ids), ("abnormal", abnormal_pool_ids))
+        for pool_id in pool_ids
+    ]
     updates = {
         "last_checked_at": now_text(),
-        "exhausted_pool_ids": pool_ids,
-        "exhausted_detected_at": now_text() if pool_ids else record.get("exhausted_detected_at", ""),
+        "exhausted_pool_ids": exhausted_pool_ids,
+        "abnormal_pool_ids": abnormal_pool_ids,
+        "token_issue_sources": issue_sources,
+        "exhausted_detected_at": now_text() if issue_sources else record.get("exhausted_detected_at", ""),
         "failure_reason": "" if not errors else "部分 Token 池查询失败",
     }
-    if pool_ids and record.get("status") == "active":
+    if issue_sources and record.get("status") == "active":
         updates["status"] = "exhausted"
-    elif not pool_ids and record.get("status") in ("exhausted", "check_failed"):
+    elif not issue_sources and record.get("status") in ("exhausted", "check_failed"):
         updates["status"] = "active"
     updated = await update_child_account(child_id, **updates)
     return updated or record
@@ -3549,7 +3654,7 @@ async def monitor_child_accounts_once(source: str = "manual") -> dict:
         record for record in records
         if record.get("status") in ("active", "exhausted", "check_failed") or is_retryable_removed_child(record)
     ]
-    exhausted, errors, pool_results = await fetch_exhausted_email_index()
+    issues, errors, pool_results = await fetch_token_issue_email_index()
     pool_name_by_id = {
         str(pool.get("pool_id") or ""): str(pool.get("pool_name") or pool.get("pool_id") or "Token 池")
         for pool in pool_results
@@ -3566,19 +3671,39 @@ async def monitor_child_accounts_once(source: str = "manual") -> dict:
     replacement_reasons: dict[str, str] = {}
     for record in active:
         email = (record.get("email") or "").strip().lower()
-        pool_ids = sorted(exhausted.get(email, set()))
+        issue_statuses = issues.get(email, {})
+        exhausted_pool_ids = sorted(issue_statuses.get("exhausted", set()))
+        abnormal_pool_ids = sorted(issue_statuses.get("abnormal", set()))
+        issue_sources = [
+            {"pool_id": pool_id, "status": status}
+            for status, pool_ids in (("exhausted", exhausted_pool_ids), ("abnormal", abnormal_pool_ids))
+            for pool_id in pool_ids
+        ]
         try:
-            if pool_ids:
+            if issue_sources:
                 matched += 1
+                issue_labels = [
+                    f"{token_issue_status_label(status)}："
+                    f"{', '.join(pool_name_by_id.get(pool_id, pool_id) for pool_id in pool_ids)}"
+                    for status, pool_ids in (("exhausted", exhausted_pool_ids), ("abnormal", abnormal_pool_ids))
+                    if pool_ids
+                ]
                 matched_accounts.append({
                     "child_id": record.get("id", ""),
                     "email": record.get("email", ""),
                     "adobe_account_email": record.get("adobe_account_email", ""),
-                    "pool_ids": pool_ids,
-                    "pool_names": [pool_name_by_id.get(pool_id, pool_id) for pool_id in pool_ids],
+                    "pool_ids": sorted({source["pool_id"] for source in issue_sources}),
+                    "pool_names": [
+                        pool_name_by_id.get(pool_id, pool_id)
+                        for pool_id in sorted({source["pool_id"] for source in issue_sources})
+                    ],
+                    "issue_sources": issue_sources,
+                    "issue_labels": issue_labels,
                 })
                 updates = {
-                    "exhausted_pool_ids": pool_ids,
+                    "exhausted_pool_ids": exhausted_pool_ids,
+                    "abnormal_pool_ids": abnormal_pool_ids,
+                    "token_issue_sources": issue_sources,
                     "exhausted_detected_at": now_text(),
                     "last_checked_at": now_text(),
                     "failure_reason": "",
@@ -3588,13 +3713,14 @@ async def monitor_child_accounts_once(source: str = "manual") -> dict:
                 await update_child_account(record.get("id", ""), **updates)
                 replacement_records.append(record)
                 replacement_reasons[record.get("id", "")] = (
-                    f"Token 池标记耗尽："
-                    f"{', '.join(pool_name_by_id.get(pool_id, pool_id) for pool_id in pool_ids)}"
+                    f"Token 池标记需补号：{'; '.join(issue_labels)}"
                 )
             else:
                 updates = {
                     "last_checked_at": now_text(),
                     "exhausted_pool_ids": [],
+                    "abnormal_pool_ids": [],
+                    "token_issue_sources": [],
                 }
                 if record.get("status") in ("exhausted", "check_failed"):
                     updates["status"] = "active"
@@ -3616,7 +3742,7 @@ async def monitor_child_accounts_once(source: str = "manual") -> dict:
             try:
                 reason_items = []
                 for record in group_records:
-                    reason = replacement_reasons.get(record.get("id", ""), "Token 池标记耗尽")
+                    reason = replacement_reasons.get(record.get("id", ""), "Token 池标记需补号")
                     if reason not in reason_items:
                         reason_items.append(reason)
                 task = await create_replacement_batch_task(group_records, "；".join(reason_items[:3]))
@@ -3629,7 +3755,7 @@ async def monitor_child_accounts_once(source: str = "manual") -> dict:
                         replaced_at="",
                         failure_reason="",
                         replacement_reason=(
-                            f"{replacement_reasons.get(record.get('id', ''), 'Token 池标记耗尽')}，"
+                            f"{replacement_reasons.get(record.get('id', ''), 'Token 池标记需补号')}，"
                             + ("旧子号已移除，等待补号任务" if already_removed else "等待任务开始移除")
                         ),
                     )

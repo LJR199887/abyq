@@ -50,7 +50,7 @@
                     <div>
                         <span class="eyebrow">CHILD ACCOUNT POOL</span>
                         <h2>子账号池</h2>
-                        <p class="card-desc">协议注册成功的子号会保存在这里；监测模式会查询 Token 池已耗尽邮箱，命中后自动移除旧号并补号。</p>
+                        <p class="card-desc">协议注册成功的子号会保存在这里；监测模式会查询 Token 池已耗尽和异常邮箱，命中后自动移除旧号并补号。</p>
                     </div>
                     <div class="child-pool-actions">
                         <button class="btn-sm primary" id="refresh-btn">刷新列表</button>
@@ -63,7 +63,7 @@
                 <div class="child-pool-stats">
                     <div class="stat-item"><span class="stat-value" id="stat-total">0</span><span class="stat-label">总数</span></div>
                     <div class="stat-item"><span class="stat-value" id="stat-active">0</span><span class="stat-label">可用</span></div>
-                    <div class="stat-item"><span class="stat-value" id="stat-low">0</span><span class="stat-label">已耗尽</span></div>
+                    <div class="stat-item"><span class="stat-value" id="stat-low">0</span><span class="stat-label">需补号</span></div>
                     <div class="stat-item"><span class="stat-value" id="stat-replacing">0</span><span class="stat-label">补号中</span></div>
                     <div class="stat-item"><span class="stat-value" id="stat-replacement-failed">0</span><span class="stat-label">补号失败</span></div>
                 </div>
@@ -168,6 +168,22 @@
         if (![20, 30, 50].includes(childPageSize)) childPageSize = 20;
         childPageSizeInput.value = String(childPageSize);
 
+        function monitorLogKey(target, log, index) {
+            const seed = [
+                log.created_at || index,
+                log.source || "",
+                log.checked || 0,
+                log.matched || 0,
+                log.replaced || 0,
+                log.failed || 0,
+            ].join("|");
+            let hash = 0;
+            for (let i = 0; i < seed.length; i++) {
+                hash = ((hash << 5) - hash + seed.charCodeAt(i)) | 0;
+            }
+            return `${target.id}-${Math.abs(hash) || index}`;
+        }
+
         function escapeHtml(value) {
             return String(value ?? "")
                 .replaceAll("&", "&amp;")
@@ -187,7 +203,7 @@
             return {
                 active: "可用",
                 check_failed: "检测失败",
-                exhausted: "已耗尽",
+                exhausted: "需补号",
                 replacing: "换号中",
                 removed: "已移除",
                 replaced: "已替换",
@@ -317,11 +333,15 @@
                 const exhaustedPools = Array.isArray(account.exhausted_pool_ids) && account.exhausted_pool_ids.length
                     ? account.exhausted_pool_ids.join(", ")
                     : "-";
+                const abnormalPools = Array.isArray(account.abnormal_pool_ids) && account.abnormal_pool_ids.length
+                    ? account.abnormal_pool_ids.join(", ")
+                    : "-";
                 const workflowHint = account.status === "registering" ? "注册处理中" : "";
                 const failure = account.failure_reason || workflowHint || account.external_pool_error || account.exhausted_token_delete_error || "";
                 const poolLines = [
                     poolDisplay(account),
                     exhaustedPools !== "-" ? `耗尽来源：${exhaustedPools}` : "",
+                    abnormalPools !== "-" ? `异常来源：${abnormalPools}` : "",
                     account.exhausted_token_delete_status ? `旧 token：${tokenDeleteText(account.exhausted_token_delete_status)}` : "",
                 ].filter(Boolean);
                 return `
@@ -421,12 +441,22 @@
             ]));
         }
 
+        function monitorPoolCountText(pool) {
+            const exhausted = Number(pool.exhausted_count ?? pool.count ?? 0) || 0;
+            const abnormal = Number(pool.abnormal_count || 0) || 0;
+            if ("abnormal_count" in pool || abnormal) {
+                return `${exhausted} 耗尽 / ${abnormal} 异常`;
+            }
+            return `${exhausted} 个耗尽`;
+        }
+
         function monitorMatchedRows(log) {
             const poolNameById = monitorPoolNameMap(log);
             return (log.matched_accounts || []).map(item => {
-                const sources = Array.isArray(item.pool_names) && item.pool_names.length
+                const issueLabels = Array.isArray(item.issue_labels) ? item.issue_labels.filter(Boolean) : [];
+                const sources = issueLabels.length ? issueLabels : (Array.isArray(item.pool_names) && item.pool_names.length
                     ? item.pool_names
-                    : (item.pool_ids || []).map(poolId => poolNameById[String(poolId)] || (poolId === "legacy" ? "1号池" : poolId));
+                    : (item.pool_ids || []).map(poolId => poolNameById[String(poolId)] || (poolId === "legacy" ? "1号池" : poolId)));
                 return {
                     primary: item.email || "-",
                     secondary: sources.length ? `来源：${sources.join("、")}` : "来源未记录",
@@ -496,22 +526,40 @@
         function renderMonitorLogs(logs, target = monitorLogList) {
             if (!logs.length) {
                 target.innerHTML = '<div class="empty-hint">暂无监测日志</div>';
+                [...monitorLogStore.entries()].forEach(([key, state]) => {
+                    if (state.target === target) monitorLogStore.delete(key);
+                });
                 return;
             }
+            const previousStates = new Map(
+                [...monitorLogStore.entries()]
+                    .filter(([, state]) => state.target === target)
+                    .map(([key, state]) => [key, state])
+            );
             [...monitorLogStore.entries()].forEach(([key, state]) => {
                 if (state.target === target) monitorLogStore.delete(key);
             });
             const showDetails = target === monitorLogModalList;
             target.innerHTML = logs.map((log, index) => {
-                const key = `${target.id}-${index}`;
-                monitorLogStore.set(key, {log, target, tab: "matched", page: 1, query: ""});
+                const key = monitorLogKey(target, log, index);
+                const previousState = previousStates.get(key) || {};
+                const state = {
+                    log,
+                    target,
+                    tab: previousState.tab || "matched",
+                    page: previousState.page || 1,
+                    query: previousState.query || "",
+                    open: Boolean(previousState.open),
+                };
+                monitorLogStore.set(key, state);
                 const poolChips = (log.pool_results || []).map(pool => `
                     <span class="monitor-pool-chip ${pool.ok ? "ok" : "fail"}">
                         ${escapeHtml(pool.pool_name || pool.pool_id || "Token 池")}
-                        <b>${pool.ok ? `${pool.count || 0} 个耗尽` : "查询失败"}</b>
+                        <b>${pool.ok ? monitorPoolCountText(pool) : `${monitorPoolCountText(pool)} · 查询失败`}</b>
                     </span>
                 `).join("");
                 const failedCount = Number(log.failed || 0);
+                if (state.tab === "failed" && !failedCount) state.tab = "matched";
                 return `
                     <div class="monitor-log-item" data-monitor-key="${key}">
                         <div class="monitor-log-head">
@@ -525,18 +573,18 @@
                                 <span><b>${log.replaced || 0}</b>补号</span>
                                 <span class="${failedCount ? "danger" : ""}"><b>${failedCount}</b>失败</span>
                             </div>
-                            ${showDetails ? `<button type="button" class="btn-sm secondary monitor-detail-toggle" data-monitor-toggle aria-expanded="false">查看详情</button>` : ""}
+                            ${showDetails ? `<button type="button" class="btn-sm secondary monitor-detail-toggle" data-monitor-toggle aria-expanded="${state.open}">${state.open ? "收起详情" : "查看详情"}</button>` : ""}
                         </div>
                         <div class="monitor-pool-summary">${poolChips || '<span class="monitor-pool-empty">未查询 Token 池</span>'}</div>
                         ${showDetails ? `
-                            <div class="monitor-log-detail" hidden>
+                            <div class="monitor-log-detail" ${state.open ? "" : "hidden"}>
                                 <div class="monitor-detail-toolbar">
                                     <div class="monitor-detail-tabs" role="tablist">
-                                        <button type="button" class="active" data-monitor-tab="matched">命中账号 ${log.matched || 0}</button>
-                                        <button type="button" data-monitor-tab="tasks">补号任务 ${monitorReplacementRows(log).length}</button>
-                                        ${failedCount ? `<button type="button" data-monitor-tab="failed">失败 ${failedCount}</button>` : ""}
+                                        <button type="button" class="${state.tab === "matched" ? "active" : ""}" data-monitor-tab="matched">命中账号 ${log.matched || 0}</button>
+                                        <button type="button" class="${state.tab === "tasks" ? "active" : ""}" data-monitor-tab="tasks">补号任务 ${monitorReplacementRows(log).length}</button>
+                                        ${failedCount ? `<button type="button" class="${state.tab === "failed" ? "active" : ""}" data-monitor-tab="failed">失败 ${failedCount}</button>` : ""}
                                     </div>
-                                    <input type="search" data-monitor-search placeholder="搜索邮箱或任务号">
+                                    <input type="search" data-monitor-search placeholder="搜索邮箱或任务号" value="${escapeHtml(state.query)}">
                                 </div>
                                 <div class="monitor-detail-body" data-monitor-detail-body="${key}"></div>
                                 <div class="monitor-detail-pagination">
@@ -549,6 +597,9 @@
                     </div>
                 `;
             }).join("");
+            [...monitorLogStore.entries()].forEach(([key, state]) => {
+                if (state.target === target && state.open) renderMonitorDetail(key);
+            });
         }
 
         function loadMonitorLogs(limit = 1, target = monitorLogList) {
@@ -708,6 +759,7 @@
                 const detail = item.querySelector(".monitor-log-detail");
                 const opening = detail.hidden;
                 detail.hidden = !opening;
+                state.open = opening;
                 toggle.setAttribute("aria-expanded", String(opening));
                 toggle.textContent = opening ? "收起详情" : "查看详情";
                 if (opening) renderMonitorDetail(key);
