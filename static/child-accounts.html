@@ -163,11 +163,12 @@
         }
 
         function poolDisplay(account) {
+            const removedSuffix = ["removed", "replaced"].includes(account.status) ? "（已移除）" : "";
             if (account.external_pool_status === "imported") {
-                return account.external_pool_name || account.external_pool_id || "已入池（未记录池名）";
+                return `${account.external_pool_name || account.external_pool_id || "已入池（未记录池名）"}${removedSuffix}`;
             }
-            if (account.external_pool_status === "failed") return "入池失败";
-            return "未入池";
+            if (account.external_pool_status === "failed") return `入池失败${removedSuffix}`;
+            return `未入池${removedSuffix}`;
         }
 
         function syncSelectionState() {
@@ -207,9 +208,14 @@
 
         function renderPoolFilter(poolOptions) {
             const current = poolFilter.value;
-            const poolItems = (poolOptions || []).map(pool => (
-                `<option value="pool:${escapeHtml(pool.id || pool.name)}">${escapeHtml(pool.name || pool.id || "Token 池")}</option>`
-            )).join("");
+            const poolItems = (poolOptions || []).map(pool => {
+                const key = pool.id || pool.name;
+                const label = pool.name || pool.id || "Token 池";
+                return `
+                    <option value="pool:${escapeHtml(key)}">${escapeHtml(label)}</option>
+                    ${pool.has_removed ? `<option value="pool_removed:${escapeHtml(key)}">${escapeHtml(label)}（已移除）</option>` : ""}
+                `;
+            }).join("");
             poolFilter.innerHTML = `
                         <option value="">全部</option>
                         ${poolItems}

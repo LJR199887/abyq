@@ -412,6 +412,8 @@ class Task:
         self.created_at = datetime.now().strftime("%m-%d %H:%M")
         self.result_files = []
         self.replacement_child_id = ""
+        self.replacement_child_ids = []
+        self.replacement_done_child_ids = []
         self.asyncio_tasks = []
         self.active_processes = {}
         self.active_profiles = {}
@@ -440,6 +442,8 @@ class Task:
             "result_count": len(self.result_files),
             "result_files": self.result_files,
             "replacement_child_id": self.replacement_child_id,
+            "replacement_child_ids": self.replacement_child_ids,
+            "replacement_done_child_ids": self.replacement_done_child_ids,
         }
 
 
@@ -448,6 +452,58 @@ def collect_active_profile_paths(tasks: dict[int, "Task"]) -> set[str]:
     for task in tasks.values():
         active.update(task.active_profiles.values())
     return active
+
+
+def consume_replacement_child_id(task: Task) -> str:
+    pending = list(getattr(task, "replacement_child_ids", []) or [])
+    if not pending and getattr(task, "replacement_child_id", ""):
+        pending = [task.replacement_child_id]
+    if not pending:
+        task.replacement_child_id = ""
+        return ""
+    child_id = pending.pop(0)
+    done = list(getattr(task, "replacement_done_child_ids", []) or [])
+    done.append(child_id)
+    task.replacement_child_ids = pending
+    task.replacement_done_child_ids = done
+    task.replacement_child_id = pending[0] if pending else ""
+    return child_id
+
+
+async def prepare_replacement_children_for_task(task: Task, account: dict, prefix: str) -> list[str]:
+    child_ids = list(getattr(task, "replacement_child_ids", []) or [])
+    if not child_ids and getattr(task, "replacement_child_id", ""):
+        child_ids = [task.replacement_child_id]
+    if not child_ids:
+        return []
+
+    records = await list_child_accounts_raw()
+    prepared = []
+    failed = []
+    await task_manager.broadcast(f"{prefix} Step 0/3：准备从母号组织移除 {len(child_ids)} 个旧子号")
+    for child_id in child_ids:
+        record = find_child_record(records, child_id)
+        if not record:
+            failed.append(child_id)
+            continue
+        email = record.get("email", child_id)
+        try:
+            await update_child_account(child_id, status="replacing", failure_reason="", replacement_reason="补号任务执行中")
+            await task_manager.broadcast(f"{prefix} Step 0/3：正在移除旧子号 {email}")
+            removed = await remove_child_member(record, "补号任务执行中")
+            prepared.append(removed.get("id", child_id))
+            await task_manager.broadcast(f"{prefix} Step 0/3：已移除旧子号 {email}")
+        except Exception as exc:
+            failed.append(email)
+            await update_child_account(child_id, status="active", failure_reason=f"补号任务移除失败：{exc}")
+            await task_manager.broadcast(f"{prefix} ⚠️ 旧子号 {email} 移除失败，本次不补：{exc}")
+
+    task.replacement_child_ids = prepared
+    task.replacement_child_id = prepared[0] if prepared else ""
+    if failed:
+        await task_manager.broadcast(f"{prefix} Step 0/3：旧子号移除失败 {len(failed)} 个：{', '.join(failed)}")
+    await task_manager.broadcast("__STATE_UPDATE__")
+    return prepared
 
 
 def cleanup_stale_profiles(active_paths: set[str] | None = None) -> int:
@@ -519,6 +575,10 @@ class TaskManager:
                         t.created_at = t_data.get("created_at", "")
                         t.result_files = t_data.get("result_files", [])
                         t.replacement_child_id = t_data.get("replacement_child_id", "")
+                        t.replacement_child_ids = t_data.get("replacement_child_ids", [])
+                        if not t.replacement_child_ids and t.replacement_child_id:
+                            t.replacement_child_ids = [t.replacement_child_id]
+                        t.replacement_done_child_ids = t_data.get("replacement_done_child_ids", [])
                         # Mark interrupted tasks as stopped
                         if t.status in ("running", "pending", "stopping"):
                             t.status = "stopped"
@@ -2088,9 +2148,13 @@ async def get_child_accounts(
         elif pool_status == "failed":
             if external_status != "failed":
                 continue
+        elif pool_status.startswith("pool_removed:"):
+            pool_key = pool_status[13:]
+            if not archived or external_status != "imported" or pool_key not in (external_pool_id, external_pool_name):
+                continue
         elif pool_status.startswith("pool:"):
             pool_key = pool_status[5:]
-            if external_status != "imported" or pool_key not in (external_pool_id, external_pool_name):
+            if archived or external_status != "imported" or pool_key not in (external_pool_id, external_pool_name):
                 continue
         if status and record.get("status") != status:
             continue
@@ -2157,6 +2221,18 @@ async def get_child_accounts(
         if record.get("external_pool_status") == "imported" and key and key not in configured_pool_keys:
             pool_options.append({"id": pool_id or pool_name, "name": pool_name or pool_id})
             configured_pool_keys.add(key)
+    archived_pool_keys = set()
+    for record in records:
+        if record.get("status") not in ("removed", "replaced") or record.get("external_pool_status") != "imported":
+            continue
+        pool_id = str(record.get("external_pool_id") or "").strip()
+        pool_name = str(record.get("external_pool_name") or "").strip()
+        key = (pool_id or pool_name).lower()
+        if key:
+            archived_pool_keys.add(key)
+    for pool in pool_options:
+        key = (str(pool.get("id", "")).strip() or str(pool.get("name", "")).strip()).lower()
+        pool["has_removed"] = key in archived_pool_keys
 
     mother_seen = set()
     mother_options = []
@@ -2245,8 +2321,9 @@ async def replace_child_accounts_bulk(req: ChildAccountDeleteRequest):
     if not ids:
         return JSONResponse(status_code=400, content={"message": "请选择要补号的子账号"})
     results = []
+    records = await list_child_accounts_raw()
+    selected_records = []
     for child_id in ids:
-        records = await list_child_accounts_raw()
         record = find_child_record(records, child_id)
         if not record:
             results.append({"id": child_id, "email": child_id, "ok": False, "skipped": False, "message": "子账号不存在"})
@@ -2255,18 +2332,43 @@ async def replace_child_accounts_bulk(req: ChildAccountDeleteRequest):
         if record.get("status") in ("removed", "replaced"):
             results.append({"id": child_id, "email": email, "ok": False, "skipped": True, "message": "已移除记录不执行补号"})
             continue
-        try:
-            updated = await replace_child_account(child_id, "批量补号")
-            results.append({
-                "id": child_id,
-                "email": email,
-                "ok": True,
-                "skipped": False,
-                "message": f"已创建补号任务 #{updated.get('replacement_task_id', '-')}",
-                "account": public_child_account(updated),
-            })
-        except Exception as exc:
-            results.append({"id": child_id, "email": email, "ok": False, "skipped": False, "message": str(exc)})
+        selected_records.append(record)
+    grouped_records: dict[str, list[dict]] = {}
+    for record in selected_records:
+        grouped_records.setdefault(record.get("adobe_account_id", ""), []).append(record)
+
+    for account_id, group_records in grouped_records.items():
+        lock = child_replacement_locks.setdefault(account_id, asyncio.Lock())
+        async with lock:
+            try:
+                task = await create_replacement_batch_task(group_records, "批量补号")
+                for record in group_records:
+                    updated = await update_child_account(
+                        record.get("id", ""),
+                        status="replacing",
+                        replacement_task_id=task.id,
+                        replaced_at="",
+                        failure_reason="",
+                        replacement_reason="批量补号，等待任务开始移除",
+                    )
+                    results.append({
+                        "id": record.get("id", ""),
+                        "email": record.get("email", ""),
+                        "ok": True,
+                        "skipped": False,
+                        "message": f"已加入补号任务 #{task.id}，等待任务开始后移除旧子号",
+                        "account": public_child_account(updated or record),
+                    })
+            except Exception as exc:
+                for record in group_records:
+                    await update_child_account(record.get("id", ""), failure_reason=f"创建补号任务失败：{exc}")
+                    results.append({
+                        "id": record.get("id", ""),
+                        "email": record.get("email", ""),
+                        "ok": False,
+                        "skipped": False,
+                        "message": str(exc),
+                    })
     success = sum(1 for item in results if item.get("ok"))
     skipped = sum(1 for item in results if item.get("skipped"))
     failed = len(results) - success - skipped
@@ -3173,23 +3275,40 @@ async def remove_child_member(record: dict, reason: str = "手动移除") -> dic
 
 
 async def create_replacement_task(record: dict, reason: str = "自动换号") -> Task:
-    account_id = record.get("adobe_account_id", "")
+    return await create_replacement_batch_task([record], reason)
+
+
+async def create_replacement_batch_task(records: list[dict], reason: str = "自动换号") -> Task:
+    if not records:
+        raise RuntimeError("没有可补号的子账号")
+    account_id = records[0].get("adobe_account_id", "")
+    if any(record.get("adobe_account_id", "") != account_id for record in records):
+        raise RuntimeError("批量补号请选择同一个母号下的子账号")
     if not find_adobe_account(account_id):
         raise RuntimeError("所属母号不存在，无法补号")
+    child_ids = [record.get("id", "") for record in records if record.get("id")]
+    child_emails = [record.get("email", "") for record in records if record.get("email")]
     task = task_manager.create_task(
-        1,
+        len(child_ids),
         1,
         False,
-        f"子号补号: {record.get('email', '')}",
+        f"子号批量补号: {len(child_ids)} 个",
         "self",
         "invite",
         [account_id],
         False,
     )
-    task.replacement_child_id = record.get("id", "")
+    task.replacement_child_id = child_ids[0] if child_ids else ""
+    task.replacement_child_ids = child_ids
+    task.replacement_done_child_ids = []
     await task_manager.queue.put(task)
     asyncio.create_task(task_manager.start_queue_worker())
-    await task_manager.broadcast(f"[子账号池] 已创建补号任务 #{task.id}：{reason}")
+    if child_emails:
+        await task_manager.broadcast(f"[Task#{task.id}] Step 0/3：已绑定旧子号，等待任务开始后移除：{', '.join(child_emails)}")
+    await task_manager.broadcast(
+        f"[子账号池] 已创建补号任务 #{task.id}：{reason}，旧子号 {len(child_ids)} 个"
+        + (f"（{', '.join(child_emails[:5])}{'...' if len(child_emails) > 5 else ''}）" if child_emails else "")
+    )
     await task_manager.broadcast("__STATE_UPDATE__")
     return task
 
@@ -3688,6 +3807,14 @@ async def run_invite_task(task: Task):
         account_label = account.get("email") or account.get("name") or account_id
         prefix = f"[Task#{task.id}: {account_label}]"
         target_success = max(1, int(task.batch_quantity or task.quantity or 1))
+        if getattr(task, "replacement_child_ids", None) or getattr(task, "replacement_child_id", ""):
+            prepared_child_ids = await prepare_replacement_children_for_task(task, account, prefix)
+            if not prepared_child_ids:
+                await task_manager.broadcast(f"{prefix} ⚠️ 没有旧子号被成功移除，补号任务取消")
+                continue
+            target_success = len(prepared_child_ids)
+            task.quantity = target_success
+            task.batch_quantity = target_success
         account_success = 0
         registration_attempts = 0
         max_attempts_per_slot = 8
@@ -3783,7 +3910,7 @@ async def run_invite_task(task: Task):
                             cookie_file=cookie_file,
                             task=task,
                         )
-                        replacement_child_id = getattr(task, "replacement_child_id", "")
+                        replacement_child_id = consume_replacement_child_id(task) if child_record else ""
                         if replacement_child_id and child_record:
                             await update_child_account(
                                 replacement_child_id,
@@ -3889,13 +4016,30 @@ async def run_task(task: Task):
     elif task.status != "stopped":
         task.status = "completed"
         await task_manager.broadcast(f"🏁 任务 #{task.id} 结束 (成功 {task.completed}, 失败 {task.failed})")
+    replacement_done_ids = list(getattr(task, "replacement_done_child_ids", []) or [])
+    replacement_pending_ids = list(getattr(task, "replacement_child_ids", []) or [])
     replacement_child_id = getattr(task, "replacement_child_id", "")
-    if replacement_child_id and task.completed <= 0:
-        await update_child_account(
-            replacement_child_id,
-            status="removed",
-            failure_reason=f"补号任务 #{task.id} 未成功",
-        )
+    if replacement_child_id and replacement_child_id not in replacement_pending_ids and replacement_child_id not in replacement_done_ids:
+        replacement_pending_ids.append(replacement_child_id)
+    replacement_total = len(replacement_done_ids) + len(replacement_pending_ids)
+    if replacement_total:
+        records = await list_child_accounts_raw()
+        failed_emails = []
+        for child_id in replacement_pending_ids:
+            record = find_child_record(records, child_id)
+            failed_emails.append(record.get("email", child_id) if record else child_id)
+            await update_child_account(
+                child_id,
+                status="removed",
+                failure_reason=f"补号任务 #{task.id} 未成功",
+            )
+        if failed_emails:
+            await task_manager.broadcast(
+                f"[子账号池] 补号任务 #{task.id} 结果：成功 {len(replacement_done_ids)}/{replacement_total}，"
+                f"失败 {len(failed_emails)}；失败子号：{', '.join(failed_emails)}"
+            )
+        else:
+            await task_manager.broadcast(f"[子账号池] 补号任务 #{task.id} 结果：成功 {len(replacement_done_ids)}/{replacement_total}，失败 0")
     await task_manager.broadcast("__STATE_UPDATE__")
 
 # ─── WebSocket ───
