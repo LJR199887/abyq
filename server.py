@@ -3550,6 +3550,11 @@ async def monitor_child_accounts_once(source: str = "manual") -> dict:
         if record.get("status") in ("active", "exhausted", "check_failed") or is_retryable_removed_child(record)
     ]
     exhausted, errors, pool_results = await fetch_exhausted_email_index()
+    pool_name_by_id = {
+        str(pool.get("pool_id") or ""): str(pool.get("pool_name") or pool.get("pool_id") or "Token 池")
+        for pool in pool_results
+        if str(pool.get("pool_id") or "")
+    }
     checked = len(active)
     matched = 0
     replaced = 0
@@ -3570,6 +3575,7 @@ async def monitor_child_accounts_once(source: str = "manual") -> dict:
                     "email": record.get("email", ""),
                     "adobe_account_email": record.get("adobe_account_email", ""),
                     "pool_ids": pool_ids,
+                    "pool_names": [pool_name_by_id.get(pool_id, pool_id) for pool_id in pool_ids],
                 })
                 updates = {
                     "exhausted_pool_ids": pool_ids,
@@ -3581,7 +3587,10 @@ async def monitor_child_accounts_once(source: str = "manual") -> dict:
                     updates["status"] = "exhausted"
                 await update_child_account(record.get("id", ""), **updates)
                 replacement_records.append(record)
-                replacement_reasons[record.get("id", "")] = f"Token 池标记耗尽：{', '.join(pool_ids)}"
+                replacement_reasons[record.get("id", "")] = (
+                    f"Token 池标记耗尽："
+                    f"{', '.join(pool_name_by_id.get(pool_id, pool_id) for pool_id in pool_ids)}"
+                )
             else:
                 updates = {
                     "last_checked_at": now_text(),
