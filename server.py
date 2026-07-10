@@ -487,6 +487,16 @@ async def prepare_replacement_children_for_task(task: Task, account: dict, prefi
             failed.append(child_id)
             continue
         email = record.get("email", child_id)
+        if record.get("status") == "removed":
+            prepared.append(record.get("id", child_id))
+            await update_child_account(
+                child_id,
+                status="removed",
+                failure_reason="",
+                replacement_reason="旧子号已移除，补号任务直接继续",
+            )
+            await task_manager.broadcast(f"{prefix} Step 0/3：旧子号 {email} 已移除，跳过组织移除")
+            continue
         try:
             await update_child_account(child_id, status="replacing", failure_reason="", replacement_reason="补号任务执行中")
             await task_manager.broadcast(f"{prefix} Step 0/3：正在移除旧子号 {email}")
@@ -3341,9 +3351,20 @@ async def replace_child_account(child_id: str, reason: str = "积分低于阈值
         return updated or record
 
 
+def is_retryable_removed_child(record: dict) -> bool:
+    return (
+        record.get("status") == "removed"
+        and bool(record.get("replacement_task_id"))
+        and bool(record.get("failure_reason"))
+    )
+
+
 async def monitor_child_accounts_once(source: str = "manual") -> dict:
     records = await list_child_accounts_raw()
-    active = [record for record in records if record.get("status") in ("active", "exhausted", "check_failed")]
+    active = [
+        record for record in records
+        if record.get("status") in ("active", "exhausted", "check_failed") or is_retryable_removed_child(record)
+    ]
     exhausted, errors, pool_results = await fetch_exhausted_email_index()
     checked = len(active)
     matched = 0
@@ -3366,14 +3387,15 @@ async def monitor_child_accounts_once(source: str = "manual") -> dict:
                     "adobe_account_email": record.get("adobe_account_email", ""),
                     "pool_ids": pool_ids,
                 })
-                await update_child_account(
-                    record.get("id", ""),
-                    status="exhausted",
-                    exhausted_pool_ids=pool_ids,
-                    exhausted_detected_at=now_text(),
-                    last_checked_at=now_text(),
-                    failure_reason="",
-                )
+                updates = {
+                    "exhausted_pool_ids": pool_ids,
+                    "exhausted_detected_at": now_text(),
+                    "last_checked_at": now_text(),
+                    "failure_reason": "",
+                }
+                if record.get("status") != "removed":
+                    updates["status"] = "exhausted"
+                await update_child_account(record.get("id", ""), **updates)
                 replacement_records.append(record)
                 replacement_reasons[record.get("id", "")] = f"Token 池标记耗尽：{', '.join(pool_ids)}"
             else:
@@ -3406,13 +3428,17 @@ async def monitor_child_accounts_once(source: str = "manual") -> dict:
                         reason_items.append(reason)
                 task = await create_replacement_batch_task(group_records, "；".join(reason_items[:3]))
                 for record in group_records:
+                    already_removed = record.get("status") == "removed"
                     updated = await update_child_account(
                         record.get("id", ""),
-                        status="replacing",
+                        status="removed" if already_removed else "replacing",
                         replacement_task_id=task.id,
                         replaced_at="",
                         failure_reason="",
-                        replacement_reason=f"{replacement_reasons.get(record.get('id', ''), 'Token 池标记耗尽')}，等待任务开始移除",
+                        replacement_reason=(
+                            f"{replacement_reasons.get(record.get('id', ''), 'Token 池标记耗尽')}，"
+                            + ("旧子号已移除，等待补号任务" if already_removed else "等待任务开始移除")
+                        ),
                     )
                     replacements.append({
                         "child_id": record.get("id", ""),

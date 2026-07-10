@@ -45,6 +45,22 @@
                 <div id="records-list" class="records-list">
                     <div class="empty-hint">暂无任务记录</div>
                 </div>
+                <div class="records-pagination">
+                    <div class="records-page-size">
+                        <span>每页</span>
+                        <select id="records-page-size">
+                            <option value="20">20</option>
+                            <option value="30">30</option>
+                            <option value="50">50</option>
+                        </select>
+                        <span>条</span>
+                    </div>
+                    <div class="records-page-controls">
+                        <button type="button" class="btn-sm primary" id="records-page-prev">上一页</button>
+                        <span id="records-page-info">第 1 / 1 页 · 共 0 条</span>
+                        <button type="button" class="btn-sm primary" id="records-page-next">下一页</button>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
@@ -58,8 +74,17 @@
         const exportUnpooledSelectedBtn = document.getElementById("export-unpooled-selected-btn");
         const exportAllBtn = document.getElementById("export-all-btn");
         const exportUnpooledAllBtn = document.getElementById("export-unpooled-all-btn");
+        const pageSizeInput = document.getElementById("records-page-size");
+        const pagePrevBtn = document.getElementById("records-page-prev");
+        const pageNextBtn = document.getElementById("records-page-next");
+        const pageInfo = document.getElementById("records-page-info");
 
         let tasks = [];
+        let selectedIds = new Set();
+        let page = 1;
+        let pageSize = parseInt(localStorage.getItem("recordsPageSize") || "20", 10) || 20;
+        if (![20, 30, 50].includes(pageSize)) pageSize = 20;
+        pageSizeInput.value = String(pageSize);
 
         function emailSourceLabel(source) {
             return source === "self" ? "自备邮箱" : "临时邮箱";
@@ -72,22 +97,40 @@
         function refreshRecords() {
             fetch("/api/tasks").then(r => r.json()).then(data => {
                 tasks = data;
+                const validIds = new Set(tasks.map(task => task.id));
+                selectedIds = new Set([...selectedIds].filter(id => validIds.has(id)));
+                const pageCount = Math.max(1, Math.ceil(tasks.length / pageSize));
+                page = Math.min(Math.max(1, page), pageCount);
                 renderRecords();
             });
         }
 
+        function pageTasks() {
+            const start = (page - 1) * pageSize;
+            return tasks.slice(start, start + pageSize);
+        }
+
+        function updatePagination() {
+            const pageCount = Math.max(1, Math.ceil(tasks.length / pageSize));
+            page = Math.min(Math.max(1, page), pageCount);
+            pageInfo.textContent = `第 ${page} / ${pageCount} 页 · 共 ${tasks.length} 条`;
+            pagePrevBtn.disabled = page <= 1;
+            pageNextBtn.disabled = page >= pageCount;
+            pageSizeInput.value = String(pageSize);
+        }
+
         function renderRecords() {
+            updatePagination();
             if (tasks.length === 0) {
                 listEl.innerHTML = '<div class="empty-hint">暂无任务记录</div>';
+                updateButtons();
                 return;
             }
-            // Save current selections before re-render
-            const checkedIds = new Set(getSelected());
 
-            listEl.innerHTML = tasks.map(t => {
+            listEl.innerHTML = pageTasks().map(t => {
                 let badgeClass = t.status;
                 let badgeText = { pending: "排队中", running: "运行中", completed: "已完成", stopped: "已停止", stopping: "停止中..." }[t.status] || t.status;
-                const isChecked = checkedIds.has(t.id) ? "checked" : "";
+                const isChecked = selectedIds.has(t.id) ? "checked" : "";
                 return `
                     <div class="record-item" data-id="${t.id}">
                         <label class="record-check">
@@ -109,7 +152,7 @@
         }
 
         function getSelected() {
-            return [...document.querySelectorAll(".task-cb:checked")].map(cb => parseInt(cb.value));
+            return [...selectedIds];
         }
 
         function updateButtons() {
@@ -118,21 +161,55 @@
             stopBtn.disabled = sel.length === 0;
             exportSelectedBtn.disabled = sel.length === 0;
             exportUnpooledSelectedBtn.disabled = sel.length === 0;
+            deleteBtn.textContent = sel.length ? `删除选中 ${sel.length}` : "删除选中";
+            stopBtn.textContent = sel.length ? `停止选中 ${sel.length}` : "停止选中";
+            exportSelectedBtn.textContent = sel.length ? `导出选中 ${sel.length}` : "导出选中";
+            exportUnpooledSelectedBtn.textContent = sel.length ? `导出未入池选中 ${sel.length}` : "导出未入池选中";
+            const visibleIds = pageTasks().map(task => task.id);
+            const checkedOnPage = visibleIds.filter(id => selectedIds.has(id)).length;
+            selectAllCb.checked = visibleIds.length > 0 && checkedOnPage === visibleIds.length;
+            selectAllCb.indeterminate = checkedOnPage > 0 && checkedOnPage < visibleIds.length;
         }
 
         listEl.addEventListener("change", (e) => {
             if (e.target.classList.contains("task-cb")) {
+                const id = parseInt(e.target.value);
+                if (e.target.checked) {
+                    selectedIds.add(id);
+                } else {
+                    selectedIds.delete(id);
+                }
                 updateButtons();
-                // Update select-all state
-                const all = document.querySelectorAll(".task-cb");
-                const checked = document.querySelectorAll(".task-cb:checked");
-                selectAllCb.checked = all.length > 0 && all.length === checked.length;
             }
         });
 
         selectAllCb.addEventListener("change", () => {
-            document.querySelectorAll(".task-cb").forEach(cb => cb.checked = selectAllCb.checked);
-            updateButtons();
+            pageTasks().forEach(task => {
+                if (selectAllCb.checked) {
+                    selectedIds.add(task.id);
+                } else {
+                    selectedIds.delete(task.id);
+                }
+            });
+            renderRecords();
+        });
+
+        pagePrevBtn.addEventListener("click", () => {
+            page = Math.max(1, page - 1);
+            renderRecords();
+        });
+
+        pageNextBtn.addEventListener("click", () => {
+            const pageCount = Math.max(1, Math.ceil(tasks.length / pageSize));
+            page = Math.min(pageCount, page + 1);
+            renderRecords();
+        });
+
+        pageSizeInput.addEventListener("change", () => {
+            pageSize = parseInt(pageSizeInput.value, 10) || 20;
+            localStorage.setItem("recordsPageSize", String(pageSize));
+            page = 1;
+            renderRecords();
         });
 
         deleteBtn.addEventListener("click", () => {
@@ -144,6 +221,7 @@
                 headers: {"Content-Type": "application/json"},
                 body: JSON.stringify({ ids })
             }).then(() => {
+                selectedIds.clear();
                 selectAllCb.checked = false;
                 refreshRecords();
             });
@@ -158,6 +236,7 @@
                 headers: {"Content-Type": "application/json"},
                 body: JSON.stringify({ ids })
             }).then(() => {
+                selectedIds.clear();
                 selectAllCb.checked = false;
                 refreshRecords();
             });

@@ -32,7 +32,7 @@
                     <div>
                         <span class="eyebrow">MONITOR LOG</span>
                         <h2>监测日志</h2>
-                        <p class="card-desc">默认显示最近 5 条；展开可查看更多，后端只保留最近 12 小时日志。</p>
+                        <p class="card-desc">默认只显示最新一条；展开后可查看最近 12 小时内的日志。</p>
                     </div>
                     <div class="child-pool-actions">
                         <button class="btn-sm primary" id="refresh-log-btn">刷新日志</button>
@@ -97,9 +97,45 @@
                         </tbody>
                     </table>
                 </div>
+                <div class="child-pagination">
+                    <div class="child-page-size">
+                        <span>每页</span>
+                        <select id="child-page-size">
+                            <option value="20">20</option>
+                            <option value="30">30</option>
+                            <option value="50">50</option>
+                        </select>
+                        <span>条</span>
+                    </div>
+                    <div class="child-page-controls">
+                        <button type="button" class="btn-sm primary" id="child-page-prev">上一页</button>
+                        <span id="child-page-info">第 1 / 1 页 · 共 0 条</span>
+                        <button type="button" class="btn-sm primary" id="child-page-next">下一页</button>
+                    </div>
+                </div>
                 <div class="status-msg" id="child-status"></div>
             </section>
         </main>
+    </div>
+
+    <div class="modal-backdrop" id="monitor-log-modal" aria-hidden="true">
+        <div class="modal-panel monitor-log-modal-panel" role="dialog" aria-modal="true" aria-labelledby="monitor-log-modal-title">
+            <div class="modal-header">
+                <div>
+                    <span class="eyebrow">MONITOR LOG</span>
+                    <h2 id="monitor-log-modal-title">监测日志</h2>
+                    <p class="card-desc">最近 12 小时内的监测记录。</p>
+                </div>
+                <div class="modal-actions">
+                    <button class="btn-sm primary" id="refresh-log-modal-btn">刷新日志</button>
+                    <button class="btn-sm success" id="download-log-modal-btn">下载日志</button>
+                    <button class="btn-sm secondary" id="close-log-modal-btn">关闭</button>
+                </div>
+            </div>
+            <div id="monitor-log-modal-list" class="monitor-log-list monitor-log-modal-list">
+                <div class="empty-hint">暂无监测日志</div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -111,12 +147,24 @@
         const poolFilter = document.getElementById("pool-filter");
         const monitorLogList = document.getElementById("monitor-log-list");
         const toggleLogBtn = document.getElementById("toggle-log-btn");
+        const monitorLogModal = document.getElementById("monitor-log-modal");
+        const monitorLogModalList = document.getElementById("monitor-log-modal-list");
+        const closeLogModalBtn = document.getElementById("close-log-modal-btn");
+        const refreshLogModalBtn = document.getElementById("refresh-log-modal-btn");
+        const downloadLogModalBtn = document.getElementById("download-log-modal-btn");
         const selectAllAccounts = document.getElementById("select-all-accounts");
         const deleteSelectedBtn = document.getElementById("delete-selected-btn");
         const replaceSelectedBtn = document.getElementById("replace-selected-btn");
-        let monitorLogExpanded = false;
+        const childPageSizeInput = document.getElementById("child-page-size");
+        const childPagePrevBtn = document.getElementById("child-page-prev");
+        const childPageNextBtn = document.getElementById("child-page-next");
+        const childPageInfo = document.getElementById("child-page-info");
         let accounts = [];
         let selectedIds = new Set();
+        let childPage = 1;
+        let childPageSize = parseInt(localStorage.getItem("childAccountPageSize") || "20", 10) || 20;
+        if (![20, 30, 50].includes(childPageSize)) childPageSize = 20;
+        childPageSizeInput.value = String(childPageSize);
 
         function escapeHtml(value) {
             return String(value ?? "")
@@ -172,15 +220,15 @@
         }
 
         function syncSelectionState() {
-            const visibleIds = accounts.map(account => account.id).filter(Boolean);
-            const selectedVisibleCount = visibleIds.filter(id => selectedIds.has(id)).length;
+            const pageIds = pageAccounts().map(account => account.id).filter(Boolean);
+            const selectedVisibleCount = pageIds.filter(id => selectedIds.has(id)).length;
             const replaceableCount = accounts.filter(account => selectedIds.has(account.id) && !["removed", "replaced"].includes(account.status)).length;
             deleteSelectedBtn.disabled = selectedIds.size === 0;
             deleteSelectedBtn.textContent = selectedIds.size ? `删除选中 ${selectedIds.size}` : "删除选中";
             replaceSelectedBtn.disabled = replaceableCount === 0;
             replaceSelectedBtn.textContent = replaceableCount ? `补号选中 ${replaceableCount}` : "补号选中";
-            selectAllAccounts.checked = visibleIds.length > 0 && selectedVisibleCount === visibleIds.length;
-            selectAllAccounts.indeterminate = selectedVisibleCount > 0 && selectedVisibleCount < visibleIds.length;
+            selectAllAccounts.checked = pageIds.length > 0 && selectedVisibleCount === pageIds.length;
+            selectAllAccounts.indeterminate = selectedVisibleCount > 0 && selectedVisibleCount < pageIds.length;
         }
 
         function renderStats(summary) {
@@ -228,13 +276,29 @@
             }
         }
 
+        function pageAccounts() {
+            const start = (childPage - 1) * childPageSize;
+            return accounts.slice(start, start + childPageSize);
+        }
+
+        function updatePagination() {
+            const pageCount = Math.max(1, Math.ceil(accounts.length / childPageSize));
+            childPage = Math.min(Math.max(1, childPage), pageCount);
+            childPageInfo.textContent = `第 ${childPage} / ${pageCount} 页 · 共 ${accounts.length} 条`;
+            childPagePrevBtn.disabled = childPage <= 1;
+            childPageNextBtn.disabled = childPage >= pageCount;
+            childPageSizeInput.value = String(childPageSize);
+        }
+
         function renderAccounts() {
+            updatePagination();
             if (!accounts.length) {
                 body.innerHTML = '<tr><td colspan="5" class="empty-hint">暂无子账号记录</td></tr>';
                 syncSelectionState();
                 return;
             }
-            body.innerHTML = accounts.map(account => {
+            const items = pageAccounts();
+            body.innerHTML = items.map(account => {
                 const isArchived = ["removed", "replaced"].includes(account.status);
                 const motherCell = isArchived
                     ? `
@@ -298,6 +362,8 @@
                     accounts = data.accounts || [];
                     const visibleIdSet = new Set(accounts.map(account => account.id));
                     selectedIds = new Set([...selectedIds].filter(id => visibleIdSet.has(id)));
+                    const pageCount = Math.max(1, Math.ceil(accounts.length / childPageSize));
+                    childPage = Math.min(Math.max(1, childPage), pageCount);
                     renderMotherFilter(data.mother_options || []);
                     renderPoolFilter(data.pool_options || []);
                     renderStats(data.summary || {});
@@ -343,12 +409,12 @@
             });
         }
 
-        function renderMonitorLogs(logs) {
+        function renderMonitorLogs(logs, target = monitorLogList) {
             if (!logs.length) {
-                monitorLogList.innerHTML = '<div class="empty-hint">暂无监测日志</div>';
+                target.innerHTML = '<div class="empty-hint">暂无监测日志</div>';
                 return;
             }
-            monitorLogList.innerHTML = logs.map(log => {
+            target.innerHTML = logs.map(log => {
                 const poolLines = (log.pool_results || []).map(pool => `
                     <span class="${pool.ok ? "ok" : "fail"}">${escapeHtml(pool.pool_name || pool.pool_id)}：${pool.ok ? `${pool.count || 0} 个耗尽` : escapeHtml(pool.error || "")}${pool.attempts > 1 ? `（尝试 ${pool.attempts}/3）` : ""}</span>
                 `).join("");
@@ -379,11 +445,23 @@
             }).join("");
         }
 
-        function loadMonitorLogs() {
-            const limit = monitorLogExpanded ? 50 : 5;
+        function loadMonitorLogs(limit = 1, target = monitorLogList) {
             return fetch(`/api/child-accounts/monitor/logs?limit=${limit}`)
                 .then(response => response.json())
-                .then(data => renderMonitorLogs(data.logs || []));
+                .then(data => renderMonitorLogs(data.logs || [], target));
+        }
+
+        function openMonitorLogModal() {
+            monitorLogModal.classList.add("show");
+            monitorLogModal.setAttribute("aria-hidden", "false");
+            document.body.classList.add("modal-open");
+            loadMonitorLogs(500, monitorLogModalList);
+        }
+
+        function closeMonitorLogModal() {
+            monitorLogModal.classList.remove("show");
+            monitorLogModal.setAttribute("aria-hidden", "true");
+            document.body.classList.remove("modal-open");
         }
 
         body.addEventListener("click", event => {
@@ -424,7 +502,7 @@
 
         document.getElementById("refresh-btn").addEventListener("click", () => loadAccounts());
         selectAllAccounts.addEventListener("change", () => {
-            const visibleIds = accounts.map(account => account.id).filter(Boolean);
+            const visibleIds = pageAccounts().map(account => account.id).filter(Boolean);
             if (selectAllAccounts.checked) {
                 visibleIds.forEach(id => selectedIds.add(id));
             } else {
@@ -470,6 +548,21 @@
                     syncSelectionState();
                 });
         });
+        childPagePrevBtn.addEventListener("click", () => {
+            childPage = Math.max(1, childPage - 1);
+            renderAccounts();
+        });
+        childPageNextBtn.addEventListener("click", () => {
+            const pageCount = Math.max(1, Math.ceil(accounts.length / childPageSize));
+            childPage = Math.min(pageCount, childPage + 1);
+            renderAccounts();
+        });
+        childPageSizeInput.addEventListener("change", () => {
+            childPageSize = parseInt(childPageSizeInput.value, 10) || 20;
+            localStorage.setItem("childAccountPageSize", String(childPageSize));
+            childPage = 1;
+            renderAccounts();
+        });
         document.getElementById("run-monitor-btn").addEventListener("click", event => {
             const btn = event.currentTarget;
             btn.disabled = true;
@@ -477,29 +570,55 @@
                 .then(response => response.json())
                 .then(data => {
                     showStatus(`✅ 监测完成：检测 ${data.checked || 0}，命中 ${data.matched || 0}，换号 ${data.replaced || 0}`);
-                    return Promise.all([loadAccounts(), loadMonitorLogs()]);
+                    return Promise.all([
+                        loadAccounts(),
+                        loadMonitorLogs(),
+                        monitorLogModal.classList.contains("show") ? loadMonitorLogs(500, monitorLogModalList) : Promise.resolve(),
+                    ]);
                 })
                 .catch(() => showStatus("❌ 监测失败", false))
                 .finally(() => { btn.disabled = false; });
         });
         document.getElementById("refresh-log-btn").addEventListener("click", () => loadMonitorLogs());
         toggleLogBtn.addEventListener("click", () => {
-            monitorLogExpanded = !monitorLogExpanded;
-            toggleLogBtn.textContent = monitorLogExpanded ? "收起日志" : "展开日志";
-            loadMonitorLogs();
+            openMonitorLogModal();
         });
         document.getElementById("download-log-btn").addEventListener("click", () => {
             window.location.href = "/api/child-accounts/monitor/logs/download";
         });
+        closeLogModalBtn.addEventListener("click", closeMonitorLogModal);
+        refreshLogModalBtn.addEventListener("click", () => loadMonitorLogs(500, monitorLogModalList));
+        downloadLogModalBtn.addEventListener("click", () => {
+            window.location.href = "/api/child-accounts/monitor/logs/download";
+        });
+        monitorLogModal.addEventListener("click", event => {
+            if (event.target === monitorLogModal) closeMonitorLogModal();
+        });
+        document.addEventListener("keydown", event => {
+            if (event.key === "Escape" && monitorLogModal.classList.contains("show")) {
+                closeMonitorLogModal();
+            }
+        });
         [searchInput, motherFilter, poolFilter].forEach(el => {
-            el.addEventListener("input", () => loadAccounts());
-            el.addEventListener("change", () => loadAccounts());
+            el.addEventListener("input", () => {
+                childPage = 1;
+                loadAccounts();
+            });
+            el.addEventListener("change", () => {
+                childPage = 1;
+                loadAccounts();
+            });
         });
 
         loadAccounts();
         loadMonitorLogs();
         setInterval(loadAccounts, 15000);
-        setInterval(loadMonitorLogs, 15000);
+        setInterval(() => {
+            loadMonitorLogs();
+            if (monitorLogModal.classList.contains("show")) {
+                loadMonitorLogs(500, monitorLogModalList);
+            }
+        }, 15000);
     });
     </script>
 </body>
