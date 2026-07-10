@@ -677,6 +677,13 @@ h1 {
 }
 .btn-sm.primary:hover { background: rgba(99,102,241,0.25); }
 
+.btn-sm.secondary {
+    background: rgba(148,163,184,0.12);
+    color: var(--text-primary);
+    border: 1px solid rgba(148,163,184,0.28);
+}
+.btn-sm.secondary:hover { background: rgba(148,163,184,0.2); }
+
 .btn-sm.success {
     background: rgba(16,185,129,0.15);
     color: var(--success);
@@ -1671,6 +1678,211 @@ textarea:focus {
     margin-top: 10px;
 }
 
+.monitor-pool-list {
+    display: grid;
+    gap: 10px;
+}
+
+.monitor-pool-option {
+    align-items: center;
+    background: rgba(255, 255, 255, 0.035);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    display: flex;
+    gap: 10px;
+    padding: 10px 12px;
+}
+
+.monitor-pool-option span,
+.monitor-pool-option small {
+    display: block;
+}
+
+.monitor-pool-option small {
+    color: var(--text-secondary);
+    font-size: 0.78rem;
+    margin-top: 3px;
+}
+
+.child-pool-layout {
+    display: grid;
+    gap: 24px;
+}
+
+.child-pool-header {
+    align-items: flex-start;
+    display: flex;
+    gap: 16px;
+    justify-content: space-between;
+}
+
+.child-pool-actions,
+.child-row-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.child-pool-actions {
+    justify-content: flex-end;
+}
+
+.child-pool-stats {
+    display: grid;
+    gap: 12px;
+    grid-template-columns: repeat(5, minmax(100px, 1fr));
+    margin: 18px 0;
+}
+
+.child-pool-filters {
+    display: grid;
+    gap: 12px;
+    grid-template-columns: 1fr 180px 180px;
+    margin-bottom: 16px;
+}
+
+.table-wrap {
+    overflow-x: auto;
+}
+
+.child-pool-table {
+    border-collapse: collapse;
+    min-width: 820px;
+    width: 100%;
+}
+
+.child-pool-table th,
+.child-pool-table td {
+    border-bottom: 1px solid var(--border-color);
+    padding: 12px;
+    text-align: left;
+    vertical-align: top;
+}
+
+.child-pool-table th {
+    color: var(--text-secondary);
+    font-size: 0.82rem;
+    font-weight: 700;
+}
+
+.child-pool-table td strong,
+.child-pool-table td span {
+    display: block;
+}
+
+.child-pool-table td small {
+    color: var(--text-secondary);
+    display: block;
+    font-size: 0.78rem;
+    margin-top: 4px;
+}
+
+.credits-value {
+    color: var(--success);
+    font-weight: 800;
+}
+
+.event-lines {
+    display: grid;
+    gap: 4px;
+}
+
+.event-lines span {
+    color: var(--text-secondary);
+    font-size: 0.78rem;
+    overflow-wrap: anywhere;
+}
+
+.badge.active {
+    background: rgba(26, 204, 141, 0.12);
+    border-color: rgba(26, 204, 141, 0.28);
+    color: var(--success);
+}
+
+.badge.exhausted,
+.badge.check_failed,
+.badge.removed {
+    background: rgba(255, 92, 92, 0.12);
+    border-color: rgba(255, 92, 92, 0.28);
+    color: var(--danger);
+}
+
+.badge.replacing {
+    background: rgba(255, 184, 76, 0.12);
+    border-color: rgba(255, 184, 76, 0.28);
+    color: var(--warning);
+}
+
+.badge.replaced {
+    background: rgba(126, 95, 255, 0.14);
+    border-color: rgba(126, 95, 255, 0.32);
+    color: var(--primary-light);
+}
+
+.monitor-log-list {
+    display: grid;
+    gap: 12px;
+    margin-top: 16px;
+}
+
+.monitor-log-item {
+    background: rgba(255, 255, 255, 0.035);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 12px;
+}
+
+.monitor-log-head {
+    align-items: center;
+    color: var(--text-secondary);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 10px;
+}
+
+.monitor-log-head strong {
+    color: var(--text-primary);
+}
+
+.monitor-log-grid {
+    display: grid;
+    gap: 10px;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.monitor-log-grid > div {
+    background: rgba(0, 0, 0, 0.14);
+    border-radius: 8px;
+    padding: 10px;
+}
+
+.monitor-log-grid b,
+.monitor-log-grid span {
+    display: block;
+}
+
+.monitor-log-grid b {
+    color: var(--text-primary);
+    font-size: 0.82rem;
+    margin-bottom: 6px;
+}
+
+.monitor-log-grid span {
+    color: var(--text-secondary);
+    font-size: 0.78rem;
+    line-height: 1.55;
+    overflow-wrap: anywhere;
+}
+
+.monitor-log-grid .ok {
+    color: var(--success);
+}
+
+.monitor-log-grid .fail {
+    color: var(--danger);
+}
+
 @media (max-width: 760px) {
     .container {
         padding: 1rem;
@@ -1750,5 +1962,20 @@ textarea:focus {
     .token-pool-key-row input,
     .token-pool-key-row .btn {
         border-radius: 8px;
+    }
+
+    .child-pool-header,
+    .child-pool-actions {
+        align-items: stretch;
+        flex-direction: column;
+    }
+
+    .child-pool-stats,
+    .child-pool-filters {
+        grid-template-columns: 1fr;
+    }
+
+    .monitor-log-grid {
+        grid-template-columns: 1fr;
     }
 }

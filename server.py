@@ -35,6 +35,10 @@ SCREENSHOT_DIR = os.path.join(DATA_DIR, "screenshots")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 TASKS_FILE = os.path.join(DATA_DIR, "tasks.json")
 TASK_LOG_DIR = os.path.join(DATA_DIR, "task_logs")
+CHILD_ACCOUNTS_FILE = os.path.join(DATA_DIR, "child_accounts.json")
+CHILD_MONITOR_LOG_FILE = os.path.join(DATA_DIR, "child_monitor_logs.json")
+CHILD_MONITOR_LOG_RETENTION_SECONDS = 12 * 60 * 60
+CHILD_MONITOR_LOG_MAX_ITEMS = 500
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 os.makedirs(TASK_LOG_DIR, exist_ok=True)
 
@@ -55,6 +59,11 @@ DEFAULT_CONFIG = {
     "token_pool_key": "",
     "token_pools": [],
     "token_pool_cursor": 0,
+    "child_monitor_enabled": False,
+    "child_monitor_threshold": 100,
+    "child_monitor_interval": 600,
+    "child_monitor_max_failures": 3,
+    "child_monitor_pool_ids": [],
     "self_email_accounts": "",
     "self_email_cursor": 0,
     "self_email_used": [],
@@ -366,6 +375,9 @@ self_email_lock = asyncio.Lock()
 self_email_reserved = set()
 adobe_account_lock = asyncio.Lock()
 token_pool_lock = asyncio.Lock()
+child_accounts_lock = asyncio.Lock()
+child_monitor_task: asyncio.Task | None = None
+child_replacement_locks: dict[str, asyncio.Lock] = {}
 
 # ─── Task Management ───
 class Task:
@@ -399,6 +411,7 @@ class Task:
         self.token_pool_imported_files = []
         self.created_at = datetime.now().strftime("%m-%d %H:%M")
         self.result_files = []
+        self.replacement_child_id = ""
         self.asyncio_tasks = []
         self.active_processes = {}
         self.active_profiles = {}
@@ -426,6 +439,7 @@ class Task:
             "created_at": self.created_at,
             "result_count": len(self.result_files),
             "result_files": self.result_files,
+            "replacement_child_id": self.replacement_child_id,
         }
 
 
@@ -504,6 +518,7 @@ class TaskManager:
                         t.token_pool_imported_files = t_data.get("token_pool_imported_files", [])
                         t.created_at = t_data.get("created_at", "")
                         t.result_files = t_data.get("result_files", [])
+                        t.replacement_child_id = t_data.get("replacement_child_id", "")
                         # Mark interrupted tasks as stopped
                         if t.status in ("running", "pending", "stopping"):
                             t.status = "stopped"
@@ -619,6 +634,11 @@ class ConfigUpdate(BaseModel):
     token_pool_site: str = ""
     token_pool_key: str = ""
     token_pools: list[dict] = Field(default_factory=list)
+    child_monitor_enabled: bool = False
+    child_monitor_threshold: float = 100
+    child_monitor_interval: int = 600
+    child_monitor_max_failures: int = 3
+    child_monitor_pool_ids: list[str] = Field(default_factory=list)
 
 
 class SelfEmailUpdate(BaseModel):
@@ -729,12 +749,18 @@ async def update_config(item: ConfigUpdate):
         "token_pool_key": legacy_key,
         "token_pools": token_pools,
         "token_pool_cursor": config.get("token_pool_cursor", 0),
+        "child_monitor_enabled": bool(item.child_monitor_enabled),
+        "child_monitor_threshold": max(0, float(item.child_monitor_threshold or 0)),
+        "child_monitor_interval": max(60, int(item.child_monitor_interval or 600)),
+        "child_monitor_max_failures": max(1, int(item.child_monitor_max_failures or 3)),
+        "child_monitor_pool_ids": [str(pool_id) for pool_id in item.child_monitor_pool_ids],
         "self_email_accounts": config.get("self_email_accounts", ""),
         "self_email_cursor": config.get("self_email_cursor", 0),
         "self_email_used": config.get("self_email_used", []),
         "adobe_accounts": config.get("adobe_accounts", []),
     }
     save_config(config)
+    ensure_child_monitor_started()
     return {"status": "ok"}
 
 @app.post("/api/test-proxy")
@@ -1951,6 +1977,140 @@ async def download_task_logs(task_id: int):
     )
 
 
+@app.get("/api/child-accounts")
+async def get_child_accounts(
+    status: str = "",
+    account_id: str = "",
+    flag: str = "",
+    search: str = "",
+):
+    records = await list_child_accounts_raw()
+    query = (search or "").strip().lower()
+    threshold = float(config.get("child_monitor_threshold", 100) or 0)
+    filtered = []
+    for record in records:
+        if status and record.get("status") != status:
+            continue
+        if account_id and record.get("adobe_account_id") != account_id:
+            continue
+        if flag in ("low_credits", "exhausted"):
+            if record.get("status") != "exhausted":
+                continue
+        elif flag == "check_failed" and record.get("status") != "check_failed":
+            continue
+        elif flag == "external_failed" and record.get("external_pool_status") != "failed":
+            continue
+        elif flag == "replacement_failed" and not (
+            record.get("status") == "removed" and record.get("replacement_task_id") and record.get("failure_reason")
+        ):
+            continue
+        if query:
+            haystack = " ".join([
+                str(record.get("email", "")),
+                str(record.get("adobe_account_email", "")),
+                str(record.get("product_name", "")),
+                str(record.get("failure_reason", "")),
+                str(record.get("exhausted_token_delete_error", "")),
+                str(record.get("source_task_id", "")),
+                str(record.get("replacement_task_id", "")),
+            ]).lower()
+            if query not in haystack:
+                continue
+        filtered.append(public_child_account(record))
+
+    summary = {
+        "total": len(records),
+        "active": sum(1 for item in records if item.get("status") == "active"),
+        "low_credits": sum(1 for item in records if item.get("status") == "exhausted"),
+        "exhausted": sum(1 for item in records if item.get("status") == "exhausted"),
+        "check_failed": sum(1 for item in records if item.get("status") == "check_failed"),
+        "replacing": sum(1 for item in records if item.get("status") == "replacing"),
+        "replacement_failed": sum(
+            1 for item in records
+            if item.get("status") == "removed" and item.get("replacement_task_id") and item.get("failure_reason")
+        ),
+        "external_failed": sum(1 for item in records if item.get("external_pool_status") == "failed"),
+        "monitor_enabled": bool(config.get("child_monitor_enabled")),
+        "threshold": threshold,
+    }
+    return {"accounts": list(reversed(filtered)), "summary": summary}
+
+
+@app.post("/api/child-accounts/monitor/run")
+async def run_child_monitor_now():
+    summary = await monitor_child_accounts_once("manual")
+    await task_manager.broadcast("__STATE_UPDATE__")
+    return {"status": "ok", **summary}
+
+
+@app.get("/api/child-accounts/monitor/logs")
+async def get_child_monitor_logs(limit: int = 50):
+    logs = list_child_monitor_logs_sync()
+    count = max(1, min(int(limit or 50), CHILD_MONITOR_LOG_MAX_ITEMS))
+    return {"logs": list(reversed(logs[-count:]))}
+
+
+@app.get("/api/child-accounts/monitor/logs/download")
+async def download_child_monitor_logs():
+    logs = list_child_monitor_logs_sync()
+    export_filename = f"子账号池监测日志_{export_timestamp()}.json"
+    from fastapi.responses import Response
+    return Response(
+        json.dumps(logs, ensure_ascii=False, indent=2),
+        media_type="application/json; charset=utf-8",
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(export_filename)}"
+        },
+    )
+
+
+@app.post("/api/child-accounts/{child_id}/refresh-credits")
+async def refresh_child_account_credits(child_id: str):
+    try:
+        record = await check_child_exhausted(child_id)
+        return {"status": "ok", "account": public_child_account(record)}
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"message": str(exc)})
+
+
+@app.post("/api/child-accounts/{child_id}/remove")
+async def remove_child_account_member(child_id: str):
+    records = await list_child_accounts_raw()
+    record = find_child_record(records, child_id)
+    if not record:
+        return JSONResponse(status_code=404, content={"message": "子账号不存在"})
+    try:
+        updated = await remove_child_member(record, "手动移除")
+        return {"status": "ok", "account": public_child_account(updated)}
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"message": str(exc)})
+
+
+@app.post("/api/child-accounts/{child_id}/replace")
+async def replace_child_account_api(child_id: str):
+    try:
+        updated = await replace_child_account(child_id, "手动补号")
+        return {"status": "ok", "account": public_child_account(updated)}
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"message": str(exc)})
+
+
+@app.post("/api/child-accounts/{child_id}/import-token-pool")
+async def import_child_account_token_pool(child_id: str):
+    records = await list_child_accounts_raw()
+    record = find_child_record(records, child_id)
+    if not record:
+        return JSONResponse(status_code=404, content={"message": "子账号不存在"})
+    external_enabled = bool(config.get("token_pool_enabled"))
+    ok = await import_payload_to_token_pool(child_cookie_payload(record), f"[子账号池 · {record.get('email', '')}]")
+    updated = await update_child_account(
+        child_id,
+        external_pool_status="imported" if external_enabled and ok else "skipped" if not external_enabled else "failed",
+        external_pool_error="" if ok else "外部 Token 池导入失败",
+    )
+    return {"status": "ok" if ok else "failed", "account": public_child_account(updated or record)}
+
+
 @app.post("/api/tasks/delete")
 async def delete_tasks(req: TaskDeleteRequest):
     task_manager.delete_tasks(req.ids)
@@ -2032,6 +2192,17 @@ def build_token_pool_import_url(site: str) -> str:
     if "/api/v1/automation/import-cookie" in raw:
         return raw
     return urljoin(raw.rstrip("/") + "/", "api/v1/automation/import-cookie")
+
+
+def build_token_pool_exhausted_url(site: str) -> str:
+    raw = (site or "").strip()
+    if not raw:
+        return ""
+    if not raw.startswith(("http://", "https://")):
+        raw = f"http://{raw}"
+    if "/api/v1/automation/exhausted-accounts" in raw:
+        return raw
+    return urljoin(raw.rstrip("/") + "/", "api/v1/automation/exhausted-accounts")
 
 
 def normalize_token_pools(raw_pools=None) -> list[dict]:
@@ -2154,6 +2325,17 @@ async def import_cookie_to_token_pool(cookie_file: str, prefix: str) -> bool:
         await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败：Cookie 内容为空")
         return False
 
+    return await import_payload_to_token_pool(payload, prefix)
+
+
+async def import_payload_to_token_pool(payload: dict, prefix: str) -> bool:
+    if not config.get("token_pool_enabled"):
+        return True
+
+    if not payload.get("cookie"):
+        await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败：Cookie 内容为空")
+        return False
+
     ordered = await reserve_token_pool_order()
     if not ordered:
         await task_manager.broadcast(f"{prefix} ⚠️ 自动入池已开启，但没有启用的 Token 池")
@@ -2174,6 +2356,721 @@ async def import_cookie_to_token_pool(cookie_file: str, prefix: str) -> bool:
 
     await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败：全部 Token 池均失败；最后错误：{last_error}")
     return False
+
+
+def now_text() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def now_ts() -> int:
+    return int(datetime.now().timestamp())
+
+
+def load_child_accounts_sync() -> list[dict]:
+    if not os.path.exists(CHILD_ACCOUNTS_FILE):
+        return []
+    try:
+        with open(CHILD_ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+    except Exception:
+        return []
+    return []
+
+
+def save_child_accounts_sync(accounts: list[dict]) -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(CHILD_ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(accounts, f, ensure_ascii=False, indent=2)
+
+
+def load_child_monitor_logs_sync() -> list[dict]:
+    if not os.path.exists(CHILD_MONITOR_LOG_FILE):
+        return []
+    try:
+        with open(CHILD_MONITOR_LOG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+    except Exception:
+        return []
+    return []
+
+
+def prune_child_monitor_logs(logs: list[dict]) -> list[dict]:
+    cutoff = datetime.now() - timedelta(seconds=CHILD_MONITOR_LOG_RETENTION_SECONDS)
+    kept = []
+    for item in logs:
+        created_at = item.get("created_at", "")
+        try:
+            created_dt = datetime.fromisoformat(created_at)
+        except (TypeError, ValueError):
+            created_dt = datetime.now()
+        if created_dt >= cutoff:
+            kept.append(item)
+    return kept[-CHILD_MONITOR_LOG_MAX_ITEMS:]
+
+
+def save_child_monitor_logs_sync(logs: list[dict]) -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    logs = prune_child_monitor_logs(logs)
+    with open(CHILD_MONITOR_LOG_FILE, "w", encoding="utf-8") as f:
+        json.dump(logs, f, ensure_ascii=False, indent=2)
+
+
+def list_child_monitor_logs_sync() -> list[dict]:
+    logs = prune_child_monitor_logs(load_child_monitor_logs_sync())
+    save_child_monitor_logs_sync(logs)
+    return logs
+
+
+async def append_child_monitor_log(entry: dict) -> dict:
+    log = {
+        "id": uuid.uuid4().hex,
+        "created_at": now_text(),
+        **entry,
+    }
+    async with child_accounts_lock:
+        logs = load_child_monitor_logs_sync()
+        logs.append(log)
+        save_child_monitor_logs_sync(logs)
+    return log
+
+
+def public_child_account(record: dict) -> dict:
+    hidden = dict(record)
+    for key in ("cookie", "access_token", "refresh_token", "email_password", "password"):
+        if hidden.get(key):
+            hidden[key] = "********"
+    return hidden
+
+
+def find_child_record(records: list[dict], child_id: str) -> dict | None:
+    return next((item for item in records if item.get("id") == child_id), None)
+
+
+async def list_child_accounts_raw() -> list[dict]:
+    async with child_accounts_lock:
+        return load_child_accounts_sync()
+
+
+async def save_child_accounts_raw(records: list[dict]) -> None:
+    async with child_accounts_lock:
+        save_child_accounts_sync(records)
+
+
+async def upsert_child_account(record: dict) -> dict:
+    async with child_accounts_lock:
+        records = load_child_accounts_sync()
+        email_key = (record.get("email") or "").strip().lower()
+        account_id = record.get("adobe_account_id", "")
+        existing = next(
+            (
+                item for item in records
+                if (item.get("email") or "").strip().lower() == email_key
+                and item.get("adobe_account_id", "") == account_id
+                and item.get("status") not in ("removed", "replaced")
+            ),
+            None,
+        )
+        if existing:
+            existing.update(record)
+            existing["updated_at"] = now_text()
+            saved = existing
+        else:
+            saved = {
+                "id": uuid.uuid4().hex,
+                "created_at": now_text(),
+                "updated_at": now_text(),
+                **record,
+            }
+            records.append(saved)
+        save_child_accounts_sync(records)
+        return saved
+
+
+async def update_child_account(child_id: str, **updates) -> dict | None:
+    async with child_accounts_lock:
+        records = load_child_accounts_sync()
+        record = find_child_record(records, child_id)
+        if not record:
+            return None
+        record.update(updates)
+        record["updated_at"] = now_text()
+        save_child_accounts_sync(records)
+        return record
+
+
+def child_cookie_payload(record: dict) -> dict:
+    return {
+        "name": record.get("email", ""),
+        "cookie": record.get("cookie", ""),
+    }
+
+
+def build_child_account_record(
+    *,
+    account: dict,
+    reserved: dict,
+    cookie_file: str,
+    cookie_data: dict,
+    task: Task | None,
+) -> dict:
+    credits = cookie_data.get("credits")
+    try:
+        credits_value = float(credits) if credits is not None else None
+    except (TypeError, ValueError):
+        credits_value = None
+    return {
+        "email": (reserved.get("email") or cookie_data.get("email") or "").strip(),
+        "password": reserved.get("password") or cookie_data.get("password", ""),
+        "email_password": reserved.get("password", ""),
+        "api_url": reserved.get("api_url", ""),
+        "client_id": reserved.get("client_id", ""),
+        "refresh_token": cookie_data.get("refresh_token") or reserved.get("refresh_token", ""),
+        "adobe_account_id": account.get("id", ""),
+        "adobe_account_email": account.get("email", ""),
+        "adobe_account_name": account.get("name", ""),
+        "org_id": account.get("organization_id", "") or account.get("org_id", ""),
+        "product_id": account.get("product_id", ""),
+        "product_name": account.get("product_name", ""),
+        "license_group_id": account.get("license_group_id", ""),
+        "member_id": reserved.get("_member_id", ""),
+        "cookie_file": cookie_file,
+        "cookie": cookie_data.get("cookie", ""),
+        "access_token": cookie_data.get("access_token", ""),
+        "user_id": cookie_data.get("user_id", ""),
+        "display_name": cookie_data.get("display_name", ""),
+        "expires_at": cookie_data.get("expires_at"),
+        "credits_available": credits_value,
+        "credits_updated_at": now_ts() if credits_value is not None else None,
+        "status": "active",
+        "external_pool_status": "pending",
+        "external_pool_error": "",
+        "last_checked_at": "",
+        "check_failures": 0,
+        "failure_reason": "",
+        "source_task_id": getattr(task, "id", None),
+    }
+
+
+async def create_child_account_from_cookie(
+    *,
+    account: dict,
+    reserved: dict,
+    cookie_file: str,
+    task: Task | None,
+) -> dict | None:
+    try:
+        with open(cookie_file, "r", encoding="utf-8") as f:
+            cookie_data = json.load(f)
+    except Exception as exc:
+        await task_manager.broadcast(f"[子账号池] ⚠️ 无法读取子账号 cookie 文件：{exc}")
+        return None
+    record = build_child_account_record(
+        account=account,
+        reserved=reserved,
+        cookie_file=cookie_file,
+        cookie_data=cookie_data,
+        task=task,
+    )
+    saved = await upsert_child_account(record)
+    await task_manager.broadcast(f"[子账号池] ✅ 已保存 {saved.get('email')} 到内部子账号池")
+    return saved
+
+
+def child_needs_token_refresh(record: dict) -> bool:
+    expires_at = record.get("expires_at")
+    try:
+        return bool(expires_at) and int(expires_at) <= now_ts() + 120
+    except (TypeError, ValueError):
+        return False
+
+
+async def refresh_child_firefly_login(record: dict, prefix: str = "[子账号池]") -> dict:
+    email = record.get("email", "")
+    refresh_token = record.get("refresh_token", "")
+    client_id = record.get("client_id", "")
+    mail_url = record.get("api_url", "")
+    if not mail_url and not (refresh_token and client_id):
+        raise RuntimeError("缺少子号取件配置，无法重新协议登录刷新 token")
+
+    loop = asyncio.get_running_loop()
+
+    def log(message: str) -> None:
+        loop.call_soon_threadsafe(
+            asyncio.create_task,
+            task_manager.broadcast(f"{prefix} {email} {message}"),
+        )
+
+    result = await asyncio.to_thread(
+        firefly_protocol.register_account,
+        email=email,
+        refresh_token=refresh_token,
+        client_id=client_id,
+        mail_url=mail_url,
+        proxy_url=adobe_proxy_url(),
+        otp_timeout=180,
+        log=log,
+    )
+    rotated = result.get("rotated_refresh_token") or ""
+    updates = {
+        "access_token": result.get("access_token", ""),
+        "cookie": result.get("cookie", ""),
+        "user_id": result.get("user_id", ""),
+        "display_name": result.get("display_name", ""),
+        "expires_at": result.get("expires_at"),
+        "failure_reason": "",
+    }
+    if rotated:
+        updates["refresh_token"] = rotated
+        await update_self_email_refresh_token(email, rotated)
+    credits = result.get("credits")
+    if credits is not None:
+        updates["credits_available"] = float(credits)
+        updates["credits_updated_at"] = now_ts()
+    updated = await update_child_account(record.get("id", ""), **updates)
+    return updated or {**record, **updates}
+
+
+async def refresh_child_credits(child_id: str, *, allow_relogin: bool = True) -> dict:
+    records = await list_child_accounts_raw()
+    record = find_child_record(records, child_id)
+    if not record:
+        raise RuntimeError("子账号不存在")
+    if record.get("status") not in ("active", "check_failed"):
+        raise RuntimeError("该子账号不是可检测状态")
+
+    working = record
+    if allow_relogin and child_needs_token_refresh(working):
+        working = await refresh_child_firefly_login(working)
+
+    credits = await asyncio.to_thread(
+        firefly_protocol.fetch_credits,
+        working.get("access_token", ""),
+        working.get("user_id", ""),
+        adobe_proxy_url(),
+    )
+    if credits is None and allow_relogin:
+        working = await refresh_child_firefly_login(working)
+        credits = await asyncio.to_thread(
+            firefly_protocol.fetch_credits,
+            working.get("access_token", ""),
+            working.get("user_id", ""),
+            adobe_proxy_url(),
+        )
+
+    if credits is None:
+        failures = int(working.get("check_failures", 0) or 0) + 1
+        status = "check_failed" if failures >= int(config.get("child_monitor_max_failures", 3) or 3) else working.get("status", "active")
+        updated = await update_child_account(
+            child_id,
+            check_failures=failures,
+            status=status,
+            last_checked_at=now_text(),
+            failure_reason="积分查询失败",
+        )
+        raise RuntimeError((updated or working).get("failure_reason", "积分查询失败"))
+
+    updated = await update_child_account(
+        child_id,
+        credits_available=float(credits),
+        credits_updated_at=now_ts(),
+        check_failures=0,
+        status="active",
+        last_checked_at=now_text(),
+        failure_reason="",
+    )
+    return updated or working
+
+
+def monitored_token_pools() -> list[dict]:
+    pools = [pool for pool in normalize_token_pools() if pool.get("enabled")]
+    selected = set(str(pool_id) for pool_id in config.get("child_monitor_pool_ids", []) if str(pool_id))
+    if selected:
+        pools = [pool for pool in pools if pool.get("id") in selected]
+    return pools
+
+
+async def fetch_exhausted_emails_from_pool(pool: dict) -> tuple[set[str], str]:
+    url = build_token_pool_exhausted_url(pool.get("site", ""))
+    key = (pool.get("key") or "").strip()
+    if not url or not key:
+        return set(), "Token 池地址或密钥未配置"
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "X-Token-Pool-Key": key,
+        "Accept": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url, headers=headers)
+        if response.status_code < 200 or response.status_code >= 300:
+            return set(), f"HTTP {response.status_code} {(response.text or '')[:160]}"
+        data = response.json()
+        emails = data.get("emails") if isinstance(data, dict) else []
+        if not isinstance(emails, list):
+            return set(), "响应缺少 emails 数组"
+        return {
+            str(email).strip().lower()
+            for email in emails
+            if str(email or "").strip()
+        }, ""
+    except Exception as exc:
+        return set(), str(exc)
+
+
+async def fetch_exhausted_email_index() -> tuple[dict[str, set[str]], dict[str, str], list[dict]]:
+    exhausted: dict[str, set[str]] = {}
+    errors: dict[str, str] = {}
+    pool_results: list[dict] = []
+    for pool in monitored_token_pools():
+        pool_id = pool.get("id") or ""
+        emails, error = await fetch_exhausted_emails_from_pool(pool)
+        if error:
+            errors[pool_id] = error
+            pool_results.append({
+                "pool_id": pool_id,
+                "pool_name": pool.get("name") or "Token 池",
+                "site": pool.get("site", ""),
+                "ok": False,
+                "count": 0,
+                "error": error,
+            })
+            continue
+        pool_results.append({
+            "pool_id": pool_id,
+            "pool_name": pool.get("name") or "Token 池",
+            "site": pool.get("site", ""),
+            "ok": True,
+            "count": len(emails),
+            "error": "",
+        })
+        for email in emails:
+            exhausted.setdefault(email, set()).add(pool_id)
+    return exhausted, errors, pool_results
+
+
+async def delete_exhausted_email_from_pool(pool: dict, email: str) -> dict:
+    url = build_token_pool_exhausted_url(pool.get("site", ""))
+    key = (pool.get("key") or "").strip()
+    pool_id = pool.get("id") or ""
+    pool_name = pool.get("name") or "Token 池"
+    result = {
+        "pool_id": pool_id,
+        "pool_name": pool_name,
+        "ok": False,
+        "status": "failed",
+        "deleted_count": 0,
+        "missing_emails": [],
+        "error": "",
+    }
+    if not url or not key:
+        result["error"] = "Token 池地址或密钥未配置"
+        return result
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "X-Token-Pool-Key": key,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.request("DELETE", url, json={"emails": [email]}, headers=headers)
+        try:
+            data = response.json() if response.content else {}
+        except ValueError:
+            data = {}
+        if response.status_code < 200 or response.status_code >= 300:
+            result["error"] = f"HTTP {response.status_code} {(response.text or '')[:160]}"
+            return result
+        deleted_count = int(data.get("deleted_count", 0) or 0) if isinstance(data, dict) else 0
+        result.update({
+            "ok": True,
+            "status": data.get("status", "ok") if isinstance(data, dict) else "ok",
+            "deleted_count": deleted_count,
+            "missing_emails": data.get("missing_emails", []) if isinstance(data, dict) else [],
+            "token_count": data.get("token_count", 0) if isinstance(data, dict) else 0,
+        })
+        return result
+    except Exception as exc:
+        result["error"] = str(exc)
+        return result
+
+
+async def cleanup_replaced_child_token(child_id: str, prefix: str = "[子账号池]") -> list[dict]:
+    records = await list_child_accounts_raw()
+    record = find_child_record(records, child_id)
+    if not record:
+        return []
+    email = (record.get("email") or "").strip()
+    pool_ids = [str(pool_id) for pool_id in (record.get("exhausted_pool_ids") or []) if str(pool_id)]
+    if not email or not pool_ids:
+        await update_child_account(
+            child_id,
+            exhausted_token_delete_status="skipped",
+            exhausted_token_delete_error="未记录耗尽来源池，跳过号池删除",
+        )
+        return []
+
+    selected = set(pool_ids)
+    pools = [pool for pool in monitored_token_pools() if pool.get("id") in selected]
+    if not pools:
+        await update_child_account(
+            child_id,
+            exhausted_token_delete_status="skipped",
+            exhausted_token_delete_error="耗尽来源池未启用或不存在",
+        )
+        return []
+
+    results = []
+    for pool in pools:
+        pool_name = pool.get("name") or "Token 池"
+        await task_manager.broadcast(f"{prefix} 清理旧耗尽 token：{pool_name} / {email}")
+        result = await delete_exhausted_email_from_pool(pool, email)
+        results.append(result)
+        if result.get("ok"):
+            await task_manager.broadcast(
+                f"{prefix} ✅ 已从 {pool_name} 删除旧耗尽 token：{email}，删除 {result.get('deleted_count', 0)} 个"
+            )
+        else:
+            await task_manager.broadcast(
+                f"{prefix} ⚠️ {pool_name} 删除旧耗尽 token 失败：{result.get('error', '')}"
+            )
+
+    failed = [item for item in results if not item.get("ok")]
+    deleted_count = sum(int(item.get("deleted_count", 0) or 0) for item in results if item.get("ok"))
+    await update_child_account(
+        child_id,
+        exhausted_token_deleted_at=now_text(),
+        exhausted_token_delete_status="failed" if failed else "deleted" if deleted_count else "not_found",
+        exhausted_token_delete_error="；".join(
+            f"{item.get('pool_name')}: {item.get('error', '')}" for item in failed
+        ),
+        exhausted_token_delete_results=results,
+        exhausted_token_deleted_count=deleted_count,
+    )
+    return results
+
+
+async def check_child_exhausted(child_id: str) -> dict:
+    records = await list_child_accounts_raw()
+    record = find_child_record(records, child_id)
+    if not record:
+        raise RuntimeError("子账号不存在")
+    exhausted, errors, _pool_results = await fetch_exhausted_email_index()
+    email = (record.get("email") or "").strip().lower()
+    pool_ids = sorted(exhausted.get(email, set()))
+    updates = {
+        "last_checked_at": now_text(),
+        "exhausted_pool_ids": pool_ids,
+        "exhausted_detected_at": now_text() if pool_ids else record.get("exhausted_detected_at", ""),
+        "failure_reason": "" if not errors else "部分 Token 池查询失败",
+    }
+    if pool_ids and record.get("status") == "active":
+        updates["status"] = "exhausted"
+    elif not pool_ids and record.get("status") in ("exhausted", "check_failed"):
+        updates["status"] = "active"
+    updated = await update_child_account(child_id, **updates)
+    return updated or record
+
+
+async def remove_child_member(record: dict, reason: str = "手动移除") -> dict:
+    account = find_adobe_account(record.get("adobe_account_id", ""))
+    if not account:
+        raise RuntimeError("所属母号不存在")
+    email = record.get("email", "")
+    if not email:
+        raise RuntimeError("子账号邮箱为空")
+    async with adobe_account_lock:
+        results = await remove_adobe_members(account, [email])
+    result = results[0] if results else {"ok": False, "message": "移除接口无返回"}
+    if not result.get("ok"):
+        raise RuntimeError(result.get("message") or "移除成员失败")
+    updated = await update_child_account(
+        record.get("id", ""),
+        status="removed",
+        removed_at=now_text(),
+        failure_reason="",
+        replacement_reason=reason,
+    )
+    return updated or record
+
+
+async def create_replacement_task(record: dict, reason: str = "自动换号") -> Task:
+    account_id = record.get("adobe_account_id", "")
+    if not find_adobe_account(account_id):
+        raise RuntimeError("所属母号不存在，无法补号")
+    task = task_manager.create_task(
+        1,
+        1,
+        False,
+        f"子号补号: {record.get('email', '')}",
+        "self",
+        "invite",
+        [account_id],
+        False,
+    )
+    task.replacement_child_id = record.get("id", "")
+    await task_manager.queue.put(task)
+    asyncio.create_task(task_manager.start_queue_worker())
+    await task_manager.broadcast(f"[子账号池] 已创建补号任务 #{task.id}：{reason}")
+    await task_manager.broadcast("__STATE_UPDATE__")
+    return task
+
+
+async def replace_child_account(child_id: str, reason: str = "积分低于阈值") -> dict:
+    records = await list_child_accounts_raw()
+    record = find_child_record(records, child_id)
+    if not record:
+        raise RuntimeError("子账号不存在")
+    account_id = record.get("adobe_account_id", "")
+    lock = child_replacement_locks.setdefault(account_id, asyncio.Lock())
+    async with lock:
+        records = await list_child_accounts_raw()
+        record = find_child_record(records, child_id)
+        if not record:
+            raise RuntimeError("子账号不存在")
+        if record.get("status") in ("replacing", "replaced"):
+            return record
+        if record.get("status") == "removed":
+            task = await create_replacement_task(record, reason)
+            updated = await update_child_account(
+                child_id,
+                replacement_task_id=task.id,
+                failure_reason="",
+            )
+            return updated or record
+        await update_child_account(child_id, status="replacing", failure_reason="", replacement_reason=reason)
+        try:
+            removed = await remove_child_member(record, reason)
+            task = await create_replacement_task(removed, reason)
+            updated = await update_child_account(
+                child_id,
+                status="removed",
+                replacement_task_id=task.id,
+                replaced_at="",
+                failure_reason="",
+            )
+            return updated or removed
+        except Exception as exc:
+            updated = await update_child_account(child_id, status="active", failure_reason=f"换号失败：{exc}")
+            raise RuntimeError(str(exc)) from exc
+
+
+async def monitor_child_accounts_once(source: str = "manual") -> dict:
+    records = await list_child_accounts_raw()
+    active = [record for record in records if record.get("status") in ("active", "exhausted", "check_failed")]
+    exhausted, errors, pool_results = await fetch_exhausted_email_index()
+    checked = len(active)
+    matched = 0
+    replaced = 0
+    failed = 0
+    matched_accounts = []
+    replacements = []
+    failed_accounts = []
+    for record in active:
+        email = (record.get("email") or "").strip().lower()
+        pool_ids = sorted(exhausted.get(email, set()))
+        try:
+            if pool_ids:
+                matched += 1
+                matched_accounts.append({
+                    "child_id": record.get("id", ""),
+                    "email": record.get("email", ""),
+                    "adobe_account_email": record.get("adobe_account_email", ""),
+                    "pool_ids": pool_ids,
+                })
+                await update_child_account(
+                    record.get("id", ""),
+                    status="exhausted",
+                    exhausted_pool_ids=pool_ids,
+                    exhausted_detected_at=now_text(),
+                    last_checked_at=now_text(),
+                    failure_reason="",
+                )
+                updated = await replace_child_account(record.get("id", ""), f"Token 池标记耗尽：{', '.join(pool_ids)}")
+                replacements.append({
+                    "child_id": record.get("id", ""),
+                    "email": record.get("email", ""),
+                    "replacement_task_id": updated.get("replacement_task_id"),
+                    "status": updated.get("status", ""),
+                })
+                replaced += 1
+            else:
+                updates = {
+                    "last_checked_at": now_text(),
+                    "exhausted_pool_ids": [],
+                }
+                if record.get("status") in ("exhausted", "check_failed"):
+                    updates["status"] = "active"
+                await update_child_account(record.get("id", ""), **updates)
+        except Exception as exc:
+            failed += 1
+            failed_accounts.append({
+                "child_id": record.get("id", ""),
+                "email": record.get("email", ""),
+                "error": str(exc),
+            })
+    summary = {
+        "checked": checked,
+        "matched": matched,
+        "refreshed": matched,
+        "replaced": replaced,
+        "failed": failed,
+        "pool_errors": errors,
+        "pool_results": pool_results,
+        "matched_accounts": matched_accounts,
+        "replacements": replacements,
+        "failed_accounts": failed_accounts,
+    }
+    await append_child_monitor_log({
+        "source": source,
+        **summary,
+    })
+    return summary
+
+
+async def child_monitor_loop():
+    while True:
+        interval = max(60, int(config.get("child_monitor_interval", 600) or 600))
+        try:
+            if config.get("child_monitor_enabled"):
+                summary = await monitor_child_accounts_once("auto")
+                if summary["checked"]:
+                    await task_manager.broadcast(
+                        "[子账号池] 监测完成："
+                        f"检测 {summary['checked']}，命中 {summary['matched']}，"
+                        f"换号 {summary['replaced']}，失败 {summary['failed']}"
+                    )
+        except Exception as exc:
+            await append_child_monitor_log({
+                "source": "auto",
+                "checked": 0,
+                "matched": 0,
+                "refreshed": 0,
+                "replaced": 0,
+                "failed": 1,
+                "pool_errors": {},
+                "pool_results": [],
+                "matched_accounts": [],
+                "replacements": [],
+                "failed_accounts": [{"error": str(exc)}],
+            })
+            await task_manager.broadcast(f"[子账号池] 监测异常：{exc}")
+        await asyncio.sleep(interval)
+
+
+def ensure_child_monitor_started() -> None:
+    global child_monitor_task
+    if child_monitor_task and not child_monitor_task.done():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    child_monitor_task = loop.create_task(child_monitor_loop())
 
 
 def write_protocol_cookie_result(cookie_id: str, email: str, password: str, record: dict) -> str:
@@ -2605,14 +3502,42 @@ async def run_invite_task(task: Task):
                         task.completed += 1
                         task.result_files.append(cookie_file)
                         account_success += 1
+                        child_record = await create_child_account_from_cookie(
+                            account=account,
+                            reserved=reserved,
+                            cookie_file=cookie_file,
+                            task=task,
+                        )
+                        replacement_child_id = getattr(task, "replacement_child_id", "")
+                        if replacement_child_id and child_record:
+                            await update_child_account(
+                                replacement_child_id,
+                                status="replaced",
+                                replaced_at=now_text(),
+                                replacement_child_id=child_record.get("id", ""),
+                            )
                         await task_manager.broadcast(
                             f"{worker_prefix} ✅ [{email}] 子任务完成，已导出 Firefly cookie/token；"
                             f"累计成功 {account_success}/{target_success}"
                         )
-                        if await import_cookie_to_token_pool(cookie_file, worker_prefix):
+                        external_enabled = bool(config.get("token_pool_enabled"))
+                        external_ok = await import_cookie_to_token_pool(cookie_file, worker_prefix)
+                        if child_record:
+                            await update_child_account(
+                                child_record.get("id", ""),
+                                external_pool_status=(
+                                    "imported" if external_enabled and external_ok
+                                    else "skipped" if not external_enabled
+                                    else "failed"
+                                ),
+                                external_pool_error="" if external_ok else "外部 Token 池导入失败",
+                            )
+                        if external_ok:
                             if config.get("token_pool_enabled"):
                                 task.token_pool_imported += 1
                                 task.token_pool_imported_files.append(cookie_file)
+                        if replacement_child_id and child_record:
+                            await cleanup_replaced_child_token(replacement_child_id, worker_prefix)
                         await task_manager.broadcast("__STATE_UPDATE__")
                         return True
                     except Exception as exc:
@@ -2686,6 +3611,13 @@ async def run_task(task: Task):
     elif task.status != "stopped":
         task.status = "completed"
         await task_manager.broadcast(f"🏁 任务 #{task.id} 结束 (成功 {task.completed}, 失败 {task.failed})")
+    replacement_child_id = getattr(task, "replacement_child_id", "")
+    if replacement_child_id and task.completed <= 0:
+        await update_child_account(
+            replacement_child_id,
+            status="removed",
+            failure_reason=f"补号任务 #{task.id} 未成功",
+        )
     await task_manager.broadcast("__STATE_UPDATE__")
 
 # ─── WebSocket ───
@@ -2857,6 +3789,7 @@ app.mount("/", StaticFiles(directory="static", html=True), name="static")
 @app.on_event("startup")
 async def cleanup_profiles_on_startup():
     cleanup_stale_profiles(collect_active_profile_paths(task_manager.tasks))
+    ensure_child_monitor_started()
 
 if __name__ == "__main__":
     import uvicorn

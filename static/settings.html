@@ -19,6 +19,7 @@
                     <a href="/" class="nav-link">🚀 任务</a>
                     <a href="/records.html" class="nav-link">📋 记录</a>
                     <a href="/self-emails.html" class="nav-link">📮 自备邮箱</a>
+                    <a href="/child-accounts.html" class="nav-link">🧩 子账号池</a>
                     <a href="/accounts.html" class="nav-link">👤 账号</a>
                     <a href="/settings.html" class="nav-link active">⚙️ 设置</a>
                 </nav>
@@ -138,6 +139,25 @@
                 </div>
                 <div class="status-msg" id="token-pool-status"></div>
             </div>
+
+            <div class="card glass-card">
+                <h2><span class="icon">📈</span> 子账号池监测</h2>
+                <p class="card-desc">开启后定时查询选中 Token 池的已耗尽账号；命中内部子账号池后，先移除旧子号，再为所属母号自动补 1 个新子号。</p>
+                <label class="proxy-toggle-row">
+                    <input type="checkbox" id="child_monitor_enabled">
+                    <span>启用子账号池监测</span>
+                </label>
+                <div class="form-group">
+                    <label>监测 Token 池</label>
+                    <div class="monitor-pool-list" id="child-monitor-pool-list"></div>
+                </div>
+                <div class="form-group">
+                    <label>监测间隔(秒)</label>
+                    <input type="number" id="child_monitor_interval" value="600" min="60" step="60">
+                </div>
+                <button class="btn action" id="save-child-monitor-btn">保存监测配置</button>
+                <div class="status-msg" id="child-monitor-status"></div>
+            </div>
         </div>
     </div>
     <script>
@@ -155,12 +175,17 @@
         const tokenPoolEnabledInput = document.getElementById("token_pool_enabled");
         const tokenPoolList = document.getElementById("token-pool-list");
         const addTokenPoolBtn = document.getElementById("add-token-pool-btn");
+        const childMonitorEnabledInput = document.getElementById("child_monitor_enabled");
+        const childMonitorIntervalInput = document.getElementById("child_monitor_interval");
+        const childMonitorPoolList = document.getElementById("child-monitor-pool-list");
         const configStatus = document.getElementById("config-status");
         const captchaStatus = document.getElementById("captcha-status");
         const proxyStatus = document.getElementById("proxy-status");
         const adobeProxyStatus = document.getElementById("adobe-proxy-status");
         const tokenPoolStatus = document.getElementById("token-pool-status");
+        const childMonitorStatus = document.getElementById("child-monitor-status");
         let tokenPools = [];
+        let childMonitorPoolIds = [];
         const visibleTokenPoolKeys = new Set();
 
         function tokenPoolId() {
@@ -268,6 +293,32 @@
                     </div>
                 `;
             }).join("");
+            renderMonitorPools();
+        }
+
+        function renderMonitorPools() {
+            if (!childMonitorPoolList) return;
+            const usablePools = tokenPools.filter(pool => pool.site && pool.key);
+            if (!usablePools.length) {
+                childMonitorPoolList.innerHTML = '<div class="empty-hint">请先在上方配置 Token 池</div>';
+                return;
+            }
+            childMonitorPoolList.innerHTML = usablePools.map(pool => {
+                const checked = !childMonitorPoolIds.length || childMonitorPoolIds.includes(pool.id);
+                return `
+                    <label class="monitor-pool-option">
+                        <input type="checkbox" value="${escapeHtml(pool.id)}" ${checked ? "checked" : ""}>
+                        <span>
+                            <strong>${escapeHtml(pool.name || "Token 池")}</strong>
+                            <small>${escapeHtml(pool.site || "")}</small>
+                        </span>
+                    </label>
+                `;
+            }).join("");
+        }
+
+        function selectedMonitorPoolIds() {
+            return Array.from(childMonitorPoolList.querySelectorAll("input[type='checkbox']:checked")).map(input => input.value);
         }
 
         function syncTokenPoolFromCard(card) {
@@ -312,6 +363,9 @@
             adobeProxySchemeInput.value = data.adobe_proxy_scheme || "http";
             adobeProxyUrlInput.value = data.adobe_proxy_url || "";
             tokenPoolEnabledInput.checked = Boolean(data.token_pool_enabled);
+            childMonitorEnabledInput.checked = Boolean(data.child_monitor_enabled);
+            childMonitorIntervalInput.value = data.child_monitor_interval || 600;
+            childMonitorPoolIds = Array.isArray(data.child_monitor_pool_ids) ? data.child_monitor_pool_ids : [];
             normalizeTokenPools(data);
             renderTokenPools();
         });
@@ -341,6 +395,9 @@
                     token_pool_site: (tokenPools.find(pool => pool.enabled) || tokenPools[0] || {}).site || "",
                     token_pool_key: (tokenPools.find(pool => pool.enabled) || tokenPools[0] || {}).key || "",
                     token_pools: tokenPoolPayload(),
+                    child_monitor_enabled: childMonitorEnabledInput.checked,
+                    child_monitor_interval: Number(childMonitorIntervalInput.value || 600),
+                    child_monitor_pool_ids: selectedMonitorPoolIds(),
                 })
             }).then(r => r.json());
         }
@@ -472,6 +529,7 @@
             const card = event.target.closest(".token-pool-card");
             if (!card) return;
             syncTokenPoolFromCard(card);
+            renderMonitorPools();
         });
 
         tokenPoolList.addEventListener("change", (event) => {
@@ -518,6 +576,10 @@
             renderTokenPools();
         });
 
+        childMonitorPoolList.addEventListener("change", () => {
+            childMonitorPoolIds = selectedMonitorPoolIds();
+        });
+
         document.getElementById("save-token-pool-btn").addEventListener("click", () => {
             const payloadPools = tokenPoolPayload();
             const enabledPools = payloadPools.filter(pool => pool.enabled);
@@ -529,6 +591,21 @@
             saveAllConfig().then(() => {
                 showStatus(tokenPoolStatus, "✅ 配置已保存", true);
                 setTimeout(() => tokenPoolStatus.textContent = "", 2000);
+            });
+        });
+
+        document.getElementById("save-child-monitor-btn").addEventListener("click", () => {
+            if (Number(childMonitorIntervalInput.value || 0) < 60) {
+                showStatus(childMonitorStatus, "监测间隔不能低于 60 秒", false);
+                return;
+            }
+            if (childMonitorEnabledInput.checked && selectedMonitorPoolIds().length === 0) {
+                showStatus(childMonitorStatus, "请至少选择一个 Token 池", false);
+                return;
+            }
+            saveAllConfig().then(() => {
+                showStatus(childMonitorStatus, "✅ 监测配置已保存", true);
+                setTimeout(() => childMonitorStatus.textContent = "", 2000);
             });
         });
     });
