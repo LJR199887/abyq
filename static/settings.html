@@ -19,6 +19,7 @@
                     <a href="/" class="nav-link">🚀 任务</a>
                     <a href="/records.html" class="nav-link">📋 记录</a>
                     <a href="/self-emails.html" class="nav-link">📮 自备邮箱</a>
+                    <a href="/child-accounts.html" class="nav-link">🧩 子账号池</a>
                     <a href="/accounts.html" class="nav-link">👤 账号</a>
                     <a href="/settings.html" class="nav-link active">⚙️ 设置</a>
                 </nav>
@@ -125,22 +126,37 @@
 
             <!-- Token Pool Config -->
             <div class="card glass-card">
-                <h2><span class="icon">🔁</span> 自动入池配置</h2>
-                <p class="card-desc">开启后，注册成功并导出完整 7 项 Cookie 后，会自动导入到指定 adobe2api Token 池。</p>
+                <h2><span class="icon">🔌</span> 自动入池配置</h2>
+                <p class="card-desc">注册成功后，Cookie 会自动导入已启用的 Token 池；某个池失败时会自动尝试下一个池。</p>
                 <label class="proxy-toggle-row">
                     <input type="checkbox" id="token_pool_enabled">
-                    <span>开启自动入池模式</span>
+                    <span>启用自动入池</span>
+                </label>
+                <div class="token-pool-list" id="token-pool-list"></div>
+                <div class="token-pool-footer">
+                    <button class="btn secondary" id="add-token-pool-btn" type="button">+ 添加 Token 池</button>
+                    <button class="btn action" id="save-token-pool-btn">保存入池配置</button>
+                </div>
+                <div class="status-msg" id="token-pool-status"></div>
+            </div>
+
+            <div class="card glass-card">
+                <h2><span class="icon">📈</span> 子账号池监测</h2>
+                <p class="card-desc">开启后定时查询选中 Token 池的已耗尽账号；命中内部子账号池后，先移除旧子号，再为所属母号自动补 1 个新子号。</p>
+                <label class="proxy-toggle-row">
+                    <input type="checkbox" id="child_monitor_enabled">
+                    <span>启用子账号池监测</span>
                 </label>
                 <div class="form-group">
-                    <label>网站地址</label>
-                    <input type="text" id="token_pool_site" placeholder="http://127.0.0.1:6001">
+                    <label>监测 Token 池</label>
+                    <div class="monitor-pool-list" id="child-monitor-pool-list"></div>
                 </div>
                 <div class="form-group">
-                    <label>Token 池密钥</label>
-                    <input type="password" id="token_pool_key" placeholder="automation_import_key">
+                    <label>监测间隔(秒)</label>
+                    <input type="number" id="child_monitor_interval" value="600" min="60" step="60">
                 </div>
-                <button class="btn primary" id="save-token-pool-btn">保存配置</button>
-                <div class="status-msg" id="token-pool-status"></div>
+                <button class="btn action" id="save-child-monitor-btn">保存监测配置</button>
+                <div class="status-msg" id="child-monitor-status"></div>
             </div>
         </div>
     </div>
@@ -157,13 +173,181 @@
         const adobeProxySchemeInput = document.getElementById("adobe_proxy_scheme");
         const adobeProxyUrlInput = document.getElementById("adobe_proxy_url");
         const tokenPoolEnabledInput = document.getElementById("token_pool_enabled");
-        const tokenPoolSiteInput = document.getElementById("token_pool_site");
-        const tokenPoolKeyInput = document.getElementById("token_pool_key");
+        const tokenPoolList = document.getElementById("token-pool-list");
+        const addTokenPoolBtn = document.getElementById("add-token-pool-btn");
+        const childMonitorEnabledInput = document.getElementById("child_monitor_enabled");
+        const childMonitorIntervalInput = document.getElementById("child_monitor_interval");
+        const childMonitorPoolList = document.getElementById("child-monitor-pool-list");
         const configStatus = document.getElementById("config-status");
         const captchaStatus = document.getElementById("captcha-status");
         const proxyStatus = document.getElementById("proxy-status");
         const adobeProxyStatus = document.getElementById("adobe-proxy-status");
         const tokenPoolStatus = document.getElementById("token-pool-status");
+        const childMonitorStatus = document.getElementById("child-monitor-status");
+        let tokenPools = [];
+        let childMonitorPoolIds = [];
+        const visibleTokenPoolKeys = new Set();
+
+        function tokenPoolId() {
+            if (window.crypto && typeof window.crypto.randomUUID === "function") {
+                return window.crypto.randomUUID();
+            }
+            return `pool-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        }
+
+        function createTokenPool(index, expanded = false) {
+            return {
+                id: tokenPoolId(),
+                name: `${index || tokenPools.length + 1}号池`,
+                site: "",
+                key: "",
+                enabled: true,
+                success: 0,
+                failed: 0,
+                expanded,
+            };
+        }
+
+        function escapeHtml(value) {
+            return String(value || "")
+                .replaceAll("&", "&amp;")
+                .replaceAll("<", "&lt;")
+                .replaceAll(">", "&gt;")
+                .replaceAll('"', "&quot;")
+                .replaceAll("'", "&#39;");
+        }
+
+        function normalizeTokenPools(data) {
+            let pools = Array.isArray(data.token_pools) ? data.token_pools : [];
+            if (!pools.length && (data.token_pool_site || data.token_pool_key)) {
+                pools = [{
+                    id: "legacy",
+                    name: "1号池",
+                    site: data.token_pool_site || "",
+                    key: data.token_pool_key || "",
+                    enabled: true,
+                    success: 0,
+                    failed: 0,
+                }];
+            }
+            tokenPools = pools.map((pool, index) => ({
+                id: pool.id || tokenPoolId(),
+                name: pool.name || `${index + 1}号池`,
+                site: pool.site || pool.url || "",
+                key: pool.key || pool.token_pool_key || "",
+                enabled: pool.enabled !== false,
+                success: Number(pool.success || 0),
+                failed: Number(pool.failed || 0),
+                expanded: false,
+            }));
+            if (!tokenPools.length) {
+                tokenPools = [createTokenPool(1)];
+            }
+        }
+
+        function renderTokenPools() {
+            tokenPoolList.innerHTML = tokenPools.map((pool, index) => {
+                const expanded = pool.expanded;
+                const keyVisible = visibleTokenPoolKeys.has(pool.id);
+                const status = pool.enabled ? "已启用" : "已停用";
+                const statusClass = pool.enabled ? "enabled" : "disabled";
+                return `
+                    <div class="token-pool-card ${expanded ? "expanded" : ""}" data-pool-id="${escapeHtml(pool.id)}">
+                        <div class="token-pool-summary">
+                            <div>
+                                <div class="token-pool-title">
+                                    <strong>${escapeHtml(pool.name || `${index + 1}号池`)}</strong>
+                                    <span class="token-pool-state ${statusClass}">${status}</span>
+                                    <span>成功 ${pool.success || 0} / 失败 ${pool.failed || 0}</span>
+                                </div>
+                                <div class="token-pool-url">${escapeHtml(pool.site || "未填写 API 地址")}</div>
+                            </div>
+                            <div class="token-pool-actions">
+                                <label class="token-pool-check">
+                                    <input type="checkbox" class="pool-enabled" ${pool.enabled ? "checked" : ""}>
+                                    <span>启用</span>
+                                </label>
+                                <button class="btn secondary token-pool-toggle" type="button">${expanded ? "收起" : "展开"}</button>
+                            </div>
+                        </div>
+                        ${expanded ? `
+                            <div class="token-pool-detail">
+                                <div class="form-group">
+                                    <label>名称</label>
+                                    <input type="text" class="pool-name" value="${escapeHtml(pool.name || "")}" placeholder="${index + 1}号池">
+                                </div>
+                                <div class="form-group">
+                                    <label>API 地址</label>
+                                    <input type="text" class="pool-site" value="${escapeHtml(pool.site || "")}" placeholder="http://127.0.0.1:6001">
+                                </div>
+                                <div class="form-group">
+                                    <label>导入密钥</label>
+                                    <div class="token-pool-key-row">
+                                        <input type="${keyVisible ? "text" : "password"}" class="pool-key" value="${escapeHtml(pool.key || "")}" placeholder="automation_import_key">
+                                        <button class="btn secondary token-pool-key-toggle" type="button">${keyVisible ? "隐藏" : "显示"}</button>
+                                    </div>
+                                </div>
+                                <button class="btn danger-action token-pool-delete" type="button">删除此池</button>
+                            </div>
+                        ` : ""}
+                    </div>
+                `;
+            }).join("");
+            renderMonitorPools();
+        }
+
+        function renderMonitorPools() {
+            if (!childMonitorPoolList) return;
+            const usablePools = tokenPools.filter(pool => pool.site && pool.key);
+            if (!usablePools.length) {
+                childMonitorPoolList.innerHTML = '<div class="empty-hint">请先在上方配置 Token 池</div>';
+                return;
+            }
+            childMonitorPoolList.innerHTML = usablePools.map(pool => {
+                const checked = !childMonitorPoolIds.length || childMonitorPoolIds.includes(pool.id);
+                return `
+                    <label class="monitor-pool-option">
+                        <input type="checkbox" value="${escapeHtml(pool.id)}" ${checked ? "checked" : ""}>
+                        <span>
+                            <strong>${escapeHtml(pool.name || "Token 池")}</strong>
+                            <small>${escapeHtml(pool.site || "")}</small>
+                        </span>
+                    </label>
+                `;
+            }).join("");
+        }
+
+        function selectedMonitorPoolIds() {
+            return Array.from(childMonitorPoolList.querySelectorAll("input[type='checkbox']:checked")).map(input => input.value);
+        }
+
+        function syncTokenPoolFromCard(card) {
+            const pool = tokenPools.find(item => item.id === card.dataset.poolId);
+            if (!pool) return;
+            const enabled = card.querySelector(".pool-enabled");
+            const name = card.querySelector(".pool-name");
+            const site = card.querySelector(".pool-site");
+            const key = card.querySelector(".pool-key");
+            if (enabled) pool.enabled = enabled.checked;
+            if (name) pool.name = name.value.trim();
+            if (site) pool.site = site.value.trim();
+            if (key) pool.key = key.value.trim();
+        }
+
+        function tokenPoolPayload() {
+            return tokenPools.map((pool, index) => ({
+                id: pool.id,
+                name: pool.name || `${index + 1}号池`,
+                site: pool.site,
+                key: pool.key,
+                enabled: pool.enabled,
+                success: pool.success || 0,
+                failed: pool.failed || 0,
+            }));
+        }
+
+        normalizeTokenPools({});
+        renderTokenPools();
 
         // Load config
         fetch("/api/config").then(r => r.json()).then(data => {
@@ -179,8 +363,11 @@
             adobeProxySchemeInput.value = data.adobe_proxy_scheme || "http";
             adobeProxyUrlInput.value = data.adobe_proxy_url || "";
             tokenPoolEnabledInput.checked = Boolean(data.token_pool_enabled);
-            tokenPoolSiteInput.value = data.token_pool_site || "";
-            tokenPoolKeyInput.value = data.token_pool_key || "";
+            childMonitorEnabledInput.checked = Boolean(data.child_monitor_enabled);
+            childMonitorIntervalInput.value = data.child_monitor_interval || 600;
+            childMonitorPoolIds = Array.isArray(data.child_monitor_pool_ids) ? data.child_monitor_pool_ids : [];
+            normalizeTokenPools(data);
+            renderTokenPools();
         });
 
         function showStatus(el, msg, ok) {
@@ -205,8 +392,12 @@
                     adobe_proxy_scheme: adobeProxySchemeInput.value,
                     adobe_proxy_url: adobeProxyUrlInput.value,
                     token_pool_enabled: tokenPoolEnabledInput.checked,
-                    token_pool_site: tokenPoolSiteInput.value,
-                    token_pool_key: tokenPoolKeyInput.value,
+                    token_pool_site: (tokenPools.find(pool => pool.enabled) || tokenPools[0] || {}).site || "",
+                    token_pool_key: (tokenPools.find(pool => pool.enabled) || tokenPools[0] || {}).key || "",
+                    token_pools: tokenPoolPayload(),
+                    child_monitor_enabled: childMonitorEnabledInput.checked,
+                    child_monitor_interval: Number(childMonitorIntervalInput.value || 600),
+                    child_monitor_pool_ids: selectedMonitorPoolIds(),
                 })
             }).then(r => r.json());
         }
@@ -334,14 +525,87 @@
             });
         });
 
+        tokenPoolList.addEventListener("input", (event) => {
+            const card = event.target.closest(".token-pool-card");
+            if (!card) return;
+            syncTokenPoolFromCard(card);
+            renderMonitorPools();
+        });
+
+        tokenPoolList.addEventListener("change", (event) => {
+            const card = event.target.closest(".token-pool-card");
+            if (!card) return;
+            syncTokenPoolFromCard(card);
+            renderTokenPools();
+        });
+
+        tokenPoolList.addEventListener("click", (event) => {
+            const card = event.target.closest(".token-pool-card");
+            if (!card) return;
+            const pool = tokenPools.find(item => item.id === card.dataset.poolId);
+            if (!pool) return;
+
+            if (event.target.closest(".token-pool-toggle")) {
+                pool.expanded = !pool.expanded;
+                renderTokenPools();
+                return;
+            }
+            if (event.target.closest(".token-pool-key-toggle")) {
+                syncTokenPoolFromCard(card);
+                if (visibleTokenPoolKeys.has(pool.id)) {
+                    visibleTokenPoolKeys.delete(pool.id);
+                } else {
+                    visibleTokenPoolKeys.add(pool.id);
+                }
+                renderTokenPools();
+                return;
+            }
+            if (event.target.closest(".token-pool-delete")) {
+                tokenPools = tokenPools.filter(item => item.id !== pool.id);
+                visibleTokenPoolKeys.delete(pool.id);
+                if (!tokenPools.length) {
+                    tokenPools = [createTokenPool(1)];
+                }
+                renderTokenPools();
+            }
+        });
+
+        addTokenPoolBtn.addEventListener("click", () => {
+            tokenPools.forEach(pool => pool.expanded = false);
+            tokenPools.push(createTokenPool(tokenPools.length + 1, true));
+            renderTokenPools();
+        });
+
+        childMonitorPoolList.addEventListener("change", () => {
+            childMonitorPoolIds = selectedMonitorPoolIds();
+        });
+
         document.getElementById("save-token-pool-btn").addEventListener("click", () => {
-            if (tokenPoolEnabledInput.checked && (!tokenPoolSiteInput.value.trim() || !tokenPoolKeyInput.value.trim())) {
-                showStatus(tokenPoolStatus, "请填写网站地址和 Token 池密钥", false);
+            const payloadPools = tokenPoolPayload();
+            const enabledPools = payloadPools.filter(pool => pool.enabled);
+            const invalidPool = enabledPools.find(pool => !pool.site.trim() || !pool.key.trim());
+            if (tokenPoolEnabledInput.checked && (!enabledPools.length || invalidPool)) {
+                showStatus(tokenPoolStatus, "请至少启用一个完整填写的 Token 池", false);
                 return;
             }
             saveAllConfig().then(() => {
                 showStatus(tokenPoolStatus, "✅ 配置已保存", true);
                 setTimeout(() => tokenPoolStatus.textContent = "", 2000);
+            });
+        });
+
+        document.getElementById("save-child-monitor-btn").addEventListener("click", () => {
+            if (Number(childMonitorIntervalInput.value || 0) < 60) {
+                showStatus(childMonitorStatus, "监测间隔不能低于 60 秒", false);
+                return;
+            }
+            if (childMonitorEnabledInput.checked && selectedMonitorPoolIds().length === 0) {
+                showStatus(childMonitorStatus, "请至少选择一个 Token 池", false);
+                return;
+            }
+            saveAllConfig().then(() => {
+                showStatus(childMonitorStatus, "✅ 监测配置已保存", true);
+                setTimeout(() => childMonitorStatus.textContent = "", 2000);
             });
         });
     });

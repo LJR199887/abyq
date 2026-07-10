@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>子账号池 - Firefly Registration</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="glass-bg"></div>
+    <div class="container">
+        <header>
+            <div class="header-row">
+                <div class="logo-box">
+                    <div class="logo-icon"></div>
+                    <h1>Firefly Registration</h1>
+                </div>
+                <nav class="nav-links">
+                    <a href="/" class="nav-link">🚀 任务</a>
+                    <a href="/records.html" class="nav-link">📋 记录</a>
+                    <a href="/self-emails.html" class="nav-link">📮 自备邮箱</a>
+                    <a href="/child-accounts.html" class="nav-link active">🧩 子账号池</a>
+                    <a href="/accounts.html" class="nav-link">👤 账号</a>
+                    <a href="/settings.html" class="nav-link">⚙️ 设置</a>
+                </nav>
+            </div>
+        </header>
+
+        <main class="child-pool-layout">
+            <section class="card glass-card">
+                <div class="child-pool-header">
+                    <div>
+                        <span class="eyebrow">MONITOR LOG</span>
+                        <h2>监测日志</h2>
+                        <p class="card-desc">默认显示最近 5 条；展开可查看更多，后端只保留最近 12 小时日志。</p>
+                    </div>
+                    <div class="child-pool-actions">
+                        <button class="btn-sm primary" id="refresh-log-btn">刷新日志</button>
+                        <button class="btn-sm secondary" id="toggle-log-btn">展开日志</button>
+                        <button class="btn-sm success" id="download-log-btn">下载日志</button>
+                    </div>
+                </div>
+                <div id="monitor-log-list" class="monitor-log-list">
+                    <div class="empty-hint">暂无监测日志</div>
+                </div>
+            </section>
+
+            <section class="card glass-card">
+                <div class="child-pool-header">
+                    <div>
+                        <span class="eyebrow">CHILD ACCOUNT POOL</span>
+                        <h2>子账号池</h2>
+                        <p class="card-desc">协议注册成功的子号会保存在这里；监测模式会查询 Token 池已耗尽邮箱，命中后自动移除旧号并补号。</p>
+                    </div>
+                    <div class="child-pool-actions">
+                        <button class="btn-sm primary" id="refresh-btn">刷新列表</button>
+                        <button class="btn-sm success" id="run-monitor-btn">立即监测</button>
+                        <button class="btn-sm danger" id="delete-selected-btn" disabled>删除选中</button>
+                    </div>
+                </div>
+
+                <div class="child-pool-stats">
+                    <div class="stat-item"><span class="stat-value" id="stat-total">0</span><span class="stat-label">总数</span></div>
+                    <div class="stat-item"><span class="stat-value" id="stat-active">0</span><span class="stat-label">可用</span></div>
+                    <div class="stat-item"><span class="stat-value" id="stat-low">0</span><span class="stat-label">已耗尽</span></div>
+                    <div class="stat-item"><span class="stat-value" id="stat-replacing">0</span><span class="stat-label">补号中</span></div>
+                    <div class="stat-item"><span class="stat-value" id="stat-replacement-failed">0</span><span class="stat-label">补号失败</span></div>
+                </div>
+
+                <div class="child-pool-filters">
+                    <input id="search-input" type="search" placeholder="搜索邮箱 / 母号 / 任务号 / 失败原因">
+                    <select id="mother-filter">
+                        <option value="">全部</option>
+                        <option value="removed">已移除</option>
+                    </select>
+                    <select id="pool-filter">
+                        <option value="">全部</option>
+                        <option value="unpooled">未入池</option>
+                        <option value="failed">入池失败</option>
+                    </select>
+                </div>
+
+                <div class="table-wrap">
+                    <table class="child-pool-table">
+                        <thead>
+                            <tr>
+                                <th class="select-col"><input type="checkbox" id="select-all-accounts"></th>
+                                <th>子号</th>
+                                <th>母号</th>
+                                <th>入池情况</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="child-account-body">
+                            <tr><td colspan="5" class="empty-hint">正在读取子账号池...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="status-msg" id="child-status"></div>
+            </section>
+        </main>
+    </div>
+
+    <script>
+    document.addEventListener("DOMContentLoaded", () => {
+        const body = document.getElementById("child-account-body");
+        const statusEl = document.getElementById("child-status");
+        const searchInput = document.getElementById("search-input");
+        const motherFilter = document.getElementById("mother-filter");
+        const poolFilter = document.getElementById("pool-filter");
+        const monitorLogList = document.getElementById("monitor-log-list");
+        const toggleLogBtn = document.getElementById("toggle-log-btn");
+        const selectAllAccounts = document.getElementById("select-all-accounts");
+        const deleteSelectedBtn = document.getElementById("delete-selected-btn");
+        let monitorLogExpanded = false;
+        let accounts = [];
+        let selectedIds = new Set();
+
+        function escapeHtml(value) {
+            return String(value ?? "")
+                .replaceAll("&", "&amp;")
+                .replaceAll("<", "&lt;")
+                .replaceAll(">", "&gt;")
+                .replaceAll('"', "&quot;")
+                .replaceAll("'", "&#39;");
+        }
+
+        function showStatus(message, ok = true) {
+            statusEl.style.color = ok ? "var(--success)" : "var(--danger)";
+            statusEl.textContent = message;
+            if (message) setTimeout(() => { statusEl.textContent = ""; }, 2500);
+        }
+
+        function statusText(status) {
+            return {
+                active: "可用",
+                check_failed: "检测失败",
+                exhausted: "已耗尽",
+                replacing: "换号中",
+                removed: "已移除",
+                replaced: "已替换",
+            }[status] || status || "未知";
+        }
+
+        function externalText(status) {
+            return {
+                pending: "待入池",
+                imported: "已入池",
+                failed: "入池失败",
+                skipped: "已跳过",
+            }[status] || status || "未记录";
+        }
+
+        function tokenDeleteText(status) {
+            return {
+                deleted: "已删除",
+                failed: "删除失败",
+                skipped: "已跳过",
+                not_found: "未找到",
+            }[status] || status || "未记录";
+        }
+
+        function poolDisplay(account) {
+            if (account.external_pool_status === "imported") {
+                return account.external_pool_name || account.external_pool_id || "已入池（未记录池名）";
+            }
+            if (account.external_pool_status === "failed") return "入池失败";
+            return "未入池";
+        }
+
+        function syncSelectionState() {
+            const visibleIds = accounts.map(account => account.id).filter(Boolean);
+            const selectedVisibleCount = visibleIds.filter(id => selectedIds.has(id)).length;
+            deleteSelectedBtn.disabled = selectedIds.size === 0;
+            deleteSelectedBtn.textContent = selectedIds.size ? `删除选中 ${selectedIds.size}` : "删除选中";
+            selectAllAccounts.checked = visibleIds.length > 0 && selectedVisibleCount === visibleIds.length;
+            selectAllAccounts.indeterminate = selectedVisibleCount > 0 && selectedVisibleCount < visibleIds.length;
+        }
+
+        function renderStats(summary) {
+            document.getElementById("stat-total").textContent = summary.total || 0;
+            document.getElementById("stat-active").textContent = summary.active || 0;
+            document.getElementById("stat-low").textContent = summary.low_credits || 0;
+            document.getElementById("stat-replacing").textContent = summary.replacing || 0;
+            document.getElementById("stat-replacement-failed").textContent = summary.replacement_failed || 0;
+        }
+
+        function renderMotherFilter(motherOptions) {
+            const current = motherFilter.value;
+            const motherItems = (motherOptions || []).map(mother => (
+                `<option value="mother:${escapeHtml(mother.email)}">${escapeHtml(mother.email)}</option>`
+            )).join("");
+            motherFilter.innerHTML = `
+                <option value="">全部</option>
+                ${motherItems}
+                <option value="removed">已移除</option>
+            `;
+            if ([...motherFilter.options].some(option => option.value === current)) {
+                motherFilter.value = current;
+            }
+        }
+
+        function renderPoolFilter(poolOptions) {
+            const current = poolFilter.value;
+            const poolItems = (poolOptions || []).map(pool => (
+                `<option value="pool:${escapeHtml(pool.id || pool.name)}">${escapeHtml(pool.name || pool.id || "Token 池")}</option>`
+            )).join("");
+            poolFilter.innerHTML = `
+                        <option value="">全部</option>
+                        ${poolItems}
+                        <option value="imported_unknown">已入池（未记录池名）</option>
+                        <option value="unpooled">未入池</option>
+                        <option value="failed">入池失败</option>
+                    `;
+            if ([...poolFilter.options].some(option => option.value === current)) {
+                poolFilter.value = current;
+            }
+        }
+
+        function renderAccounts() {
+            if (!accounts.length) {
+                body.innerHTML = '<tr><td colspan="5" class="empty-hint">暂无子账号记录</td></tr>';
+                syncSelectionState();
+                return;
+            }
+            body.innerHTML = accounts.map(account => {
+                const isArchived = ["removed", "replaced"].includes(account.status);
+                const motherCell = isArchived
+                    ? `
+                        <span class="archived-account-label">已移除</span>
+                        <small>旧子号记录</small>
+                    `
+                    : `
+                        <span>${escapeHtml(account.adobe_account_email || account.adobe_account_name || "-")}</span>
+                        <small>${escapeHtml(account.product_name || account.org_id || "")}</small>
+                    `;
+                const disabledAttr = isArchived ? "disabled title=\"旧记录不可操作\"" : "";
+                const exhaustedPools = Array.isArray(account.exhausted_pool_ids) && account.exhausted_pool_ids.length
+                    ? account.exhausted_pool_ids.join(", ")
+                    : "-";
+                const failure = account.failure_reason || account.external_pool_error || account.exhausted_token_delete_error || "";
+                const poolLines = [
+                    poolDisplay(account),
+                    exhaustedPools !== "-" ? `耗尽来源：${exhaustedPools}` : "",
+                    account.exhausted_token_delete_status ? `旧 token：${tokenDeleteText(account.exhausted_token_delete_status)}` : "",
+                ].filter(Boolean);
+                return `
+                    <tr data-id="${escapeHtml(account.id)}">
+                        <td class="select-col">
+                            <input type="checkbox" class="child-account-select" data-id="${escapeHtml(account.id)}" ${selectedIds.has(account.id) ? "checked" : ""}>
+                        </td>
+                        <td>
+                            <strong>${escapeHtml(account.email)}</strong>
+                            <small>${escapeHtml(account.display_name || account.user_id || "")}</small>
+                            ${failure ? `<small class="danger-text">${escapeHtml(failure)}</small>` : ""}
+                        </td>
+                        <td>
+                            ${motherCell}
+                        </td>
+                        <td>
+                            <div class="event-lines">
+                                ${poolLines.map((line, index) => `<span class="${index === 0 ? "pool-name" : ""}">${escapeHtml(line)}</span>`).join("")}
+                            </div>
+                        </td>
+                        <td>
+                            <div class="child-row-actions">
+                                <button class="btn-sm primary" data-action="export-cookie">导出</button>
+                                <button class="btn-sm warning" data-action="import" ${disabledAttr}>入池</button>
+                                <button class="btn-sm danger" data-action="remove" ${disabledAttr}>移除</button>
+                                <button class="btn-sm success" data-action="replace" ${disabledAttr}>补号</button>
+                            </div>
+                        </td>
+                    </tr>
+                `;
+            }).join("");
+            syncSelectionState();
+        }
+
+        function loadAccounts() {
+            const params = new URLSearchParams();
+            if (searchInput.value.trim()) params.set("search", searchInput.value.trim());
+            if (motherFilter.value) params.set("mother_status", motherFilter.value);
+            if (poolFilter.value) params.set("pool_status", poolFilter.value);
+            return fetch(`/api/child-accounts?${params.toString()}`)
+                .then(response => response.json())
+                .then(data => {
+                    accounts = data.accounts || [];
+                    const visibleIdSet = new Set(accounts.map(account => account.id));
+                    selectedIds = new Set([...selectedIds].filter(id => visibleIdSet.has(id)));
+                    renderMotherFilter(data.mother_options || []);
+                    renderPoolFilter(data.pool_options || []);
+                    renderStats(data.summary || {});
+                    renderAccounts();
+                });
+        }
+
+        function postAction(id, action) {
+            const actionMap = {
+                import: "import-token-pool",
+                remove: "remove",
+                replace: "replace",
+            };
+            return fetch(`/api/child-accounts/${id}/${actionMap[action]}`, { method: "POST" })
+                .then(async response => {
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) throw new Error(data.message || "操作失败");
+                    return data;
+                });
+        }
+
+        function deleteRecords(ids) {
+            return fetch("/api/child-accounts/delete", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ ids }),
+            }).then(async response => {
+                const data = await response.json().catch(() => ({}));
+                if (!response.ok) throw new Error(data.message || "删除失败");
+                return data;
+            });
+        }
+
+        function renderMonitorLogs(logs) {
+            if (!logs.length) {
+                monitorLogList.innerHTML = '<div class="empty-hint">暂无监测日志</div>';
+                return;
+            }
+            monitorLogList.innerHTML = logs.map(log => {
+                const poolLines = (log.pool_results || []).map(pool => `
+                    <span class="${pool.ok ? "ok" : "fail"}">${escapeHtml(pool.pool_name || pool.pool_id)}：${pool.ok ? `${pool.count || 0} 个耗尽` : escapeHtml(pool.error || "")}${pool.attempts > 1 ? `（尝试 ${pool.attempts}/3）` : ""}</span>
+                `).join("");
+                const matchedLines = (log.matched_accounts || []).map(item => `
+                    <span>${escapeHtml(item.email)} ← ${escapeHtml((item.pool_ids || []).join(", "))}</span>
+                `).join("");
+                const replacementLines = (log.replacements || []).map(item => `
+                    <span>${escapeHtml(item.email)} → 任务 #${escapeHtml(item.replacement_task_id || "-")}</span>
+                `).join("");
+                const failedLines = (log.failed_accounts || []).map(item => `
+                    <span class="fail">${escapeHtml(item.email || "监测")}：${escapeHtml(item.error || "")}</span>
+                `).join("");
+                return `
+                    <div class="monitor-log-item">
+                        <div class="monitor-log-head">
+                            <strong>${escapeHtml(log.created_at || "-")}</strong>
+                            <span>${log.source === "auto" ? "自动监测" : "手动监测"}</span>
+                            <span>检测 ${log.checked || 0} / 命中 ${log.matched || 0} / 补号 ${log.replaced || 0} / 失败 ${log.failed || 0}</span>
+                        </div>
+                        <div class="monitor-log-grid">
+                            <div><b>Token 池</b>${poolLines || "<span>无</span>"}</div>
+                            <div><b>命中子号</b>${matchedLines || "<span>无</span>"}</div>
+                            <div><b>补号任务</b>${replacementLines || "<span>无</span>"}</div>
+                            <div><b>失败</b>${failedLines || "<span>无</span>"}</div>
+                        </div>
+                    </div>
+                `;
+            }).join("");
+        }
+
+        function loadMonitorLogs() {
+            const limit = monitorLogExpanded ? 50 : 5;
+            return fetch(`/api/child-accounts/monitor/logs?limit=${limit}`)
+                .then(response => response.json())
+                .then(data => renderMonitorLogs(data.logs || []));
+        }
+
+        body.addEventListener("click", event => {
+            const button = event.target.closest("button[data-action]");
+            if (!button) return;
+            const row = button.closest("tr[data-id]");
+            const id = row?.dataset.id;
+            const action = button.dataset.action;
+            if (!id) return;
+            if (action === "export-cookie") {
+                window.location.href = `/api/child-accounts/${id}/export-cookie`;
+                return;
+            }
+            if (action === "remove" && !confirm("确认从母号组织移除此子号？")) return;
+            if (action === "replace" && !confirm("确认先移除此子号并创建补号任务？")) return;
+            button.disabled = true;
+            postAction(id, action)
+                .then(() => {
+                    showStatus("✅ 操作完成");
+                    return loadAccounts();
+                })
+                .catch(error => showStatus(`❌ ${error.message}`, false))
+                .finally(() => { button.disabled = false; });
+        });
+
+        body.addEventListener("change", event => {
+            const checkbox = event.target.closest(".child-account-select");
+            if (!checkbox) return;
+            const id = checkbox.dataset.id;
+            if (!id) return;
+            if (checkbox.checked) {
+                selectedIds.add(id);
+            } else {
+                selectedIds.delete(id);
+            }
+            syncSelectionState();
+        });
+
+        document.getElementById("refresh-btn").addEventListener("click", () => loadAccounts());
+        selectAllAccounts.addEventListener("change", () => {
+            const visibleIds = accounts.map(account => account.id).filter(Boolean);
+            if (selectAllAccounts.checked) {
+                visibleIds.forEach(id => selectedIds.add(id));
+            } else {
+                visibleIds.forEach(id => selectedIds.delete(id));
+            }
+            renderAccounts();
+        });
+        deleteSelectedBtn.addEventListener("click", event => {
+            const ids = [...selectedIds];
+            if (!ids.length) return;
+            if (!confirm(`确认删除选中的 ${ids.length} 条子账号池记录？不会移除 Adobe 组织成员。`)) return;
+            const btn = event.currentTarget;
+            btn.disabled = true;
+            deleteRecords(ids)
+                .then(data => {
+                    selectedIds.clear();
+                    showStatus(`✅ 已删除 ${data.deleted || 0} 条记录`);
+                    return loadAccounts();
+                })
+                .catch(error => showStatus(`❌ ${error.message}`, false))
+                .finally(() => {
+                    btn.disabled = false;
+                    syncSelectionState();
+                });
+        });
+        document.getElementById("run-monitor-btn").addEventListener("click", event => {
+            const btn = event.currentTarget;
+            btn.disabled = true;
+            fetch("/api/child-accounts/monitor/run", { method: "POST" })
+                .then(response => response.json())
+                .then(data => {
+                    showStatus(`✅ 监测完成：检测 ${data.checked || 0}，命中 ${data.matched || 0}，换号 ${data.replaced || 0}`);
+                    return Promise.all([loadAccounts(), loadMonitorLogs()]);
+                })
+                .catch(() => showStatus("❌ 监测失败", false))
+                .finally(() => { btn.disabled = false; });
+        });
+        document.getElementById("refresh-log-btn").addEventListener("click", () => loadMonitorLogs());
+        toggleLogBtn.addEventListener("click", () => {
+            monitorLogExpanded = !monitorLogExpanded;
+            toggleLogBtn.textContent = monitorLogExpanded ? "收起日志" : "展开日志";
+            loadMonitorLogs();
+        });
+        document.getElementById("download-log-btn").addEventListener("click", () => {
+            window.location.href = "/api/child-accounts/monitor/logs/download";
+        });
+        [searchInput, motherFilter, poolFilter].forEach(el => {
+            el.addEventListener("input", () => loadAccounts());
+            el.addEventListener("change", () => loadAccounts());
+        });
+
+        loadAccounts();
+        loadMonitorLogs();
+        setInterval(loadAccounts, 15000);
+        setInterval(loadMonitorLogs, 15000);
+    });
+    </script>
+</body>
+</html>

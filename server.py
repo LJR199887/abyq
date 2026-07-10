@@ -23,6 +23,9 @@ from pydantic import BaseModel, Field
 import glob
 import httpx
 
+import adobe_admin
+import firefly_protocol
+
 app = FastAPI()
 
 # Config storage
@@ -32,6 +35,10 @@ SCREENSHOT_DIR = os.path.join(DATA_DIR, "screenshots")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 TASKS_FILE = os.path.join(DATA_DIR, "tasks.json")
 TASK_LOG_DIR = os.path.join(DATA_DIR, "task_logs")
+CHILD_ACCOUNTS_FILE = os.path.join(DATA_DIR, "child_accounts.json")
+CHILD_MONITOR_LOG_FILE = os.path.join(DATA_DIR, "child_monitor_logs.json")
+CHILD_MONITOR_LOG_RETENTION_SECONDS = 12 * 60 * 60
+CHILD_MONITOR_LOG_MAX_ITEMS = 500
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 os.makedirs(TASK_LOG_DIR, exist_ok=True)
 
@@ -50,6 +57,13 @@ DEFAULT_CONFIG = {
     "token_pool_enabled": False,
     "token_pool_site": "",
     "token_pool_key": "",
+    "token_pools": [],
+    "token_pool_cursor": 0,
+    "child_monitor_enabled": False,
+    "child_monitor_threshold": 100,
+    "child_monitor_interval": 600,
+    "child_monitor_max_failures": 3,
+    "child_monitor_pool_ids": [],
     "self_email_accounts": "",
     "self_email_cursor": 0,
     "self_email_used": [],
@@ -82,8 +96,17 @@ PUBLIC_PATHS = {
 
 
 def extract_task_id_from_log(message: str) -> int | None:
-    for pattern in (r"\[任务#(\d+)(?:[-\s·\]])", r"任务\s*#(\d+)"):
-        match = re.search(pattern, message)
+    for pattern in (
+        r"\[任务#(\d+)(?:[-\s·\]])",
+        r"任务\s*#(\d+)",
+        r"\[Task#(\d+)(?:[-:\s\]])",
+        r"Task\s*#(\d+)",
+        r"#(\d+)",
+    ):
+        try:
+            match = re.search(pattern, message)
+        except re.error:
+            continue
         if match:
             return int(match.group(1))
     return None
@@ -351,6 +374,10 @@ config = load_config()
 self_email_lock = asyncio.Lock()
 self_email_reserved = set()
 adobe_account_lock = asyncio.Lock()
+token_pool_lock = asyncio.Lock()
+child_accounts_lock = asyncio.Lock()
+child_monitor_task: asyncio.Task | None = None
+child_replacement_locks: dict[str, asyncio.Lock] = {}
 
 # ─── Task Management ───
 class Task:
@@ -384,6 +411,7 @@ class Task:
         self.token_pool_imported_files = []
         self.created_at = datetime.now().strftime("%m-%d %H:%M")
         self.result_files = []
+        self.replacement_child_id = ""
         self.asyncio_tasks = []
         self.active_processes = {}
         self.active_profiles = {}
@@ -411,6 +439,7 @@ class Task:
             "created_at": self.created_at,
             "result_count": len(self.result_files),
             "result_files": self.result_files,
+            "replacement_child_id": self.replacement_child_id,
         }
 
 
@@ -489,6 +518,7 @@ class TaskManager:
                         t.token_pool_imported_files = t_data.get("token_pool_imported_files", [])
                         t.created_at = t_data.get("created_at", "")
                         t.result_files = t_data.get("result_files", [])
+                        t.replacement_child_id = t_data.get("replacement_child_id", "")
                         # Mark interrupted tasks as stopped
                         if t.status in ("running", "pending", "stopping"):
                             t.status = "stopped"
@@ -603,6 +633,12 @@ class ConfigUpdate(BaseModel):
     token_pool_enabled: bool = False
     token_pool_site: str = ""
     token_pool_key: str = ""
+    token_pools: list[dict] = Field(default_factory=list)
+    child_monitor_enabled: bool = False
+    child_monitor_threshold: float = 100
+    child_monitor_interval: int = 600
+    child_monitor_max_failures: int = 3
+    child_monitor_pool_ids: list[str] = Field(default_factory=list)
 
 
 class SelfEmailUpdate(BaseModel):
@@ -631,10 +667,24 @@ class TaskDeleteRequest(BaseModel):
     ids: list[int]
 
 
+class ChildAccountDeleteRequest(BaseModel):
+    ids: list[str]
+
+
 class AdobeAccountUpdate(BaseModel):
     id: str = ""
-    name: str
+    name: str = ""
+    email: str = ""
+    hotmail_password: str = ""
+    adobe_password: str = ""
+    client_id: str = ""
+    refresh_token: str = ""
     cookie: str = ""
+
+
+class AdobeAccountBatchImport(BaseModel):
+    content: str = ""
+    on_duplicate: str = "skip"
 
 
 class AdobeTeamActionRequest(BaseModel):
@@ -669,6 +719,23 @@ async def update_config(item: ConfigUpdate):
     global config
     proxy_scheme = item.proxy_scheme if item.proxy_scheme in ("http", "https", "socks5") else "http"
     adobe_proxy_scheme = item.adobe_proxy_scheme if item.adobe_proxy_scheme in ("http", "https", "socks5") else "http"
+    token_pools = normalize_token_pools(item.token_pools)
+    legacy_site = item.token_pool_site.strip()
+    legacy_key = item.token_pool_key.strip()
+    if not token_pools and (legacy_site or legacy_key):
+        token_pools.append({
+            "id": "legacy",
+            "name": "1号池",
+            "site": legacy_site,
+            "key": legacy_key,
+            "enabled": True,
+            "success": 0,
+            "failed": 0,
+        })
+    legacy_pool = next((pool for pool in token_pools if pool.get("site") and pool.get("key")), None)
+    if legacy_pool:
+        legacy_site = legacy_pool.get("site", "")
+        legacy_key = legacy_pool.get("key", "")
     config = {
         "api_key": item.api_key,
         "api_base": item.api_base,
@@ -682,14 +749,22 @@ async def update_config(item: ConfigUpdate):
         "adobe_proxy_scheme": adobe_proxy_scheme,
         "adobe_proxy_url": item.adobe_proxy_url.strip(),
         "token_pool_enabled": item.token_pool_enabled,
-        "token_pool_site": item.token_pool_site.strip(),
-        "token_pool_key": item.token_pool_key.strip(),
+        "token_pool_site": legacy_site,
+        "token_pool_key": legacy_key,
+        "token_pools": token_pools,
+        "token_pool_cursor": config.get("token_pool_cursor", 0),
+        "child_monitor_enabled": bool(item.child_monitor_enabled),
+        "child_monitor_threshold": max(0, float(item.child_monitor_threshold or 0)),
+        "child_monitor_interval": max(60, int(item.child_monitor_interval or 600)),
+        "child_monitor_max_failures": max(1, int(item.child_monitor_max_failures or 3)),
+        "child_monitor_pool_ids": [str(pool_id) for pool_id in item.child_monitor_pool_ids],
         "self_email_accounts": config.get("self_email_accounts", ""),
         "self_email_cursor": config.get("self_email_cursor", 0),
         "self_email_used": config.get("self_email_used", []),
         "adobe_accounts": config.get("adobe_accounts", []),
     }
     save_config(config)
+    ensure_child_monitor_started()
     return {"status": "ok"}
 
 @app.post("/api/test-proxy")
@@ -759,21 +834,42 @@ def normalize_email_list(emails: list[str]) -> list[str]:
 
 
 def adobe_account_summary(account: dict) -> dict:
+    normalize_adobe_account(account)
     cookie = account.get("cookie", "")
     try:
         cookie_count = len(parse_adobe_cookies(cookie)) if cookie else 0
     except ValueError:
         cookie_count = 0
+    has_protocol = bool(account.get("client_id") and account.get("refresh_token"))
+    display_name = account.get("name") or account.get("email") or ""
+    assignment_count = len(account.get("product_assignments") or [])
     return {
         "id": account.get("id", ""),
-        "name": account.get("name", ""),
+        "name": display_name,
+        "email": account.get("email", ""),
+        "hotmail_password": account.get("hotmail_password", ""),
+        "adobe_password": account.get("adobe_password", ""),
+        "client_id": account.get("client_id", ""),
+        "refresh_token": account.get("refresh_token", ""),
         "cookie_configured": bool(cookie),
-        "cookie_preview": f"已配置 · {cookie_count} 项" if cookie else "",
-        "product_count": len(account.get("invite_product_ids", [])),
-        "organization_id": account.get("organization_id", ""),
+        "credential_configured": has_protocol,
+        "cookie_preview": (
+            "protocol credentials configured"
+            if has_protocol else (f"cookie configured ? {cookie_count} items" if cookie else "")
+        ),
+        "product_count": assignment_count or (1 if account.get("product_id") else len(account.get("invite_product_ids", []))),
+        "organization_id": account.get("org_id") or account.get("organization_id", ""),
+        "org_id": account.get("org_id", ""),
+        "product_name": account.get("product_name", ""),
+        "member_count": account.get("member_count", 0),
+        "has_org": account.get("has_org"),
+        "is_valid": account.get("is_valid"),
+        "check_message": account.get("check_message", ""),
         "subscriptions": account.get("subscriptions", []),
         "last_token_check_at": account.get("last_token_check_at", ""),
         "token_expires_at": account.get("token_expires_at", ""),
+        "last_login_at": account.get("last_login_at", ""),
+        "last_checked_at": account.get("last_checked_at", ""),
         "updated_at": account.get("updated_at", ""),
     }
 
@@ -832,6 +928,161 @@ def find_adobe_account(account_id: str) -> dict | None:
         (account for account in config.get("adobe_accounts", []) if account.get("id") == account_id),
         None,
     )
+
+
+def adobe_proxy_url() -> str:
+    proxy = adobe_proxy_config()
+    return proxy["url"] if proxy else ""
+
+
+def adobe_account_email(account: dict) -> str:
+    return (account.get("email") or account.get("name") or "").strip()
+
+
+def normalize_adobe_account(account: dict) -> dict:
+    email = adobe_account_email(account)
+    if email:
+        account["email"] = email
+    account.setdefault("name", email or account.get("id", ""))
+    for key in (
+        "hotmail_password", "adobe_password", "client_id", "refresh_token",
+        "admin_token", "admin_cookie", "org_id", "product_id", "product_name",
+        "license_group_id", "check_message", "last_login_at", "last_checked_at",
+    ):
+        account.setdefault(key, "")
+    account.setdefault("product_assignments", [])
+    account.setdefault("member_count", 0)
+    account.setdefault("has_org", False)
+    account.setdefault("is_valid", None)
+    return account
+
+
+def protocol_account_ready(account: dict) -> bool:
+    normalize_adobe_account(account)
+    return bool(account.get("email") and account.get("client_id") and account.get("refresh_token"))
+
+
+def apply_admin_login_result(account: dict, result: dict) -> None:
+    rotated = result.get("rotated_refresh_token") or ""
+    if rotated and rotated != account.get("refresh_token"):
+        account["refresh_token"] = rotated
+    account["admin_token"] = result.get("token") or ""
+    account["admin_cookie"] = result.get("cookie") or ""
+    account["org_id"] = result.get("org_id") or ""
+    account["organization_id"] = account["org_id"]
+    account["product_id"] = result.get("product_id") or ""
+    account["product_name"] = result.get("product_name") or ""
+    account["license_group_id"] = result.get("license_group_id") or ""
+    assignments = result.get("product_assignments") or []
+    account["product_assignments"] = assignments if isinstance(assignments, list) else []
+    account["has_org"] = bool(result.get("has_org"))
+    account["is_valid"] = bool(result.get("has_org"))
+    account["last_login_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    account["last_checked_at"] = account["last_login_at"]
+    account["check_message"] = (
+        f"组织 {result.get('org_count', 0)} 个 / 产品 {result.get('product_count', 0)} 个"
+        if result.get("has_org") else result.get("message", "")
+    )
+
+
+async def ensure_protocol_admin(account: dict, log=None) -> dict:
+    normalize_adobe_account(account)
+    proxy_url = adobe_proxy_url()
+
+    def emit(message: str) -> None:
+        if callable(log):
+            log(message)
+
+    has_cached = bool(
+        account.get("admin_token") and account.get("org_id")
+        and account.get("product_id") and account.get("license_group_id")
+    )
+    if has_cached:
+        try:
+            check_result = await asyncio.to_thread(
+                adobe_admin.check_admin,
+                token=account["admin_token"],
+                org_id=account["org_id"],
+                proxy_url=proxy_url,
+            )
+            for key in ("product_id", "product_name", "license_group_id", "product_assignments"):
+                if key in check_result:
+                    account[key] = check_result.get(key) or ([] if key == "product_assignments" else "")
+            account["has_org"] = bool(check_result.get("has_org", True))
+            account["is_valid"] = True
+            account["last_checked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+            account["check_message"] = (
+                f"组织 {check_result.get('org_count', 0)} 个 / 产品 {check_result.get('product_count', 0)} 个"
+            )
+            save_config(config)
+            return account
+        except Exception as exc:
+            emit(f"管理 token 已失效，重新协议登录: {str(exc)[:160]}")
+
+    if not protocol_account_ready(account):
+        raise RuntimeError("账号缺少 email / ClientID / RefreshToken，无法协议登录")
+
+    result = await asyncio.to_thread(
+        adobe_admin.login_account,
+        email=account["email"],
+        adobe_password=account.get("adobe_password", ""),
+        refresh_token=account.get("refresh_token", ""),
+        client_id=account.get("client_id", ""),
+        proxy_url=proxy_url,
+        otp_timeout=180,
+        log=emit,
+    )
+    apply_admin_login_result(account, result)
+    save_config(config)
+    if not account.get("has_org"):
+        raise RuntimeError(account.get("check_message") or "登录成功但未发现可用组织/产品")
+    return account
+
+
+def parse_adobe_account_import(content: str, on_duplicate: str = "skip") -> dict:
+    result = {"created": 0, "updated": 0, "skipped": 0, "failed": 0, "errors": []}
+    accounts = config.setdefault("adobe_accounts", [])
+    by_email = {
+        adobe_account_email(normalize_adobe_account(account)).lower(): account
+        for account in accounts
+        if adobe_account_email(account)
+    }
+    overwrite = on_duplicate == "overwrite"
+    for line_no, raw in enumerate((content or "").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [part.strip() for part in line.split("----")]
+        if len(parts) < 5 or not parts[0] or "@" not in parts[0]:
+            result["failed"] += 1
+            result["errors"].append(f"第 {line_no} 行格式应为 邮箱----邮箱密码----Adobe密码----ClientID----RefreshToken")
+            continue
+        email = parts[0]
+        fields = {
+            "email": email,
+            "name": email,
+            "hotmail_password": parts[1],
+            "adobe_password": parts[2],
+            "client_id": parts[3],
+            "refresh_token": "----".join(parts[4:]).strip(),
+        }
+        key = email.lower()
+        existing = by_email.get(key)
+        if existing:
+            if not overwrite:
+                result["skipped"] += 1
+                continue
+            existing.update(fields)
+            existing["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+            result["updated"] += 1
+            continue
+        account = {"id": uuid.uuid4().hex, **fields, "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M")}
+        normalize_adobe_account(account)
+        accounts.append(account)
+        by_email[key] = account
+        result["created"] += 1
+    save_config(config)
+    return result
 
 
 def parse_adobe_cookies(cookie_header: str) -> list[dict]:
@@ -1354,6 +1605,111 @@ async def remove_adobe_members(account: dict, emails: list[str]) -> list[dict]:
         pass
 
 
+def protocol_member_summary(item: dict, protected: set[str] | None = None) -> dict:
+    raw = item.get("raw") if isinstance(item.get("raw"), dict) else item
+    email = (item.get("email") or raw.get("email") or raw.get("userName") or "").strip()
+    member_id = item.get("member_id") or raw.get("id") or raw.get("memberId") or ""
+    protected = protected or set()
+    return {
+        "id": member_id,
+        "email": email,
+        "first_name": raw.get("firstName", ""),
+        "last_name": raw.get("lastName", ""),
+        "type": raw.get("type", ""),
+        "account_status": raw.get("accountStatus", raw.get("status", "")),
+        "protected": email.lower() in protected,
+        "protection_reason": "admin account" if email.lower() in protected else "",
+        "removable": bool(member_id) and email.lower() not in protected,
+        "editable": True,
+        "products": len(raw.get("products") or []),
+    }
+
+
+async def fetch_adobe_members(account: dict, page_number: int = 0, page_size: int = 20, search: str = "") -> dict:
+    await ensure_protocol_admin(account)
+    proxy_url = adobe_proxy_url()
+    members = await asyncio.to_thread(
+        adobe_admin.fetch_members,
+        token=account["admin_token"],
+        org_id=account["org_id"],
+        proxy_url=proxy_url,
+        search=search.strip(),
+        pages=max(1, page_number + 1),
+    )
+    protected = {adobe_account_email(account).lower()}
+    start = max(0, page_number) * min(max(1, page_size), 100)
+    size = min(max(1, page_size), 100)
+    page_members = members[start:start + size]
+    account["member_count"] = len(members)
+    save_config(config)
+    return {
+        "organization_id": account.get("org_id", ""),
+        "page": max(0, page_number),
+        "page_size": size,
+        "has_more": start + size < len(members),
+        "members": [protocol_member_summary(member, protected) for member in page_members],
+    }
+
+
+async def invite_adobe_members(account: dict, emails: list[str]) -> list[dict]:
+    await ensure_protocol_admin(account)
+    assignments = account.get("product_assignments") or []
+    if not assignments and account.get("product_id") and account.get("license_group_id"):
+        assignments = [{
+            "product_id": account["product_id"],
+            "license_group_id": account["license_group_id"],
+            "product_name": account.get("product_name", ""),
+        }]
+    if not assignments:
+        raise RuntimeError("账号尚未发现可用产品或授权组，请先协议检测母号")
+    proxy_url = adobe_proxy_url()
+
+    async def grant(email: str) -> dict:
+        result = await asyncio.to_thread(
+            adobe_admin.grant_member,
+            token=account["admin_token"],
+            org_id=account["org_id"],
+            product_id=account["product_id"],
+            license_group_id=account["license_group_id"],
+            product_assignments=assignments,
+            email=email,
+            proxy_url=proxy_url,
+        )
+        ok = bool(result.get("ok"))
+        return {
+            "email": email,
+            "ok": ok,
+            "member_id": result.get("member_id", ""),
+            "message": result.get("message") or ("authorized" if ok else "authorization failed"),
+        }
+
+    return [await grant(email) for email in emails]
+
+
+async def remove_adobe_members(account: dict, emails: list[str]) -> list[dict]:
+    await ensure_protocol_admin(account)
+    proxy_url = adobe_proxy_url()
+    protected = {adobe_account_email(account).lower()}
+    results = []
+    for email in emails:
+        if email.strip().lower() in protected:
+            results.append({"email": email, "ok": False, "message": "cannot remove admin account"})
+            continue
+        result = await asyncio.to_thread(
+            adobe_admin.remove_member,
+            token=account["admin_token"],
+            org_id=account["org_id"],
+            email=email,
+            proxy_url=proxy_url,
+        )
+        results.append({
+            "email": email,
+            "ok": bool(result.get("ok")),
+            "message": result.get("message") or "",
+        })
+    return results
+
+
 @app.get("/api/adobe-accounts")
 async def get_adobe_accounts():
     return [adobe_account_summary(account) for account in config.get("adobe_accounts", [])]
@@ -1362,31 +1718,48 @@ async def get_adobe_accounts():
 @app.post("/api/adobe-accounts")
 async def save_adobe_account(item: AdobeAccountUpdate):
     global config
-    name = item.name.strip()
-    if not name:
-        return JSONResponse(status_code=400, content={"message": "请输入账号名称"})
+    email = (item.email or item.name).strip()
+    name = (item.name or email).strip()
+    if not email or "@" not in email:
+        return JSONResponse(status_code=400, content={"message": "请输入有效的母号邮箱"})
     accounts = config.setdefault("adobe_accounts", [])
     account = find_adobe_account(item.id) if item.id else None
-    try:
-        if account:
-            account["name"] = name
-            account.pop("product_ids", None)
-            if item.cookie.strip():
-                parse_adobe_cookies(item.cookie.strip())
-                account["cookie"] = item.cookie.strip()
-        else:
+    if not account:
+        existing = next(
+            (acc for acc in accounts if adobe_account_email(normalize_adobe_account(acc)).lower() == email.lower()),
+            None,
+        )
+        if existing:
+            account = existing
+    if not account:
+        account = {"id": uuid.uuid4().hex}
+        accounts.append(account)
+
+    account.update({
+        "name": name,
+        "email": email,
+        "hotmail_password": item.hotmail_password.strip(),
+        "adobe_password": item.adobe_password.strip(),
+        "client_id": item.client_id.strip(),
+        "refresh_token": item.refresh_token.strip(),
+    })
+    if item.cookie.strip():
+        try:
             parse_adobe_cookies(item.cookie.strip())
-            account = {
-                "id": uuid.uuid4().hex,
-                "name": name,
-                "cookie": item.cookie.strip(),
-            }
-            accounts.append(account)
-    except ValueError as exc:
-        return JSONResponse(status_code=400, content={"message": str(exc)})
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"message": str(exc)})
+        account["cookie"] = item.cookie.strip()
+    normalize_adobe_account(account)
     account["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
     save_config(config)
     return adobe_account_summary(account)
+
+
+@app.post("/api/adobe-accounts/batch-import")
+async def batch_import_adobe_accounts(item: AdobeAccountBatchImport):
+    if item.on_duplicate not in ("skip", "overwrite"):
+        return JSONResponse(status_code=400, content={"message": "on_duplicate must be skip or overwrite"})
+    return parse_adobe_account_import(item.content, item.on_duplicate)
 
 
 @app.delete("/api/adobe-accounts/{account_id}")
@@ -1407,11 +1780,29 @@ async def test_adobe_account(account_id: str):
     account = find_adobe_account(account_id)
     if not account:
         return JSONResponse(status_code=404, content={"message": "账号不存在"})
+    logs: list[str] = []
     try:
         async with adobe_account_lock:
-            return await test_adobe_account_cookie(account)
+            await ensure_protocol_admin(account, log=logs.append)
+            account["last_checked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+            account["is_valid"] = True
+            save_config(config)
+            return {
+                "ok": True,
+                "message": account.get("check_message") or "协议登录成功，已获取管理权限",
+                "organization_id": account.get("org_id", ""),
+                "product_name": account.get("product_name", ""),
+                "logs": logs[-80:],
+            }
     except Exception as exc:
-        return JSONResponse(status_code=400, content={"ok": False, "message": str(exc)})
+        account["is_valid"] = False
+        account["check_message"] = str(exc)[:500]
+        account["last_checked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        save_config(config)
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "message": str(exc), "logs": logs[-80:]},
+        )
 
 
 @app.get("/api/adobe-accounts/{account_id}/members")
@@ -1590,6 +1981,243 @@ async def download_task_logs(task_id: int):
     )
 
 
+@app.get("/api/child-accounts")
+async def get_child_accounts(
+    status: str = "",
+    account_id: str = "",
+    flag: str = "",
+    search: str = "",
+    mother_status: str = "",
+    pool_status: str = "",
+):
+    records = await list_child_accounts_raw()
+    query = (search or "").strip().lower()
+    threshold = float(config.get("child_monitor_threshold", 100) or 0)
+    filtered = []
+    for record in records:
+        archived = record.get("status") in ("removed", "replaced")
+        mother_email = record.get("adobe_account_email") or record.get("adobe_account_name") or ""
+        if mother_status == "removed" and not archived:
+            continue
+        elif mother_status.startswith("mother:"):
+            mother_key = mother_status[7:].strip().lower()
+            if archived or mother_email.strip().lower() != mother_key:
+                continue
+        external_status = record.get("external_pool_status") or ""
+        external_pool_id = record.get("external_pool_id") or ""
+        external_pool_name = record.get("external_pool_name") or ""
+        if pool_status == "unpooled":
+            if external_status in ("imported", "failed"):
+                continue
+        elif pool_status == "imported_unknown":
+            if external_status != "imported" or external_pool_id or external_pool_name:
+                continue
+        elif pool_status == "failed":
+            if external_status != "failed":
+                continue
+        elif pool_status.startswith("pool:"):
+            pool_key = pool_status[5:]
+            if external_status != "imported" or pool_key not in (external_pool_id, external_pool_name):
+                continue
+        if status and record.get("status") != status:
+            continue
+        if account_id and record.get("adobe_account_id") != account_id:
+            continue
+        if flag in ("low_credits", "exhausted"):
+            if record.get("status") != "exhausted":
+                continue
+        elif flag == "check_failed" and record.get("status") != "check_failed":
+            continue
+        elif flag == "external_failed" and record.get("external_pool_status") != "failed":
+            continue
+        elif flag == "replacement_failed" and not (
+            record.get("status") == "removed" and record.get("replacement_task_id") and record.get("failure_reason")
+        ):
+            continue
+        if query:
+            haystack = " ".join([
+                str(record.get("email", "")),
+                str(record.get("adobe_account_email", "")),
+                str(record.get("product_name", "")),
+                str(record.get("failure_reason", "")),
+                str(record.get("exhausted_token_delete_error", "")),
+                str(record.get("source_task_id", "")),
+                str(record.get("replacement_task_id", "")),
+            ]).lower()
+            if query not in haystack:
+                continue
+        filtered.append(public_child_account(record))
+
+    summary = {
+        "total": len(records),
+        "active": sum(1 for item in records if item.get("status") == "active"),
+        "low_credits": sum(1 for item in records if item.get("status") == "exhausted"),
+        "exhausted": sum(1 for item in records if item.get("status") == "exhausted"),
+        "check_failed": sum(1 for item in records if item.get("status") == "check_failed"),
+        "replacing": sum(1 for item in records if item.get("status") == "replacing"),
+        "replacement_failed": sum(
+            1 for item in records
+            if item.get("status") == "removed" and item.get("replacement_task_id") and item.get("failure_reason")
+        ),
+        "external_failed": sum(1 for item in records if item.get("external_pool_status") == "failed"),
+        "monitor_enabled": bool(config.get("child_monitor_enabled")),
+        "threshold": threshold,
+    }
+    pool_options = [
+        {"id": pool.get("id", ""), "name": pool.get("name") or "Token 池"}
+        for pool in normalize_token_pools()
+        if pool.get("enabled")
+    ]
+    configured_pool_keys = {
+        str(pool.get("id", "")).strip().lower()
+        for pool in pool_options
+        if str(pool.get("id", "")).strip()
+    } | {
+        str(pool.get("name", "")).strip().lower()
+        for pool in pool_options
+        if str(pool.get("name", "")).strip()
+    }
+    for record in records:
+        pool_id = str(record.get("external_pool_id") or "").strip()
+        pool_name = str(record.get("external_pool_name") or "").strip()
+        key = (pool_id or pool_name).lower()
+        if record.get("external_pool_status") == "imported" and key and key not in configured_pool_keys:
+            pool_options.append({"id": pool_id or pool_name, "name": pool_name or pool_id})
+            configured_pool_keys.add(key)
+
+    mother_seen = set()
+    mother_options = []
+    for record in records:
+        if record.get("status") in ("removed", "replaced"):
+            continue
+        email = str(record.get("adobe_account_email") or record.get("adobe_account_name") or "").strip()
+        if not email:
+            continue
+        key = email.lower()
+        if key in mother_seen:
+            continue
+        mother_seen.add(key)
+        mother_options.append({"email": email})
+    return {
+        "accounts": list(reversed(filtered)),
+        "summary": summary,
+        "pool_options": pool_options,
+        "mother_options": mother_options,
+    }
+
+
+@app.post("/api/child-accounts/monitor/run")
+async def run_child_monitor_now():
+    summary = await monitor_child_accounts_once("manual")
+    await task_manager.broadcast("__STATE_UPDATE__")
+    return {"status": "ok", **summary}
+
+
+@app.get("/api/child-accounts/monitor/logs")
+async def get_child_monitor_logs(limit: int = 50):
+    logs = list_child_monitor_logs_sync()
+    count = max(1, min(int(limit or 50), CHILD_MONITOR_LOG_MAX_ITEMS))
+    return {"logs": list(reversed(logs[-count:]))}
+
+
+@app.get("/api/child-accounts/monitor/logs/download")
+async def download_child_monitor_logs():
+    logs = list_child_monitor_logs_sync()
+    export_filename = f"子账号池监测日志_{export_timestamp()}.json"
+    from fastapi.responses import Response
+    return Response(
+        json.dumps(logs, ensure_ascii=False, indent=2),
+        media_type="application/json; charset=utf-8",
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(export_filename)}"
+        },
+    )
+
+
+@app.post("/api/child-accounts/{child_id}/refresh-credits")
+async def refresh_child_account_credits(child_id: str):
+    try:
+        record = await check_child_exhausted(child_id)
+        return {"status": "ok", "account": public_child_account(record)}
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"message": str(exc)})
+
+
+@app.post("/api/child-accounts/{child_id}/remove")
+async def remove_child_account_member(child_id: str):
+    records = await list_child_accounts_raw()
+    record = find_child_record(records, child_id)
+    if not record:
+        return JSONResponse(status_code=404, content={"message": "子账号不存在"})
+    try:
+        updated = await remove_child_member(record, "手动移除")
+        return {"status": "ok", "account": public_child_account(updated)}
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"message": str(exc)})
+
+
+@app.post("/api/child-accounts/{child_id}/replace")
+async def replace_child_account_api(child_id: str):
+    try:
+        updated = await replace_child_account(child_id, "手动补号")
+        return {"status": "ok", "account": public_child_account(updated)}
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"message": str(exc)})
+
+
+@app.post("/api/child-accounts/{child_id}/import-token-pool")
+async def import_child_account_token_pool(child_id: str):
+    records = await list_child_accounts_raw()
+    record = find_child_record(records, child_id)
+    if not record:
+        return JSONResponse(status_code=404, content={"message": "子账号不存在"})
+    external_enabled = bool(config.get("token_pool_enabled"))
+    result = await import_payload_to_token_pool_result(child_cookie_payload(record), f"[子账号池 · {record.get('email', '')}]")
+    ok = bool(result.get("ok"))
+    updated = await update_child_account(
+        child_id,
+        external_pool_status="imported" if external_enabled and ok else "skipped" if not external_enabled else "failed",
+        external_pool_id=result.get("pool_id", "") if external_enabled and ok else "",
+        external_pool_name=result.get("pool_name", "") if external_enabled and ok else "",
+        external_pool_error="" if ok else result.get("error", "") or "外部 Token 池导入失败",
+    )
+    return {"status": "ok" if ok else "failed", "account": public_child_account(updated or record)}
+
+
+@app.get("/api/child-accounts/{child_id}/export-cookie")
+async def export_child_account_cookie(child_id: str):
+    records = await list_child_accounts_raw()
+    record = find_child_record(records, child_id)
+    if not record:
+        return JSONResponse(status_code=404, content={"message": "子账号不存在"})
+    if not record.get("cookie"):
+        return JSONResponse(status_code=400, content={"message": "该子账号没有可导出的 cookie"})
+    payload = child_cookie_export_payload(record)
+    export_filename = f"{sanitize_filename(record.get('email', ''), '子账号')}_cookie.json"
+    from fastapi.responses import Response
+    return Response(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        media_type="application/json; charset=utf-8",
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(export_filename)}"
+        },
+    )
+
+
+@app.post("/api/child-accounts/delete")
+async def delete_child_account_records(req: ChildAccountDeleteRequest):
+    ids = {str(item) for item in req.ids}
+    if not ids:
+        return JSONResponse(status_code=400, content={"message": "请选择要删除的子账号记录"})
+    async with child_accounts_lock:
+        records = load_child_accounts_sync()
+        kept = [record for record in records if str(record.get("id", "")) not in ids]
+        deleted = len(records) - len(kept)
+        save_child_accounts_sync(kept)
+    await task_manager.broadcast("__STATE_UPDATE__")
+    return {"status": "ok", "deleted": deleted}
+
+
 @app.post("/api/tasks/delete")
 async def delete_tasks(req: TaskDeleteRequest):
     task_manager.delete_tasks(req.ids)
@@ -1673,30 +2301,91 @@ def build_token_pool_import_url(site: str) -> str:
     return urljoin(raw.rstrip("/") + "/", "api/v1/automation/import-cookie")
 
 
-async def import_cookie_to_token_pool(cookie_file: str, prefix: str) -> bool:
-    if not config.get("token_pool_enabled"):
-        return True
+def build_token_pool_exhausted_url(site: str) -> str:
+    raw = (site or "").strip()
+    if not raw:
+        return ""
+    if not raw.startswith(("http://", "https://")):
+        raw = f"http://{raw}"
+    if "/api/v1/automation/exhausted-accounts" in raw:
+        return raw
+    return urljoin(raw.rstrip("/") + "/", "api/v1/automation/exhausted-accounts")
 
-    import_url = build_token_pool_import_url(config.get("token_pool_site", ""))
-    token_pool_key = (config.get("token_pool_key") or "").strip()
+
+def normalize_token_pools(raw_pools=None) -> list[dict]:
+    pools = raw_pools if raw_pools is not None else config.get("token_pools")
+    normalized: list[dict] = []
+    if isinstance(pools, list):
+        for index, pool in enumerate(pools, 1):
+            if not isinstance(pool, dict):
+                continue
+            site = (pool.get("site") or pool.get("url") or "").strip()
+            key = (pool.get("key") or pool.get("token_pool_key") or "").strip()
+            if not site and not key:
+                continue
+            normalized.append({
+                "id": (pool.get("id") or uuid.uuid4().hex).strip(),
+                "name": (pool.get("name") or f"{index}号池").strip(),
+                "site": site,
+                "key": key,
+                "enabled": bool(pool.get("enabled", True)),
+                "success": int(pool.get("success", 0) or 0),
+                "failed": int(pool.get("failed", 0) or 0),
+            })
+
+    legacy_site = (config.get("token_pool_site") or "").strip()
+    legacy_key = (config.get("token_pool_key") or "").strip()
+    if not normalized and (legacy_site or legacy_key):
+        normalized.append({
+            "id": "legacy",
+            "name": "1号池",
+            "site": legacy_site,
+            "key": legacy_key,
+            "enabled": True,
+            "success": 0,
+            "failed": 0,
+        })
+    return normalized
+
+
+def save_token_pool_stats(pools: list[dict], cursor: int) -> None:
+    config["token_pools"] = pools
+    config["token_pool_cursor"] = cursor
+    save_config(config)
+
+
+async def reserve_token_pool_order() -> list[dict]:
+    async with token_pool_lock:
+        pools = normalize_token_pools()
+        enabled_pools = [pool for pool in pools if pool.get("enabled")]
+        if not enabled_pools:
+            return []
+
+        cursor = int(config.get("token_pool_cursor", 0) or 0)
+        start = cursor % len(enabled_pools)
+        ordered = enabled_pools[start:] + enabled_pools[:start]
+        next_cursor = (start + 1) % len(enabled_pools)
+        save_token_pool_stats(pools, next_cursor)
+        return [dict(pool) for pool in ordered]
+
+
+async def record_token_pool_result(pool_id: str, success: bool) -> None:
+    async with token_pool_lock:
+        pools = normalize_token_pools()
+        source_pool = next((item for item in pools if item.get("id") == pool_id), None)
+        if not source_pool:
+            return
+        stat_key = "success" if success else "failed"
+        source_pool[stat_key] = int(source_pool.get(stat_key, 0) or 0) + 1
+        save_token_pool_stats(pools, int(config.get("token_pool_cursor", 0) or 0))
+
+
+async def import_cookie_to_single_token_pool(prefix: str, pool: dict, payload: dict) -> tuple[bool, str]:
+    import_url = build_token_pool_import_url(pool.get("site", ""))
+    token_pool_key = (pool.get("key") or "").strip()
+    pool_name = pool.get("name") or "Token 池"
     if not import_url or not token_pool_key:
-        await task_manager.broadcast(f"{prefix} ⚠️ 自动入池已开启，但网站地址或 Token 池密钥未配置")
-        return False
-
-    try:
-        with open(cookie_file, "r", encoding="utf-8") as f:
-            cookie_data = json.load(f)
-    except Exception as e:
-        await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败：无法读取 Cookie 文件 ({e})")
-        return False
-
-    payload = {
-        "name": cookie_data.get("name", ""),
-        "cookie": cookie_data.get("cookie", ""),
-    }
-    if not payload["cookie"]:
-        await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败：Cookie 内容为空")
-        return False
+        return False, "网站地址或 Token 池密钥未配置"
 
     headers = {
         "Authorization": f"Bearer {token_pool_key}",
@@ -1710,19 +2399,880 @@ async def import_cookie_to_token_pool(cookie_file: str, prefix: str) -> bool:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(import_url, json=payload, headers=headers)
             if 200 <= response.status_code < 300:
-                await task_manager.broadcast(f"{prefix} ✅ 已自动导入 Token 池")
-                return True
+                return True, ""
             detail = response.text[:200].replace("\n", " ")
             last_error = f"HTTP {response.status_code} {detail}"
         except Exception as e:
             last_error = str(e)
 
         if attempt < 3:
-            await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败，第 {attempt}/3 次：{last_error}，2 秒后重试")
+            await task_manager.broadcast(
+                f"{prefix} ⚠️ {pool_name} 入池失败，第 {attempt}/3 次：{last_error}，2 秒后重试"
+            )
+            await asyncio.sleep(2)
+    return False, last_error
+
+
+async def import_cookie_to_token_pool(cookie_file: str, prefix: str) -> bool:
+    result = await import_cookie_to_token_pool_result(cookie_file, prefix)
+    return bool(result.get("ok"))
+
+
+async def import_cookie_to_token_pool_result(cookie_file: str, prefix: str) -> dict:
+    if not config.get("token_pool_enabled"):
+        return {"ok": True, "status": "skipped", "pool_id": "", "pool_name": "", "error": ""}
+
+    try:
+        with open(cookie_file, "r", encoding="utf-8") as f:
+            cookie_data = json.load(f)
+    except Exception as e:
+        await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败：无法读取 Cookie 文件 ({e})")
+        return {"ok": False, "status": "failed", "pool_id": "", "pool_name": "", "error": str(e)}
+
+    payload = {
+        "name": cookie_data.get("name", ""),
+        "cookie": cookie_data.get("cookie", ""),
+    }
+    if not payload["cookie"]:
+        await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败：Cookie 内容为空")
+        return {"ok": False, "status": "failed", "pool_id": "", "pool_name": "", "error": "Cookie 内容为空"}
+
+    return await import_payload_to_token_pool_result(payload, prefix)
+
+
+async def import_payload_to_token_pool(payload: dict, prefix: str) -> bool:
+    result = await import_payload_to_token_pool_result(payload, prefix)
+    return bool(result.get("ok"))
+
+
+async def import_payload_to_token_pool_result(payload: dict, prefix: str) -> dict:
+    if not config.get("token_pool_enabled"):
+        return {"ok": True, "status": "skipped", "pool_id": "", "pool_name": "", "error": ""}
+
+    if not payload.get("cookie"):
+        await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败：Cookie 内容为空")
+        return {"ok": False, "status": "failed", "pool_id": "", "pool_name": "", "error": "Cookie 内容为空"}
+
+    ordered = await reserve_token_pool_order()
+    if not ordered:
+        await task_manager.broadcast(f"{prefix} ⚠️ 自动入池已开启，但没有启用的 Token 池")
+        return {"ok": False, "status": "failed", "pool_id": "", "pool_name": "", "error": "没有启用的 Token 池"}
+
+    last_error = ""
+    for pool in ordered:
+        pool_name = pool.get("name") or "Token 池"
+        await task_manager.broadcast(f"{prefix} 正在自动入池：{pool_name}")
+        ok, error = await import_cookie_to_single_token_pool(prefix, pool, payload)
+        if ok:
+            await record_token_pool_result(pool.get("id", ""), True)
+            await task_manager.broadcast(f"{prefix} ✅ 已自动导入 {pool_name}")
+            return {
+                "ok": True,
+                "status": "imported",
+                "pool_id": pool.get("id", ""),
+                "pool_name": pool_name,
+                "error": "",
+            }
+        await record_token_pool_result(pool.get("id", ""), False)
+        last_error = error
+        await task_manager.broadcast(f"{prefix} ⚠️ {pool_name} 入池失败，尝试下一个池：{error}")
+
+    await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败：全部 Token 池均失败；最后错误：{last_error}")
+    return {"ok": False, "status": "failed", "pool_id": "", "pool_name": "", "error": last_error}
+
+
+def now_text() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def now_ts() -> int:
+    return int(datetime.now().timestamp())
+
+
+def load_child_accounts_sync() -> list[dict]:
+    if not os.path.exists(CHILD_ACCOUNTS_FILE):
+        return []
+    try:
+        with open(CHILD_ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+    except Exception:
+        return []
+    return []
+
+
+def save_child_accounts_sync(accounts: list[dict]) -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(CHILD_ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(accounts, f, ensure_ascii=False, indent=2)
+
+
+def load_child_monitor_logs_sync() -> list[dict]:
+    if not os.path.exists(CHILD_MONITOR_LOG_FILE):
+        return []
+    try:
+        with open(CHILD_MONITOR_LOG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+    except Exception:
+        return []
+    return []
+
+
+def prune_child_monitor_logs(logs: list[dict]) -> list[dict]:
+    cutoff = datetime.now() - timedelta(seconds=CHILD_MONITOR_LOG_RETENTION_SECONDS)
+    kept = []
+    for item in logs:
+        created_at = item.get("created_at", "")
+        try:
+            created_dt = datetime.fromisoformat(created_at)
+        except (TypeError, ValueError):
+            created_dt = datetime.now()
+        if created_dt >= cutoff:
+            kept.append(item)
+    return kept[-CHILD_MONITOR_LOG_MAX_ITEMS:]
+
+
+def save_child_monitor_logs_sync(logs: list[dict]) -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    logs = prune_child_monitor_logs(logs)
+    with open(CHILD_MONITOR_LOG_FILE, "w", encoding="utf-8") as f:
+        json.dump(logs, f, ensure_ascii=False, indent=2)
+
+
+def list_child_monitor_logs_sync() -> list[dict]:
+    logs = prune_child_monitor_logs(load_child_monitor_logs_sync())
+    save_child_monitor_logs_sync(logs)
+    return logs
+
+
+async def append_child_monitor_log(entry: dict) -> dict:
+    log = {
+        "id": uuid.uuid4().hex,
+        "created_at": now_text(),
+        **entry,
+    }
+    async with child_accounts_lock:
+        logs = load_child_monitor_logs_sync()
+        logs.append(log)
+        save_child_monitor_logs_sync(logs)
+    return log
+
+
+def public_child_account(record: dict) -> dict:
+    hidden = dict(record)
+    for key in ("cookie", "access_token", "refresh_token", "email_password", "password"):
+        if hidden.get(key):
+            hidden[key] = "********"
+    return hidden
+
+
+def find_child_record(records: list[dict], child_id: str) -> dict | None:
+    return next((item for item in records if item.get("id") == child_id), None)
+
+
+async def list_child_accounts_raw() -> list[dict]:
+    async with child_accounts_lock:
+        return load_child_accounts_sync()
+
+
+async def save_child_accounts_raw(records: list[dict]) -> None:
+    async with child_accounts_lock:
+        save_child_accounts_sync(records)
+
+
+async def upsert_child_account(record: dict) -> dict:
+    async with child_accounts_lock:
+        records = load_child_accounts_sync()
+        email_key = (record.get("email") or "").strip().lower()
+        account_id = record.get("adobe_account_id", "")
+        existing = next(
+            (
+                item for item in records
+                if (item.get("email") or "").strip().lower() == email_key
+                and item.get("adobe_account_id", "") == account_id
+                and item.get("status") not in ("removed", "replaced")
+            ),
+            None,
+        )
+        if existing:
+            existing.update(record)
+            existing["updated_at"] = now_text()
+            saved = existing
+        else:
+            saved = {
+                "id": uuid.uuid4().hex,
+                "created_at": now_text(),
+                "updated_at": now_text(),
+                **record,
+            }
+            records.append(saved)
+        save_child_accounts_sync(records)
+        return saved
+
+
+async def update_child_account(child_id: str, **updates) -> dict | None:
+    async with child_accounts_lock:
+        records = load_child_accounts_sync()
+        record = find_child_record(records, child_id)
+        if not record:
+            return None
+        record.update(updates)
+        record["updated_at"] = now_text()
+        save_child_accounts_sync(records)
+        return record
+
+
+def child_cookie_payload(record: dict) -> dict:
+    return {
+        "name": record.get("email", ""),
+        "cookie": record.get("cookie", ""),
+    }
+
+
+def child_cookie_export_payload(record: dict) -> dict:
+    return {
+        "cookie": record.get("cookie", ""),
+        "name": record.get("email", ""),
+        "email": record.get("email", ""),
+        "password": record.get("password", ""),
+        "access_token": record.get("access_token", ""),
+        "credits": record.get("credits_available"),
+        "expires_at": record.get("expires_at"),
+        "display_name": record.get("display_name", ""),
+        "user_id": record.get("user_id", ""),
+        "refresh_token": record.get("refresh_token", ""),
+    }
+
+
+def build_child_account_record(
+    *,
+    account: dict,
+    reserved: dict,
+    cookie_file: str,
+    cookie_data: dict,
+    task: Task | None,
+) -> dict:
+    credits = cookie_data.get("credits")
+    try:
+        credits_value = float(credits) if credits is not None else None
+    except (TypeError, ValueError):
+        credits_value = None
+    return {
+        "email": (reserved.get("email") or cookie_data.get("email") or "").strip(),
+        "password": reserved.get("password") or cookie_data.get("password", ""),
+        "email_password": reserved.get("password", ""),
+        "api_url": reserved.get("api_url", ""),
+        "client_id": reserved.get("client_id", ""),
+        "refresh_token": cookie_data.get("refresh_token") or reserved.get("refresh_token", ""),
+        "adobe_account_id": account.get("id", ""),
+        "adobe_account_email": account.get("email", ""),
+        "adobe_account_name": account.get("name", ""),
+        "org_id": account.get("organization_id", "") or account.get("org_id", ""),
+        "product_id": account.get("product_id", ""),
+        "product_name": account.get("product_name", ""),
+        "license_group_id": account.get("license_group_id", ""),
+        "member_id": reserved.get("_member_id", ""),
+        "cookie_file": cookie_file,
+        "cookie": cookie_data.get("cookie", ""),
+        "access_token": cookie_data.get("access_token", ""),
+        "user_id": cookie_data.get("user_id", ""),
+        "display_name": cookie_data.get("display_name", ""),
+        "expires_at": cookie_data.get("expires_at"),
+        "credits_available": credits_value,
+        "credits_updated_at": now_ts() if credits_value is not None else None,
+        "status": "active",
+        "external_pool_status": "pending",
+        "external_pool_error": "",
+        "last_checked_at": "",
+        "check_failures": 0,
+        "failure_reason": "",
+        "source_task_id": getattr(task, "id", None),
+    }
+
+
+async def create_child_account_from_cookie(
+    *,
+    account: dict,
+    reserved: dict,
+    cookie_file: str,
+    task: Task | None,
+) -> dict | None:
+    try:
+        with open(cookie_file, "r", encoding="utf-8") as f:
+            cookie_data = json.load(f)
+    except Exception as exc:
+        await task_manager.broadcast(f"[子账号池] ⚠️ 无法读取子账号 cookie 文件：{exc}")
+        return None
+    record = build_child_account_record(
+        account=account,
+        reserved=reserved,
+        cookie_file=cookie_file,
+        cookie_data=cookie_data,
+        task=task,
+    )
+    saved = await upsert_child_account(record)
+    await task_manager.broadcast(f"[子账号池] ✅ 已保存 {saved.get('email')} 到内部子账号池")
+    return saved
+
+
+def child_needs_token_refresh(record: dict) -> bool:
+    expires_at = record.get("expires_at")
+    try:
+        return bool(expires_at) and int(expires_at) <= now_ts() + 120
+    except (TypeError, ValueError):
+        return False
+
+
+async def refresh_child_firefly_login(record: dict, prefix: str = "[子账号池]") -> dict:
+    email = record.get("email", "")
+    refresh_token = record.get("refresh_token", "")
+    client_id = record.get("client_id", "")
+    mail_url = record.get("api_url", "")
+    if not mail_url and not (refresh_token and client_id):
+        raise RuntimeError("缺少子号取件配置，无法重新协议登录刷新 token")
+
+    loop = asyncio.get_running_loop()
+
+    def log(message: str) -> None:
+        loop.call_soon_threadsafe(
+            asyncio.create_task,
+            task_manager.broadcast(f"{prefix} {email} {message}"),
+        )
+
+    result = await asyncio.to_thread(
+        firefly_protocol.register_account,
+        email=email,
+        refresh_token=refresh_token,
+        client_id=client_id,
+        mail_url=mail_url,
+        proxy_url=adobe_proxy_url(),
+        otp_timeout=180,
+        log=log,
+    )
+    rotated = result.get("rotated_refresh_token") or ""
+    updates = {
+        "access_token": result.get("access_token", ""),
+        "cookie": result.get("cookie", ""),
+        "user_id": result.get("user_id", ""),
+        "display_name": result.get("display_name", ""),
+        "expires_at": result.get("expires_at"),
+        "failure_reason": "",
+    }
+    if rotated:
+        updates["refresh_token"] = rotated
+        await update_self_email_refresh_token(email, rotated)
+    credits = result.get("credits")
+    if credits is not None:
+        updates["credits_available"] = float(credits)
+        updates["credits_updated_at"] = now_ts()
+    updated = await update_child_account(record.get("id", ""), **updates)
+    return updated or {**record, **updates}
+
+
+async def refresh_child_credits(child_id: str, *, allow_relogin: bool = True) -> dict:
+    records = await list_child_accounts_raw()
+    record = find_child_record(records, child_id)
+    if not record:
+        raise RuntimeError("子账号不存在")
+    if record.get("status") not in ("active", "check_failed"):
+        raise RuntimeError("该子账号不是可检测状态")
+
+    working = record
+    if allow_relogin and child_needs_token_refresh(working):
+        working = await refresh_child_firefly_login(working)
+
+    credits = await asyncio.to_thread(
+        firefly_protocol.fetch_credits,
+        working.get("access_token", ""),
+        working.get("user_id", ""),
+        adobe_proxy_url(),
+    )
+    if credits is None and allow_relogin:
+        working = await refresh_child_firefly_login(working)
+        credits = await asyncio.to_thread(
+            firefly_protocol.fetch_credits,
+            working.get("access_token", ""),
+            working.get("user_id", ""),
+            adobe_proxy_url(),
+        )
+
+    if credits is None:
+        failures = int(working.get("check_failures", 0) or 0) + 1
+        status = "check_failed" if failures >= int(config.get("child_monitor_max_failures", 3) or 3) else working.get("status", "active")
+        updated = await update_child_account(
+            child_id,
+            check_failures=failures,
+            status=status,
+            last_checked_at=now_text(),
+            failure_reason="积分查询失败",
+        )
+        raise RuntimeError((updated or working).get("failure_reason", "积分查询失败"))
+
+    updated = await update_child_account(
+        child_id,
+        credits_available=float(credits),
+        credits_updated_at=now_ts(),
+        check_failures=0,
+        status="active",
+        last_checked_at=now_text(),
+        failure_reason="",
+    )
+    return updated or working
+
+
+def monitored_token_pools() -> list[dict]:
+    pools = [pool for pool in normalize_token_pools() if pool.get("enabled")]
+    selected = set(str(pool_id) for pool_id in config.get("child_monitor_pool_ids", []) if str(pool_id))
+    if selected:
+        pools = [pool for pool in pools if pool.get("id") in selected]
+    return pools
+
+
+async def fetch_exhausted_emails_from_pool(pool: dict) -> tuple[set[str], str, int]:
+    url = build_token_pool_exhausted_url(pool.get("site", ""))
+    key = (pool.get("key") or "").strip()
+    if not url or not key:
+        return set(), "Token 池地址或密钥未配置", 1
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "X-Token-Pool-Key": key,
+        "Accept": "application/json",
+    }
+    last_error = ""
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(url, headers=headers)
+            if response.status_code < 200 or response.status_code >= 300:
+                last_error = f"HTTP {response.status_code} {(response.text or '')[:160]}"
+            else:
+                data = response.json()
+                emails = data.get("emails") if isinstance(data, dict) else []
+                if not isinstance(emails, list):
+                    last_error = "响应缺少 emails 数组"
+                else:
+                    return {
+                        str(email).strip().lower()
+                        for email in emails
+                        if str(email or "").strip()
+                    }, "", attempt
+        except Exception as exc:
+            last_error = str(exc)
+
+        if attempt < max_attempts:
             await asyncio.sleep(2)
 
-    await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败：{last_error}")
-    return False
+    return set(), last_error, max_attempts
+
+
+async def fetch_exhausted_email_index() -> tuple[dict[str, set[str]], dict[str, str], list[dict]]:
+    exhausted: dict[str, set[str]] = {}
+    errors: dict[str, str] = {}
+    pool_results: list[dict] = []
+    for pool in monitored_token_pools():
+        pool_id = pool.get("id") or ""
+        emails, error, attempts = await fetch_exhausted_emails_from_pool(pool)
+        if error:
+            errors[pool_id] = error
+            pool_results.append({
+                "pool_id": pool_id,
+                "pool_name": pool.get("name") or "Token 池",
+                "site": pool.get("site", ""),
+                "ok": False,
+                "count": 0,
+                "error": error,
+                "attempts": attempts,
+            })
+            continue
+        pool_results.append({
+            "pool_id": pool_id,
+            "pool_name": pool.get("name") or "Token 池",
+            "site": pool.get("site", ""),
+            "ok": True,
+            "count": len(emails),
+            "error": "",
+            "attempts": attempts,
+        })
+        for email in emails:
+            exhausted.setdefault(email, set()).add(pool_id)
+    return exhausted, errors, pool_results
+
+
+async def delete_exhausted_email_from_pool(pool: dict, email: str) -> dict:
+    url = build_token_pool_exhausted_url(pool.get("site", ""))
+    key = (pool.get("key") or "").strip()
+    pool_id = pool.get("id") or ""
+    pool_name = pool.get("name") or "Token 池"
+    result = {
+        "pool_id": pool_id,
+        "pool_name": pool_name,
+        "ok": False,
+        "status": "failed",
+        "deleted_count": 0,
+        "missing_emails": [],
+        "error": "",
+    }
+    if not url or not key:
+        result["error"] = "Token 池地址或密钥未配置"
+        return result
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "X-Token-Pool-Key": key,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.request("DELETE", url, json={"emails": [email]}, headers=headers)
+        try:
+            data = response.json() if response.content else {}
+        except ValueError:
+            data = {}
+        if response.status_code < 200 or response.status_code >= 300:
+            result["error"] = f"HTTP {response.status_code} {(response.text or '')[:160]}"
+            return result
+        deleted_count = int(data.get("deleted_count", 0) or 0) if isinstance(data, dict) else 0
+        result.update({
+            "ok": True,
+            "status": data.get("status", "ok") if isinstance(data, dict) else "ok",
+            "deleted_count": deleted_count,
+            "missing_emails": data.get("missing_emails", []) if isinstance(data, dict) else [],
+            "token_count": data.get("token_count", 0) if isinstance(data, dict) else 0,
+        })
+        return result
+    except Exception as exc:
+        result["error"] = str(exc)
+        return result
+
+
+async def cleanup_replaced_child_token(child_id: str, prefix: str = "[子账号池]") -> list[dict]:
+    records = await list_child_accounts_raw()
+    record = find_child_record(records, child_id)
+    if not record:
+        return []
+    email = (record.get("email") or "").strip()
+    pool_ids = [str(pool_id) for pool_id in (record.get("exhausted_pool_ids") or []) if str(pool_id)]
+    if not email or not pool_ids:
+        await update_child_account(
+            child_id,
+            exhausted_token_delete_status="skipped",
+            exhausted_token_delete_error="未记录耗尽来源池，跳过号池删除",
+        )
+        return []
+
+    selected = set(pool_ids)
+    pools = [pool for pool in monitored_token_pools() if pool.get("id") in selected]
+    if not pools:
+        await update_child_account(
+            child_id,
+            exhausted_token_delete_status="skipped",
+            exhausted_token_delete_error="耗尽来源池未启用或不存在",
+        )
+        return []
+
+    results = []
+    for pool in pools:
+        pool_name = pool.get("name") or "Token 池"
+        await task_manager.broadcast(f"{prefix} 清理旧耗尽 token：{pool_name} / {email}")
+        result = await delete_exhausted_email_from_pool(pool, email)
+        results.append(result)
+        if result.get("ok"):
+            await task_manager.broadcast(
+                f"{prefix} ✅ 已从 {pool_name} 删除旧耗尽 token：{email}，删除 {result.get('deleted_count', 0)} 个"
+            )
+        else:
+            await task_manager.broadcast(
+                f"{prefix} ⚠️ {pool_name} 删除旧耗尽 token 失败：{result.get('error', '')}"
+            )
+
+    failed = [item for item in results if not item.get("ok")]
+    deleted_count = sum(int(item.get("deleted_count", 0) or 0) for item in results if item.get("ok"))
+    await update_child_account(
+        child_id,
+        exhausted_token_deleted_at=now_text(),
+        exhausted_token_delete_status="failed" if failed else "deleted" if deleted_count else "not_found",
+        exhausted_token_delete_error="；".join(
+            f"{item.get('pool_name')}: {item.get('error', '')}" for item in failed
+        ),
+        exhausted_token_delete_results=results,
+        exhausted_token_deleted_count=deleted_count,
+    )
+    return results
+
+
+async def check_child_exhausted(child_id: str) -> dict:
+    records = await list_child_accounts_raw()
+    record = find_child_record(records, child_id)
+    if not record:
+        raise RuntimeError("子账号不存在")
+    exhausted, errors, _pool_results = await fetch_exhausted_email_index()
+    email = (record.get("email") or "").strip().lower()
+    pool_ids = sorted(exhausted.get(email, set()))
+    updates = {
+        "last_checked_at": now_text(),
+        "exhausted_pool_ids": pool_ids,
+        "exhausted_detected_at": now_text() if pool_ids else record.get("exhausted_detected_at", ""),
+        "failure_reason": "" if not errors else "部分 Token 池查询失败",
+    }
+    if pool_ids and record.get("status") == "active":
+        updates["status"] = "exhausted"
+    elif not pool_ids and record.get("status") in ("exhausted", "check_failed"):
+        updates["status"] = "active"
+    updated = await update_child_account(child_id, **updates)
+    return updated or record
+
+
+async def remove_child_member(record: dict, reason: str = "手动移除") -> dict:
+    account = find_adobe_account(record.get("adobe_account_id", ""))
+    if not account:
+        raise RuntimeError("所属母号不存在")
+    email = record.get("email", "")
+    if not email:
+        raise RuntimeError("子账号邮箱为空")
+    async with adobe_account_lock:
+        results = await remove_adobe_members(account, [email])
+    result = results[0] if results else {"ok": False, "message": "移除接口无返回"}
+    if not result.get("ok"):
+        raise RuntimeError(result.get("message") or "移除成员失败")
+    updated = await update_child_account(
+        record.get("id", ""),
+        status="removed",
+        removed_at=now_text(),
+        failure_reason="",
+        replacement_reason=reason,
+    )
+    return updated or record
+
+
+async def create_replacement_task(record: dict, reason: str = "自动换号") -> Task:
+    account_id = record.get("adobe_account_id", "")
+    if not find_adobe_account(account_id):
+        raise RuntimeError("所属母号不存在，无法补号")
+    task = task_manager.create_task(
+        1,
+        1,
+        False,
+        f"子号补号: {record.get('email', '')}",
+        "self",
+        "invite",
+        [account_id],
+        False,
+    )
+    task.replacement_child_id = record.get("id", "")
+    await task_manager.queue.put(task)
+    asyncio.create_task(task_manager.start_queue_worker())
+    await task_manager.broadcast(f"[子账号池] 已创建补号任务 #{task.id}：{reason}")
+    await task_manager.broadcast("__STATE_UPDATE__")
+    return task
+
+
+async def replace_child_account(child_id: str, reason: str = "积分低于阈值") -> dict:
+    records = await list_child_accounts_raw()
+    record = find_child_record(records, child_id)
+    if not record:
+        raise RuntimeError("子账号不存在")
+    account_id = record.get("adobe_account_id", "")
+    lock = child_replacement_locks.setdefault(account_id, asyncio.Lock())
+    async with lock:
+        records = await list_child_accounts_raw()
+        record = find_child_record(records, child_id)
+        if not record:
+            raise RuntimeError("子账号不存在")
+        if record.get("status") in ("replacing", "replaced"):
+            return record
+        if record.get("status") == "removed":
+            task = await create_replacement_task(record, reason)
+            updated = await update_child_account(
+                child_id,
+                replacement_task_id=task.id,
+                failure_reason="",
+            )
+            return updated or record
+        await update_child_account(child_id, status="replacing", failure_reason="", replacement_reason=reason)
+        try:
+            removed = await remove_child_member(record, reason)
+            task = await create_replacement_task(removed, reason)
+            updated = await update_child_account(
+                child_id,
+                status="removed",
+                replacement_task_id=task.id,
+                replaced_at="",
+                failure_reason="",
+            )
+            return updated or removed
+        except Exception as exc:
+            updated = await update_child_account(child_id, status="active", failure_reason=f"换号失败：{exc}")
+            raise RuntimeError(str(exc)) from exc
+
+
+async def monitor_child_accounts_once(source: str = "manual") -> dict:
+    records = await list_child_accounts_raw()
+    active = [record for record in records if record.get("status") in ("active", "exhausted", "check_failed")]
+    exhausted, errors, pool_results = await fetch_exhausted_email_index()
+    checked = len(active)
+    matched = 0
+    replaced = 0
+    failed = 0
+    matched_accounts = []
+    replacements = []
+    failed_accounts = []
+    for record in active:
+        email = (record.get("email") or "").strip().lower()
+        pool_ids = sorted(exhausted.get(email, set()))
+        try:
+            if pool_ids:
+                matched += 1
+                matched_accounts.append({
+                    "child_id": record.get("id", ""),
+                    "email": record.get("email", ""),
+                    "adobe_account_email": record.get("adobe_account_email", ""),
+                    "pool_ids": pool_ids,
+                })
+                await update_child_account(
+                    record.get("id", ""),
+                    status="exhausted",
+                    exhausted_pool_ids=pool_ids,
+                    exhausted_detected_at=now_text(),
+                    last_checked_at=now_text(),
+                    failure_reason="",
+                )
+                updated = await replace_child_account(record.get("id", ""), f"Token 池标记耗尽：{', '.join(pool_ids)}")
+                replacements.append({
+                    "child_id": record.get("id", ""),
+                    "email": record.get("email", ""),
+                    "replacement_task_id": updated.get("replacement_task_id"),
+                    "status": updated.get("status", ""),
+                })
+                replaced += 1
+            else:
+                updates = {
+                    "last_checked_at": now_text(),
+                    "exhausted_pool_ids": [],
+                }
+                if record.get("status") in ("exhausted", "check_failed"):
+                    updates["status"] = "active"
+                await update_child_account(record.get("id", ""), **updates)
+        except Exception as exc:
+            failed += 1
+            failed_accounts.append({
+                "child_id": record.get("id", ""),
+                "email": record.get("email", ""),
+                "error": str(exc),
+            })
+    summary = {
+        "checked": checked,
+        "matched": matched,
+        "refreshed": matched,
+        "replaced": replaced,
+        "failed": failed,
+        "pool_errors": errors,
+        "pool_results": pool_results,
+        "matched_accounts": matched_accounts,
+        "replacements": replacements,
+        "failed_accounts": failed_accounts,
+    }
+    await append_child_monitor_log({
+        "source": source,
+        **summary,
+    })
+    return summary
+
+
+async def child_monitor_loop():
+    while True:
+        interval = max(60, int(config.get("child_monitor_interval", 600) or 600))
+        try:
+            if config.get("child_monitor_enabled"):
+                summary = await monitor_child_accounts_once("auto")
+                if summary["checked"]:
+                    await task_manager.broadcast(
+                        "[子账号池] 监测完成："
+                        f"检测 {summary['checked']}，命中 {summary['matched']}，"
+                        f"换号 {summary['replaced']}，失败 {summary['failed']}"
+                    )
+        except Exception as exc:
+            await append_child_monitor_log({
+                "source": "auto",
+                "checked": 0,
+                "matched": 0,
+                "refreshed": 0,
+                "replaced": 0,
+                "failed": 1,
+                "pool_errors": {},
+                "pool_results": [],
+                "matched_accounts": [],
+                "replacements": [],
+                "failed_accounts": [{"error": str(exc)}],
+            })
+            await task_manager.broadcast(f"[子账号池] 监测异常：{exc}")
+        await asyncio.sleep(interval)
+
+
+def ensure_child_monitor_started() -> None:
+    global child_monitor_task
+    if child_monitor_task and not child_monitor_task.done():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    child_monitor_task = loop.create_task(child_monitor_loop())
+
+
+def write_protocol_cookie_result(cookie_id: str, email: str, password: str, record: dict) -> str:
+    cookie_file = os.path.join(SCREENSHOT_DIR, f"cookie_{cookie_id}.json")
+    data = {
+        "cookie": record.get("cookie", ""),
+        "name": email,
+        "email": email,
+        "password": password,
+        "access_token": record.get("access_token", ""),
+        "credits": record.get("credits"),
+        "expires_at": record.get("expires_at"),
+        "display_name": record.get("display_name", ""),
+        "user_id": record.get("user_id", ""),
+        "refresh_token": record.get("rotated_refresh_token", ""),
+    }
+    with open(cookie_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+    return cookie_file
+
+
+async def register_invited_self_email(account: dict, reserved: dict, cookie_id: str, prefix: str) -> str:
+    email = reserved["email"]
+    password = reserved.get("password", "")
+    mail_url = reserved.get("api_url", "")
+    refresh_token = reserved.get("refresh_token", "")
+    client_id = reserved.get("client_id", "")
+    if not mail_url and not (refresh_token and client_id):
+        raise RuntimeError("子号缺少 API 取件链接，且没有 ClientID / RefreshToken 可用于 Graph/IMAP 收码")
+
+    loop = asyncio.get_running_loop()
+
+    def log(message: str) -> None:
+        loop.call_soon_threadsafe(
+            asyncio.create_task,
+            task_manager.broadcast(f"{prefix} {message}"),
+        )
+
+    record = await asyncio.to_thread(
+        firefly_protocol.register_account,
+        email=email,
+        refresh_token=refresh_token,
+        client_id=client_id,
+        mail_url=mail_url,
+        proxy_url=adobe_proxy_url(),
+        otp_timeout=180,
+        log=log,
+    )
+    rotated = record.get("rotated_refresh_token") or ""
+    if rotated:
+        await update_self_email_refresh_token(email, rotated)
+    return write_protocol_cookie_result(cookie_id, email, password, record)
 
 
 def parse_self_email_accounts(raw: str) -> list[dict]:
@@ -1731,13 +3281,32 @@ def parse_self_email_accounts(raw: str) -> list[dict]:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        parts = [part.strip() for part in line.split("----")]
-        if len(parts) < 3 or not parts[0] or not parts[1] or not parts[2]:
+        if "----" in line:
+            parts = [part.strip() for part in line.split("----")]
+        else:
+            parts = [part.strip() for part in line.split("-", 2)]
+        if len(parts) < 3 or not parts[0] or not parts[1]:
+            continue
+        api_url = ""
+        client_id = ""
+        refresh_token = ""
+        if len(parts) >= 5:
+            client_id = parts[2]
+            refresh_token = parts[3]
+            api_url = "----".join(parts[4:]).strip()
+        elif len(parts) >= 4:
+            client_id = parts[2]
+            refresh_token = "----".join(parts[3:]).strip()
+        elif parts[2].startswith(("http://", "https://", "moemail://")):
+            api_url = parts[2]
+        else:
             continue
         accounts.append({
             "email": parts[0],
             "password": parts[1],
-            "api_url": "----".join(parts[2:]).strip(),
+            "api_url": api_url,
+            "client_id": client_id,
+            "refresh_token": refresh_token,
         })
     return accounts
 
@@ -1762,6 +3331,9 @@ def build_self_email_overview() -> dict:
             "email": account["email"],
             "password_mask": "*" * min(max(len(password), 6), 12),
             "api_url": account["api_url"],
+            "client_id": account.get("client_id", ""),
+            "has_refresh_token": bool(account.get("refresh_token")),
+            "receive_mode": "API" if account["api_url"] else ("Graph/IMAP" if account.get("client_id") and account.get("refresh_token") else ""),
             "used": email_key in used,
         })
     used_count = sum(1 for row in rows if row["used"])
@@ -1775,10 +3347,34 @@ def build_self_email_overview() -> dict:
 
 
 def serialize_self_email_accounts(accounts: list[dict]) -> str:
-    return "\n".join(
-        f"{account['email']}----{account['password']}----{account['api_url']}"
-        for account in accounts
-    )
+    lines = []
+    for account in accounts:
+        if account.get("client_id") or account.get("refresh_token"):
+            lines.append(
+                f"{account['email']}----{account['password']}----"
+                f"{account.get('client_id', '')}----{account.get('refresh_token', '')}----"
+                f"{account.get('api_url', '')}"
+            )
+        else:
+            lines.append(f"{account['email']}----{account['password']}----{account.get('api_url', '')}")
+    return "\n".join(lines)
+
+
+async def update_self_email_refresh_token(email: str, refresh_token: str):
+    global config
+    if not email or not refresh_token:
+        return
+    email_key = email.strip().lower()
+    async with self_email_lock:
+        accounts = parse_self_email_accounts(config.get("self_email_accounts", ""))
+        changed = False
+        for account in accounts:
+            if account["email"].strip().lower() == email_key and account.get("refresh_token") != refresh_token:
+                account["refresh_token"] = refresh_token
+                changed = True
+        if changed:
+            config["self_email_accounts"] = serialize_self_email_accounts(accounts)
+            save_config(config)
 
 
 async def allocate_self_email_account() -> dict | None:
@@ -1956,98 +3552,183 @@ async def allocate_self_email_batch(quantity: int) -> list[dict]:
 
 
 async def run_invite_task(task: Task):
-    worker_index = 0
     for account_position, account_id in enumerate(task.adobe_account_ids, 1):
         if task.status == "stopping":
             break
         account = find_adobe_account(account_id)
         if not account:
             task.failed += task.batch_quantity
-            await task_manager.broadcast(f"[任务#{task.id}] ❌ 所选 Adobe 账号已不存在，跳过本批")
+            await task_manager.broadcast(f"[Task#{task.id}] ERROR: selected Adobe admin account no longer exists; skipping")
             continue
 
-        account_label = account.get("name") or account_id
-        prefix = f"[任务#{task.id} · {account_label}]"
-        batch = await allocate_self_email_batch(task.batch_quantity)
-        if len(batch) < task.batch_quantity:
-            for reserved in batch:
-                await release_self_email_account(reserved["email"])
-            task.failed += task.batch_quantity
-            await task_manager.broadcast(f"{prefix} ❌ 可用自备邮箱不足，跳过本批")
-            continue
+        account_label = account.get("email") or account.get("name") or account_id
+        prefix = f"[Task#{task.id}: {account_label}]"
+        target_success = max(1, int(task.batch_quantity or task.quantity or 1))
+        account_success = 0
+        registration_attempts = 0
+        max_registration_attempts = target_success * 5
+        await task_manager.broadcast(
+            f"{prefix} 目标 {target_success} 个成功账号；每个目标最多换邮箱 5 次，直到凑满或邮箱池耗尽"
+        )
 
         if task.invite_remove_members:
-            await task_manager.broadcast(f"{prefix} 正在获取并清理全部可移除成员...")
+            await task_manager.broadcast(f"{prefix} Step 1/3：读取并清理全部可移除成员...")
             try:
                 async with adobe_account_lock:
                     removable = await collect_removable_adobe_member_emails(account)
                     removal_results = await remove_adobe_members(account, removable) if removable else []
                 removal_failures = [result for result in removal_results if not result["ok"]]
-                await task_manager.broadcast(
-                    f"{prefix} 已清理 {len(removal_results) - len(removal_failures)} 个成员"
-                    + (f"，{len(removal_failures)} 个移除失败" if removal_failures else "")
-                )
+                removed_count = len(removal_results) - len(removal_failures)
+                suffix = f"，{len(removal_failures)} 个移除失败" if removal_failures else ""
+                await task_manager.broadcast(f"{prefix} 成员清理完成：已移除 {removed_count} 个{suffix}")
             except Exception as exc:
-                for reserved in batch:
-                    await release_self_email_account(reserved["email"])
-                task.failed += task.batch_quantity
-                await task_manager.broadcast(f"{prefix} ❌ 清理成员失败，本批已取消: {exc}")
+                task.failed += target_success
+                await task_manager.broadcast(f"{prefix} ❌ 成员清理失败，本母号取消：{exc}")
                 continue
         else:
-            await task_manager.broadcast(f"{prefix} 已关闭先移除成员，直接发送团队邀请...")
+            await task_manager.broadcast(f"{prefix} Step 1/3：已关闭清理成员，直接开始授权")
 
-        emails = [reserved["email"] for reserved in batch]
-        await task_manager.broadcast(f"{prefix} 正在发送 {len(emails)} 封团队邀请...")
-        try:
-            async with adobe_account_lock:
-                invite_results = await invite_adobe_members(account, emails)
-        except Exception as exc:
-            invite_results = [{"email": email, "ok": False, "message": str(exc)} for email in emails]
+        sem = asyncio.Semaphore(max(1, task.concurrency))
 
-        successful = []
-        for reserved, result in zip(batch, invite_results):
-            if result["ok"]:
-                await mark_self_email_used(reserved["email"])
-                successful.append(reserved)
-                await task_manager.broadcast(f"{prefix} ✅ {reserved['email']} 邀请已发送")
-            else:
-                await release_self_email_account(reserved["email"])
-                task.failed += 1
-                await task_manager.broadcast(f"{prefix} ❌ {reserved['email']} 邀请失败: {result['message']}")
-
-        await task_manager.broadcast("__STATE_UPDATE__")
-        if not successful or task.status == "stopping":
-            continue
-
-        if INVITE_EMAIL_WAIT_SECONDS:
-            await task_manager.broadcast(
-                f"{prefix} 等待邀请邮件送达，{INVITE_EMAIL_WAIT_SECONDS} 秒后开始注册..."
-            )
-        else:
-            await task_manager.broadcast(f"{prefix} 开始轮询邀请邮件并执行注册...")
-        waited = 0
-        while waited < INVITE_EMAIL_WAIT_SECONDS and task.status != "stopping":
-            interval = min(5, INVITE_EMAIL_WAIT_SECONDS - waited)
-            await asyncio.sleep(interval)
-            waited += interval
-        if task.status == "stopping":
-            break
-
-        sem = asyncio.Semaphore(task.concurrency)
-
-        async def wrapper(reserved: dict):
-            nonlocal worker_index
-            worker_index += 1
-            index = worker_index
+        async def run_invite_slot(slot_index: int) -> bool | None:
+            nonlocal account_success, registration_attempts
+            worker_prefix = f"[Task#{task.id}-{slot_index}: {account_label}]"
             async with sem:
-                if task.status == "stopping":
-                    return
-                await execute_single_worker(task, index, reserved)
+                for attempt in range(1, 6):
+                    if task.status == "stopping":
+                        return False
 
-        workers = [asyncio.create_task(wrapper(reserved)) for reserved in successful]
+                    reserved = await allocate_self_email_account()
+                    if not reserved:
+                        await task_manager.broadcast(
+                            f"{worker_prefix} ⚠️ 自备邮箱池已耗尽，子任务停止于第 {attempt}/5 次"
+                        )
+                        return None
+
+                    registration_attempts += 1
+                    email = reserved["email"]
+                    await task_manager.broadcast(
+                        f"{worker_prefix} Step 2/3：第 {attempt}/5 次尝试，授权 {email}"
+                    )
+
+                    try:
+                        async with adobe_account_lock:
+                            invite_results = await invite_adobe_members(account, [email])
+                        invite_result = invite_results[0] if invite_results else {
+                            "email": email, "ok": False, "message": "授权接口无返回"
+                        }
+                    except Exception as exc:
+                        invite_result = {"email": email, "ok": False, "message": str(exc)}
+
+                    if not invite_result.get("ok"):
+                        await release_self_email_account(email)
+                        task.failed += 1
+                        await task_manager.broadcast(
+                            f"{worker_prefix} ❌ [{email}] 授权失败：{invite_result.get('message', '')}，释放邮箱"
+                        )
+                        await task_manager.broadcast("__STATE_UPDATE__")
+                        continue
+
+                    reserved["_member_id"] = invite_result.get("member_id", "")
+                    await task_manager.broadcast(f"{worker_prefix} ✅ [{email}] 授权成功")
+
+                    if task.status == "stopping":
+                        await mark_self_email_used(email)
+                        with suppress(Exception):
+                            async with adobe_account_lock:
+                                await remove_adobe_members(account, [email])
+                        await task_manager.broadcast("__STATE_UPDATE__")
+                        return False
+
+                    try:
+                        await task_manager.broadcast(
+                            f"{worker_prefix} Step 3/3：[{email}] 收码、补全资料并登录 Firefly"
+                        )
+                        cookie_id = f"task{task.id}_slot{slot_index}_try{attempt}"
+                        cookie_file = await register_invited_self_email(
+                            account, reserved, cookie_id, worker_prefix
+                        )
+                        await mark_self_email_used(email)
+                        task.completed += 1
+                        task.result_files.append(cookie_file)
+                        account_success += 1
+                        child_record = await create_child_account_from_cookie(
+                            account=account,
+                            reserved=reserved,
+                            cookie_file=cookie_file,
+                            task=task,
+                        )
+                        replacement_child_id = getattr(task, "replacement_child_id", "")
+                        if replacement_child_id and child_record:
+                            await update_child_account(
+                                replacement_child_id,
+                                status="replaced",
+                                replaced_at=now_text(),
+                                replacement_child_id=child_record.get("id", ""),
+                            )
+                        await task_manager.broadcast(
+                            f"{worker_prefix} ✅ [{email}] 子任务完成，已导出 Firefly cookie/token；"
+                            f"累计成功 {account_success}/{target_success}"
+                        )
+                        external_enabled = bool(config.get("token_pool_enabled"))
+                        external_result = await import_cookie_to_token_pool_result(cookie_file, worker_prefix)
+                        external_ok = bool(external_result.get("ok"))
+                        if child_record:
+                            await update_child_account(
+                                child_record.get("id", ""),
+                                external_pool_status=(
+                                    "imported" if external_enabled and external_ok
+                                    else "skipped" if not external_enabled
+                                    else "failed"
+                                ),
+                                external_pool_id=external_result.get("pool_id", "") if external_enabled and external_ok else "",
+                                external_pool_name=external_result.get("pool_name", "") if external_enabled and external_ok else "",
+                                external_pool_error="" if external_ok else external_result.get("error", "") or "外部 Token 池导入失败",
+                            )
+                        if external_ok:
+                            if config.get("token_pool_enabled"):
+                                task.token_pool_imported += 1
+                                task.token_pool_imported_files.append(cookie_file)
+                        if replacement_child_id and child_record:
+                            await cleanup_replaced_child_token(replacement_child_id, worker_prefix)
+                        await task_manager.broadcast("__STATE_UPDATE__")
+                        return True
+                    except Exception as exc:
+                        task.failed += 1
+                        await mark_self_email_used(email)
+                        await task_manager.broadcast(
+                            f"{worker_prefix} ❌ [{email}] 注册失败：{exc}，"
+                            f"邮箱标记已使用并尝试移除成员，准备换邮箱"
+                        )
+                        with suppress(Exception):
+                            async with adobe_account_lock:
+                                await remove_adobe_members(account, [email])
+                        await task_manager.broadcast("__STATE_UPDATE__")
+
+                await task_manager.broadcast(f"{worker_prefix} ⚠️ 子任务已达到 5 次尝试上限")
+                return False
+
+        await task_manager.broadcast(
+            f"{prefix} Step 2/3：启动 {target_success} 个子任务，并发 {max(1, task.concurrency)}，每个最多 5 次"
+        )
+        workers = [
+            asyncio.create_task(run_invite_slot(slot_index))
+            for slot_index in range(1, target_success + 1)
+        ]
         task.asyncio_tasks = workers
-        await asyncio.gather(*workers, return_exceptions=True)
+        results = await asyncio.gather(*workers, return_exceptions=True)
         task.asyncio_tasks = []
+        account_success = sum(1 for result in results if result is True)
+
+        if account_success >= target_success:
+            await task_manager.broadcast(f"{prefix} ✅ 已凑满目标 {target_success}/{target_success}")
+        elif registration_attempts >= max_registration_attempts:
+            await task_manager.broadcast(
+                f"{prefix} ⚠️ 已达到重试上限，最终成功 {account_success}/{target_success}，"
+                f"总尝试 {registration_attempts}/{max_registration_attempts}"
+            )
+        elif task.status != "stopping":
+            await task_manager.broadcast(f"{prefix} ⚠️ 未凑满目标，最终成功 {account_success}/{target_success}")
 
 
 async def run_task(task: Task):
@@ -2083,6 +3764,13 @@ async def run_task(task: Task):
     elif task.status != "stopped":
         task.status = "completed"
         await task_manager.broadcast(f"🏁 任务 #{task.id} 结束 (成功 {task.completed}, 失败 {task.failed})")
+    replacement_child_id = getattr(task, "replacement_child_id", "")
+    if replacement_child_id and task.completed <= 0:
+        await update_child_account(
+            replacement_child_id,
+            status="removed",
+            failure_reason=f"补号任务 #{task.id} 未成功",
+        )
     await task_manager.broadcast("__STATE_UPDATE__")
 
 # ─── WebSocket ───
@@ -2254,6 +3942,7 @@ app.mount("/", StaticFiles(directory="static", html=True), name="static")
 @app.on_event("startup")
 async def cleanup_profiles_on_startup():
     cleanup_stale_profiles(collect_active_profile_paths(task_manager.tasks))
+    ensure_child_monitor_started()
 
 if __name__ == "__main__":
     import uvicorn
