@@ -2238,6 +2238,47 @@ async def replace_child_account_api(child_id: str):
         return JSONResponse(status_code=500, content={"message": str(exc)})
 
 
+@app.post("/api/child-accounts/replace")
+async def replace_child_accounts_bulk(req: ChildAccountDeleteRequest):
+    ids = [str(item) for item in req.ids if str(item)]
+    if not ids:
+        return JSONResponse(status_code=400, content={"message": "请选择要补号的子账号"})
+    results = []
+    for child_id in ids:
+        records = await list_child_accounts_raw()
+        record = find_child_record(records, child_id)
+        if not record:
+            results.append({"id": child_id, "email": child_id, "ok": False, "skipped": False, "message": "子账号不存在"})
+            continue
+        email = record.get("email", "")
+        if record.get("status") in ("removed", "replaced"):
+            results.append({"id": child_id, "email": email, "ok": False, "skipped": True, "message": "已移除记录不执行补号"})
+            continue
+        try:
+            updated = await replace_child_account(child_id, "批量补号")
+            results.append({
+                "id": child_id,
+                "email": email,
+                "ok": True,
+                "skipped": False,
+                "message": f"已创建补号任务 #{updated.get('replacement_task_id', '-')}",
+                "account": public_child_account(updated),
+            })
+        except Exception as exc:
+            results.append({"id": child_id, "email": email, "ok": False, "skipped": False, "message": str(exc)})
+    success = sum(1 for item in results if item.get("ok"))
+    skipped = sum(1 for item in results if item.get("skipped"))
+    failed = len(results) - success - skipped
+    return {
+        "status": "ok" if failed == 0 else "partial",
+        "total": len(results),
+        "success": success,
+        "skipped": skipped,
+        "failed": failed,
+        "results": results,
+    }
+
+
 @app.post("/api/child-accounts/{child_id}/import-token-pool")
 async def import_child_account_token_pool(child_id: str):
     records = await list_child_accounts_raw()

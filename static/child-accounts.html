@@ -55,6 +55,7 @@
                     <div class="child-pool-actions">
                         <button class="btn-sm primary" id="refresh-btn">刷新列表</button>
                         <button class="btn-sm success" id="run-monitor-btn">立即监测</button>
+                        <button class="btn-sm success" id="replace-selected-btn" disabled>补号选中</button>
                         <button class="btn-sm danger" id="delete-selected-btn" disabled>删除选中</button>
                     </div>
                 </div>
@@ -112,6 +113,7 @@
         const toggleLogBtn = document.getElementById("toggle-log-btn");
         const selectAllAccounts = document.getElementById("select-all-accounts");
         const deleteSelectedBtn = document.getElementById("delete-selected-btn");
+        const replaceSelectedBtn = document.getElementById("replace-selected-btn");
         let monitorLogExpanded = false;
         let accounts = [];
         let selectedIds = new Set();
@@ -171,8 +173,11 @@
         function syncSelectionState() {
             const visibleIds = accounts.map(account => account.id).filter(Boolean);
             const selectedVisibleCount = visibleIds.filter(id => selectedIds.has(id)).length;
+            const replaceableCount = accounts.filter(account => selectedIds.has(account.id) && !["removed", "replaced"].includes(account.status)).length;
             deleteSelectedBtn.disabled = selectedIds.size === 0;
             deleteSelectedBtn.textContent = selectedIds.size ? `删除选中 ${selectedIds.size}` : "删除选中";
+            replaceSelectedBtn.disabled = replaceableCount === 0;
+            replaceSelectedBtn.textContent = replaceableCount ? `补号选中 ${replaceableCount}` : "补号选中";
             selectAllAccounts.checked = visibleIds.length > 0 && selectedVisibleCount === visibleIds.length;
             selectAllAccounts.indeterminate = selectedVisibleCount > 0 && selectedVisibleCount < visibleIds.length;
         }
@@ -320,6 +325,18 @@
             });
         }
 
+        function replaceRecords(ids) {
+            return fetch("/api/child-accounts/replace", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ ids }),
+            }).then(async response => {
+                const data = await response.json().catch(() => ({}));
+                if (!response.ok) throw new Error(data.message || "补号失败");
+                return data;
+            });
+        }
+
         function renderMonitorLogs(logs) {
             if (!logs.length) {
                 monitorLogList.innerHTML = '<div class="empty-hint">暂无监测日志</div>';
@@ -422,6 +439,26 @@
                     return loadAccounts();
                 })
                 .catch(error => showStatus(`❌ ${error.message}`, false))
+                .finally(() => {
+                    btn.disabled = false;
+                    syncSelectionState();
+                });
+        });
+        replaceSelectedBtn.addEventListener("click", event => {
+            const ids = accounts
+                .filter(account => selectedIds.has(account.id) && !["removed", "replaced"].includes(account.status))
+                .map(account => account.id);
+            if (!ids.length) return;
+            if (!confirm(`确认对选中的 ${ids.length} 个子号执行补号？系统会先移除旧成员，再创建同母号补号任务。`)) return;
+            const btn = event.currentTarget;
+            btn.disabled = true;
+            btn.textContent = "补号中...";
+            replaceRecords(ids)
+                .then(data => {
+                    showStatus(`✓ 批量补号完成：成功 ${data.success || 0}，跳过 ${data.skipped || 0}，失败 ${data.failed || 0}`, (data.failed || 0) === 0);
+                    return loadAccounts();
+                })
+                .catch(error => showStatus(`✗ ${error.message}`, false))
                 .finally(() => {
                     btn.disabled = false;
                     syncSelectionState();
