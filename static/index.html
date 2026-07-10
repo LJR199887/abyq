@@ -53,8 +53,12 @@
                 </div>
 
                 <!-- New Task -->
-                <div class="card glass-card">
-                    <h2><span class="icon">🚀</span> 创建任务</h2>
+                <div class="card glass-card create-task-card collapsed" id="create-task-card">
+                    <h2 class="collapsible-card-title">
+                        <span><span class="icon">🚀</span> 创建任务</span>
+                        <button type="button" class="btn-sm primary collapse-toggle-btn" id="toggle-create-task-btn">展开</button>
+                    </h2>
+                    <div class="collapsible-card-body" id="create-task-body">
                     <div class="form-group">
                         <label>任务名称</label>
                         <input type="text" id="task_name" placeholder="例如：代理A批次 / 夜间跑号" maxlength="40">
@@ -117,13 +121,19 @@
                     </div>
                     <button class="btn action" id="start-task-btn">加入队列</button>
                     <div class="status-msg" id="task-status"></div>
+                    </div>
                 </div>
 
                 <!-- Quick Task List (minimal) -->
-                <div class="card glass-card" style="flex:1;min-height:0;">
+                <div class="card glass-card task-queue-card">
                     <h2><span class="icon">📋</span> 任务队列 <a href="/records.html" class="view-all">查看全部 →</a></h2>
-                    <div id="task-list" class="task-list" style="max-height:300px;">
+                    <div id="task-list" class="task-list">
                         <div class="empty-hint">暂无任务</div>
+                    </div>
+                    <div class="task-pagination" id="task-pagination">
+                        <button type="button" class="btn-sm primary" id="task-page-prev">上一页</button>
+                        <span id="task-page-info">第 1 / 1 页</span>
+                        <button type="button" class="btn-sm primary" id="task-page-next">下一页</button>
                     </div>
                 </div>
             </div>

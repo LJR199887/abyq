@@ -125,6 +125,7 @@ h1 {
     gap: 1.5rem;
     overflow-y: auto;
     padding-right: 4px;
+    min-height: 0;
 }
 
 .right-col {
@@ -734,6 +735,41 @@ h1 {
     gap: 6px;
 }
 
+.records-pagination {
+    align-items: center;
+    border-top: 1px solid var(--card-border);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1rem;
+    justify-content: space-between;
+    margin-top: 1rem;
+    padding-top: 1rem;
+}
+
+.records-page-size,
+.records-page-controls {
+    align-items: center;
+    display: flex;
+    gap: 0.6rem;
+}
+
+.records-page-size span,
+.records-page-controls span {
+    color: var(--text-secondary);
+    font-size: 0.82rem;
+    white-space: nowrap;
+}
+
+.records-page-size select {
+    padding: 0.45rem 1.8rem 0.45rem 0.75rem;
+    width: 78px;
+}
+
+.records-page-controls .btn-sm {
+    justify-content: center;
+    min-width: 76px;
+}
+
 .record-item {
     display: flex;
     align-items: center;
@@ -802,6 +838,37 @@ h1 {
     display: flex;
     align-items: center;
     gap: 0.5rem;
+}
+
+.collapsible-card-title {
+    justify-content: space-between;
+    margin-bottom: 1rem;
+}
+
+.collapsible-card-title > span {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.collapse-toggle-btn {
+    min-width: 58px;
+}
+
+.collapsible-card-body {
+    display: block;
+}
+
+.create-task-card.collapsed {
+    padding-bottom: 1rem;
+}
+
+.create-task-card.collapsed .collapsible-card-title {
+    margin-bottom: 0;
+}
+
+.create-task-card.collapsed .collapsible-card-body {
+    display: none;
 }
 
 .view-all {
@@ -967,12 +1034,41 @@ textarea:focus {
 }
 
 /* ─── Task List (Home mini) ─── */
+.task-queue-card {
+    flex: 0 0 auto;
+    min-height: 0;
+}
+
+.task-queue-card h2 {
+    align-items: center;
+}
+
 .task-list {
-    flex: 1;
-    overflow-y: auto;
+    flex: 0 0 auto;
+    overflow: visible;
     display: flex;
     flex-direction: column;
     gap: 8px;
+}
+
+.task-pagination {
+    display: grid;
+    grid-template-columns: 80px 1fr 80px;
+    align-items: center;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+.task-pagination span {
+    color: var(--text-secondary);
+    font-size: 0.78rem;
+    text-align: center;
+    white-space: nowrap;
+}
+
+.task-pagination .btn-sm {
+    justify-content: center;
+    padding: 6px 8px;
 }
 
 .empty-hint {
@@ -984,13 +1080,15 @@ textarea:focus {
 
 .task-item {
     display: flex;
-    align-items: center;
+    align-items: stretch;
     justify-content: space-between;
+    gap: 10px;
     padding: 10px 14px;
     border-radius: 10px;
     background: rgba(0, 0, 0, 0.25);
     border: 1px solid rgba(255,255,255,0.05);
     transition: border-color 0.2s;
+    min-width: 0;
 }
 
 .task-item:hover { border-color: rgba(255,255,255,0.12); }
@@ -1004,32 +1102,54 @@ textarea:focus {
     display: flex;
     flex-direction: column;
     gap: 2px;
+    min-width: 0;
+    flex: 1 1 auto;
 }
 
 .task-item .task-id,
 .record-main .task-id {
     font-size: 0.9rem;
     font-weight: 500;
+    overflow-wrap: anywhere;
+    line-height: 1.35;
 }
 
 .task-item .task-meta {
     font-size: 0.75rem;
     color: var(--text-secondary);
+    overflow-wrap: anywhere;
+    line-height: 1.35;
 }
 
 .task-item .task-right {
     display: flex;
+    flex: 0 0 86px;
+    flex-direction: column;
     align-items: center;
+    justify-content: center;
     gap: 8px;
 }
 
 .task-item .task-counts {
     font-size: 0.75rem;
     color: var(--text-secondary);
-    text-align: right;
+    text-align: center;
     display: flex;
     flex-direction: column;
     gap: 2px;
+}
+
+.task-actions {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 6px;
+    width: 100%;
+}
+
+.task-actions .btn-sm {
+    width: 100%;
+    justify-content: center;
+    padding: 6px 8px;
 }
 
 .task-item .task-counts .ok { color: var(--success); font-weight: 600; }
@@ -1792,6 +1912,41 @@ textarea:focus {
     accent-color: var(--primary-color);
     height: 16px;
     width: 16px;
+}
+
+.child-pagination {
+    align-items: center;
+    border-top: 1px solid var(--card-border);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1rem;
+    justify-content: space-between;
+    margin-top: 1rem;
+    padding-top: 1rem;
+}
+
+.child-page-size,
+.child-page-controls {
+    align-items: center;
+    display: flex;
+    gap: 0.6rem;
+}
+
+.child-page-size span,
+.child-page-controls span {
+    color: var(--text-secondary);
+    font-size: 0.82rem;
+    white-space: nowrap;
+}
+
+.child-page-size select {
+    padding: 0.45rem 1.8rem 0.45rem 0.75rem;
+    width: 78px;
+}
+
+.child-page-controls .btn-sm {
+    justify-content: center;
+    min-width: 76px;
 }
 
 .child-pool-table td strong,

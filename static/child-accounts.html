@@ -97,6 +97,22 @@
                         </tbody>
                     </table>
                 </div>
+                <div class="child-pagination">
+                    <div class="child-page-size">
+                        <span>每页</span>
+                        <select id="child-page-size">
+                            <option value="20">20</option>
+                            <option value="30">30</option>
+                            <option value="50">50</option>
+                        </select>
+                        <span>条</span>
+                    </div>
+                    <div class="child-page-controls">
+                        <button type="button" class="btn-sm primary" id="child-page-prev">上一页</button>
+                        <span id="child-page-info">第 1 / 1 页 · 共 0 条</span>
+                        <button type="button" class="btn-sm primary" id="child-page-next">下一页</button>
+                    </div>
+                </div>
                 <div class="status-msg" id="child-status"></div>
             </section>
         </main>
@@ -114,9 +130,17 @@
         const selectAllAccounts = document.getElementById("select-all-accounts");
         const deleteSelectedBtn = document.getElementById("delete-selected-btn");
         const replaceSelectedBtn = document.getElementById("replace-selected-btn");
+        const childPageSizeInput = document.getElementById("child-page-size");
+        const childPagePrevBtn = document.getElementById("child-page-prev");
+        const childPageNextBtn = document.getElementById("child-page-next");
+        const childPageInfo = document.getElementById("child-page-info");
         let monitorLogExpanded = false;
         let accounts = [];
         let selectedIds = new Set();
+        let childPage = 1;
+        let childPageSize = parseInt(localStorage.getItem("childAccountPageSize") || "20", 10) || 20;
+        if (![20, 30, 50].includes(childPageSize)) childPageSize = 20;
+        childPageSizeInput.value = String(childPageSize);
 
         function escapeHtml(value) {
             return String(value ?? "")
@@ -172,15 +196,15 @@
         }
 
         function syncSelectionState() {
-            const visibleIds = accounts.map(account => account.id).filter(Boolean);
-            const selectedVisibleCount = visibleIds.filter(id => selectedIds.has(id)).length;
+            const pageIds = pageAccounts().map(account => account.id).filter(Boolean);
+            const selectedVisibleCount = pageIds.filter(id => selectedIds.has(id)).length;
             const replaceableCount = accounts.filter(account => selectedIds.has(account.id) && !["removed", "replaced"].includes(account.status)).length;
             deleteSelectedBtn.disabled = selectedIds.size === 0;
             deleteSelectedBtn.textContent = selectedIds.size ? `删除选中 ${selectedIds.size}` : "删除选中";
             replaceSelectedBtn.disabled = replaceableCount === 0;
             replaceSelectedBtn.textContent = replaceableCount ? `补号选中 ${replaceableCount}` : "补号选中";
-            selectAllAccounts.checked = visibleIds.length > 0 && selectedVisibleCount === visibleIds.length;
-            selectAllAccounts.indeterminate = selectedVisibleCount > 0 && selectedVisibleCount < visibleIds.length;
+            selectAllAccounts.checked = pageIds.length > 0 && selectedVisibleCount === pageIds.length;
+            selectAllAccounts.indeterminate = selectedVisibleCount > 0 && selectedVisibleCount < pageIds.length;
         }
 
         function renderStats(summary) {
@@ -228,13 +252,29 @@
             }
         }
 
+        function pageAccounts() {
+            const start = (childPage - 1) * childPageSize;
+            return accounts.slice(start, start + childPageSize);
+        }
+
+        function updatePagination() {
+            const pageCount = Math.max(1, Math.ceil(accounts.length / childPageSize));
+            childPage = Math.min(Math.max(1, childPage), pageCount);
+            childPageInfo.textContent = `第 ${childPage} / ${pageCount} 页 · 共 ${accounts.length} 条`;
+            childPagePrevBtn.disabled = childPage <= 1;
+            childPageNextBtn.disabled = childPage >= pageCount;
+            childPageSizeInput.value = String(childPageSize);
+        }
+
         function renderAccounts() {
+            updatePagination();
             if (!accounts.length) {
                 body.innerHTML = '<tr><td colspan="5" class="empty-hint">暂无子账号记录</td></tr>';
                 syncSelectionState();
                 return;
             }
-            body.innerHTML = accounts.map(account => {
+            const items = pageAccounts();
+            body.innerHTML = items.map(account => {
                 const isArchived = ["removed", "replaced"].includes(account.status);
                 const motherCell = isArchived
                     ? `
@@ -298,6 +338,8 @@
                     accounts = data.accounts || [];
                     const visibleIdSet = new Set(accounts.map(account => account.id));
                     selectedIds = new Set([...selectedIds].filter(id => visibleIdSet.has(id)));
+                    const pageCount = Math.max(1, Math.ceil(accounts.length / childPageSize));
+                    childPage = Math.min(Math.max(1, childPage), pageCount);
                     renderMotherFilter(data.mother_options || []);
                     renderPoolFilter(data.pool_options || []);
                     renderStats(data.summary || {});
@@ -424,7 +466,7 @@
 
         document.getElementById("refresh-btn").addEventListener("click", () => loadAccounts());
         selectAllAccounts.addEventListener("change", () => {
-            const visibleIds = accounts.map(account => account.id).filter(Boolean);
+            const visibleIds = pageAccounts().map(account => account.id).filter(Boolean);
             if (selectAllAccounts.checked) {
                 visibleIds.forEach(id => selectedIds.add(id));
             } else {
@@ -470,6 +512,21 @@
                     syncSelectionState();
                 });
         });
+        childPagePrevBtn.addEventListener("click", () => {
+            childPage = Math.max(1, childPage - 1);
+            renderAccounts();
+        });
+        childPageNextBtn.addEventListener("click", () => {
+            const pageCount = Math.max(1, Math.ceil(accounts.length / childPageSize));
+            childPage = Math.min(pageCount, childPage + 1);
+            renderAccounts();
+        });
+        childPageSizeInput.addEventListener("change", () => {
+            childPageSize = parseInt(childPageSizeInput.value, 10) || 20;
+            localStorage.setItem("childAccountPageSize", String(childPageSize));
+            childPage = 1;
+            renderAccounts();
+        });
         document.getElementById("run-monitor-btn").addEventListener("click", event => {
             const btn = event.currentTarget;
             btn.disabled = true;
@@ -492,8 +549,14 @@
             window.location.href = "/api/child-accounts/monitor/logs/download";
         });
         [searchInput, motherFilter, poolFilter].forEach(el => {
-            el.addEventListener("input", () => loadAccounts());
-            el.addEventListener("change", () => loadAccounts());
+            el.addEventListener("input", () => {
+                childPage = 1;
+                loadAccounts();
+            });
+            el.addEventListener("change", () => {
+                childPage = 1;
+                loadAccounts();
+            });
         });
 
         loadAccounts();

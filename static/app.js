@@ -7,6 +7,11 @@ document.addEventListener("DOMContentLoaded", () => {
     const taskListEl = document.getElementById("task-list");
     const terminalBody = document.getElementById("terminal-body");
     const downloadTaskLogBtn = document.getElementById("download-task-log-btn");
+    const createTaskCard = document.getElementById("create-task-card");
+    const toggleCreateTaskBtn = document.getElementById("toggle-create-task-btn");
+    const taskPagePrevBtn = document.getElementById("task-page-prev");
+    const taskPageNextBtn = document.getElementById("task-page-next");
+    const taskPageInfo = document.getElementById("task-page-info");
 
     // Stats
     const statPending = document.getElementById("stat-pending");
@@ -21,6 +26,24 @@ document.addEventListener("DOMContentLoaded", () => {
     const savedLogTaskId = parseInt(localStorage.getItem(LAST_LOG_TASK_KEY));
     let currentLogTaskId = Number.isInteger(savedLogTaskId) ? savedLogTaskId : "sys";
     let logRenderVersion = 0;
+    const TASK_PAGE_SIZE = 10;
+    let taskPage = 1;
+    let latestTasks = [];
+
+    function setCreateTaskCollapsed(collapsed) {
+        if (!createTaskCard || !toggleCreateTaskBtn) return;
+        createTaskCard.classList.toggle("collapsed", collapsed);
+        toggleCreateTaskBtn.textContent = collapsed ? "展开" : "收起";
+        localStorage.setItem("createTaskCollapsed", collapsed ? "1" : "0");
+    }
+
+    const savedCreateTaskCollapsed = localStorage.getItem("createTaskCollapsed");
+    setCreateTaskCollapsed(savedCreateTaskCollapsed === null ? true : savedCreateTaskCollapsed === "1");
+    if (toggleCreateTaskBtn) {
+        toggleCreateTaskBtn.addEventListener("click", () => {
+            setCreateTaskCollapsed(!createTaskCard.classList.contains("collapsed"));
+        });
+    }
 
     function switchLogView(taskId) {
         currentLogTaskId = taskId;
@@ -249,6 +272,47 @@ document.addEventListener("DOMContentLoaded", () => {
     });
 
     // ────────────────── Task List ──────────────────
+    function renderTaskList(tasks) {
+        latestTasks = tasks;
+        const pageCount = Math.max(1, Math.ceil(tasks.length / TASK_PAGE_SIZE));
+        taskPage = Math.min(Math.max(1, taskPage), pageCount);
+        if (tasks.length === 0) {
+            taskListEl.innerHTML = '<div class="empty-hint">暂无任务</div>';
+        } else {
+            const start = (taskPage - 1) * TASK_PAGE_SIZE;
+            const pageTasks = tasks.slice(start, start + TASK_PAGE_SIZE);
+            taskListEl.innerHTML = pageTasks.map(t => {
+                let badgeClass = t.status;
+                let badgeText = { pending: "排队中", running: "运行中", completed: "已完成", stopped: "已停止", stopping: "停止中..." }[t.status] || t.status;
+                let activeClass = t.id === currentLogTaskId ? " active-task" : "";
+                return `
+                    <div class="task-item${activeClass}" data-id="${t.id}" style="cursor: pointer;">
+                        <div class="task-left">
+                            <span class="task-id">${t.name || `任务 #${t.id}`}</span>
+                            <span class="task-meta">#${t.id} · ${t.created_at} · ${registrationModeLabel(t.registration_mode)} · ${t.quantity}个 · 并发${t.concurrency}</span>
+                        </div>
+                        <div class="task-right">
+                            <div class="task-counts">
+                                <span><span class="ok">${t.completed}</span> / <span class="fail">${t.failed}</span></span>
+                                <span class="pool">入池 ${t.token_pool_imported || 0}</span>
+                                <span class="unpooled">未入池 ${t.token_pool_unpooled || 0}</span>
+                            </div>
+                            <span class="badge ${badgeClass}">${badgeText}</span>
+                            <div class="task-actions">
+                                <button class="btn-sm primary view-task-log-btn" data-id="${t.id}">日志</button>
+                                ${["pending", "running"].includes(t.status) ? `<button class="btn-sm danger stop-task-btn" data-id="${t.id}">停止</button>` : ''}
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join("");
+        }
+
+        if (taskPageInfo) taskPageInfo.textContent = `第 ${taskPage} / ${pageCount} 页 · 共 ${tasks.length} 条`;
+        if (taskPagePrevBtn) taskPagePrevBtn.disabled = taskPage <= 1;
+        if (taskPageNextBtn) taskPageNextBtn.disabled = taskPage >= pageCount;
+    }
+
     function refreshTaskList() {
         fetch("/api/tasks")
             .then(r => r.json())
@@ -272,7 +336,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 statFailed.textContent = failed;
 
                 if (tasks.length === 0) {
-                    taskListEl.innerHTML = '<div class="empty-hint">暂无任务</div>';
+                    renderTaskList(tasks);
                     localStorage.removeItem(LAST_LOG_TASK_KEY);
                     if (currentLogTaskId !== "sys") switchLogView("sys");
                     return;
@@ -286,38 +350,39 @@ document.addEventListener("DOMContentLoaded", () => {
                     switchLogView(fallbackTask.id);
                 }
 
-                // Show latest 10
-                taskListEl.innerHTML = tasks.slice(0, 10).map(t => {
-                    let badgeClass = t.status;
-                    let badgeText = { pending: "排队中", running: "运行中", completed: "已完成", stopped: "已停止", stopping: "停止中..." }[t.status] || t.status;
-                    let activeClass = t.id === currentLogTaskId ? " active-task" : "";
-                    return `
-                        <div class="task-item${activeClass}" data-id="${t.id}" style="cursor: pointer;">
-                            <div class="task-left">
-                                <span class="task-id">${t.name || `任务 #${t.id}`}</span>
-                                <span class="task-meta">#${t.id} · ${t.created_at} · ${registrationModeLabel(t.registration_mode)} · ${t.quantity}个 · 并发${t.concurrency}</span>
-                            </div>
-                            <div class="task-right">
-                                <div class="task-counts">
-                                    <span class="ok">${t.completed}</span> / <span class="fail">${t.failed}</span>
-                                    <span class="pool">入池 ${t.token_pool_imported || 0}</span>
-                                    <span class="unpooled">未入池 ${t.token_pool_unpooled || 0}</span>
-                                </div>
-                                <span class="badge ${badgeClass}">${badgeText}</span>
-                                ${["pending", "running"].includes(t.status) ? `<button class="btn-sm danger stop-task-btn" data-id="${t.id}" style="margin-left: 8px;">停止</button>` : ''}
-                            </div>
-                        </div>
-                    `;
-                }).join("");
+                renderTaskList(tasks);
             });
     }
 
+    if (taskPagePrevBtn) {
+        taskPagePrevBtn.addEventListener("click", () => {
+            taskPage = Math.max(1, taskPage - 1);
+            renderTaskList(latestTasks);
+        });
+    }
+
+    if (taskPageNextBtn) {
+        taskPageNextBtn.addEventListener("click", () => {
+            const pageCount = Math.max(1, Math.ceil(latestTasks.length / TASK_PAGE_SIZE));
+            taskPage = Math.min(pageCount, taskPage + 1);
+            renderTaskList(latestTasks);
+        });
+    }
+
     taskListEl.addEventListener("click", (e) => {
-        if (e.target.classList.contains("stop-task-btn")) {
-            const taskId = parseInt(e.target.getAttribute("data-id"));
+        const logButton = e.target.closest(".view-task-log-btn");
+        if (logButton) {
+            const taskId = parseInt(logButton.getAttribute("data-id"));
+            if (taskId) switchLogView(taskId);
+            return;
+        }
+
+        const stopButton = e.target.closest(".stop-task-btn");
+        if (stopButton) {
+            const taskId = parseInt(stopButton.getAttribute("data-id"));
             if (confirm(`确认要停止任务 #${taskId} 吗？`)) {
-                e.target.disabled = true;
-                e.target.textContent = "停止中...";
+                stopButton.disabled = true;
+                stopButton.textContent = "停止中...";
                 fetch("/api/tasks/stop", {
                     method: "POST",
                     headers: {"Content-Type": "application/json"},
