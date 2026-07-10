@@ -1747,7 +1747,7 @@ textarea:focus {
 
 .child-pool-table {
     border-collapse: collapse;
-    min-width: 820px;
+    min-width: 900px;
     width: 100%;
 }
 
@@ -1765,6 +1765,19 @@ textarea:focus {
     font-weight: 700;
 }
 
+.child-pool-table .select-col {
+    padding-left: 8px;
+    padding-right: 8px;
+    text-align: center;
+    width: 34px;
+}
+
+.child-pool-table input[type="checkbox"] {
+    accent-color: var(--primary-color);
+    height: 16px;
+    width: 16px;
+}
+
 .child-pool-table td strong,
 .child-pool-table td span {
     display: block;
@@ -1775,6 +1788,11 @@ textarea:focus {
     display: block;
     font-size: 0.78rem;
     margin-top: 4px;
+}
+
+.archived-account-label {
+    color: var(--danger);
+    font-weight: 800;
 }
 
 .credits-value {
@@ -1791,6 +1809,12 @@ textarea:focus {
     color: var(--text-secondary);
     font-size: 0.78rem;
     overflow-wrap: anywhere;
+}
+
+.event-lines .pool-name {
+    color: var(--success);
+    font-size: 0.86rem;
+    font-weight: 800;
 }
 
 .badge.active {

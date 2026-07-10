@@ -101,12 +101,12 @@ def extract_task_id_from_log(message: str) -> int | None:
         r"任务\s*#(\d+)",
         r"\[Task#(\d+)(?:[-:\s\]])",
         r"Task\s*#(\d+)",
-        r"\[??#(\d+)(?:[-:\s?\]])",
-        r"??\s*#(\d+)",
-        r"\[???#(\d+)(?:[-\s?\]])",
-        r"???\s*#(\d+)",
+        r"#(\d+)",
     ):
-        match = re.search(pattern, message)
+        try:
+            match = re.search(pattern, message)
+        except re.error:
+            continue
         if match:
             return int(match.group(1))
     return None
@@ -665,6 +665,10 @@ class TaskStart(BaseModel):
 
 class TaskDeleteRequest(BaseModel):
     ids: list[int]
+
+
+class ChildAccountDeleteRequest(BaseModel):
+    ids: list[str]
 
 
 class AdobeAccountUpdate(BaseModel):
@@ -1983,12 +1987,38 @@ async def get_child_accounts(
     account_id: str = "",
     flag: str = "",
     search: str = "",
+    mother_status: str = "",
+    pool_status: str = "",
 ):
     records = await list_child_accounts_raw()
     query = (search or "").strip().lower()
     threshold = float(config.get("child_monitor_threshold", 100) or 0)
     filtered = []
     for record in records:
+        archived = record.get("status") in ("removed", "replaced")
+        mother_email = record.get("adobe_account_email") or record.get("adobe_account_name") or ""
+        if mother_status == "removed" and not archived:
+            continue
+        elif mother_status.startswith("mother:"):
+            mother_key = mother_status[7:].strip().lower()
+            if archived or mother_email.strip().lower() != mother_key:
+                continue
+        external_status = record.get("external_pool_status") or ""
+        external_pool_id = record.get("external_pool_id") or ""
+        external_pool_name = record.get("external_pool_name") or ""
+        if pool_status == "unpooled":
+            if external_status in ("imported", "failed"):
+                continue
+        elif pool_status == "imported_unknown":
+            if external_status != "imported" or external_pool_id or external_pool_name:
+                continue
+        elif pool_status == "failed":
+            if external_status != "failed":
+                continue
+        elif pool_status.startswith("pool:"):
+            pool_key = pool_status[5:]
+            if external_status != "imported" or pool_key not in (external_pool_id, external_pool_name):
+                continue
         if status and record.get("status") != status:
             continue
         if account_id and record.get("adobe_account_id") != account_id:
@@ -2033,7 +2063,47 @@ async def get_child_accounts(
         "monitor_enabled": bool(config.get("child_monitor_enabled")),
         "threshold": threshold,
     }
-    return {"accounts": list(reversed(filtered)), "summary": summary}
+    pool_options = [
+        {"id": pool.get("id", ""), "name": pool.get("name") or "Token 池"}
+        for pool in normalize_token_pools()
+        if pool.get("enabled")
+    ]
+    configured_pool_keys = {
+        str(pool.get("id", "")).strip().lower()
+        for pool in pool_options
+        if str(pool.get("id", "")).strip()
+    } | {
+        str(pool.get("name", "")).strip().lower()
+        for pool in pool_options
+        if str(pool.get("name", "")).strip()
+    }
+    for record in records:
+        pool_id = str(record.get("external_pool_id") or "").strip()
+        pool_name = str(record.get("external_pool_name") or "").strip()
+        key = (pool_id or pool_name).lower()
+        if record.get("external_pool_status") == "imported" and key and key not in configured_pool_keys:
+            pool_options.append({"id": pool_id or pool_name, "name": pool_name or pool_id})
+            configured_pool_keys.add(key)
+
+    mother_seen = set()
+    mother_options = []
+    for record in records:
+        if record.get("status") in ("removed", "replaced"):
+            continue
+        email = str(record.get("adobe_account_email") or record.get("adobe_account_name") or "").strip()
+        if not email:
+            continue
+        key = email.lower()
+        if key in mother_seen:
+            continue
+        mother_seen.add(key)
+        mother_options.append({"email": email})
+    return {
+        "accounts": list(reversed(filtered)),
+        "summary": summary,
+        "pool_options": pool_options,
+        "mother_options": mother_options,
+    }
 
 
 @app.post("/api/child-accounts/monitor/run")
@@ -2102,13 +2172,50 @@ async def import_child_account_token_pool(child_id: str):
     if not record:
         return JSONResponse(status_code=404, content={"message": "子账号不存在"})
     external_enabled = bool(config.get("token_pool_enabled"))
-    ok = await import_payload_to_token_pool(child_cookie_payload(record), f"[子账号池 · {record.get('email', '')}]")
+    result = await import_payload_to_token_pool_result(child_cookie_payload(record), f"[子账号池 · {record.get('email', '')}]")
+    ok = bool(result.get("ok"))
     updated = await update_child_account(
         child_id,
         external_pool_status="imported" if external_enabled and ok else "skipped" if not external_enabled else "failed",
-        external_pool_error="" if ok else "外部 Token 池导入失败",
+        external_pool_id=result.get("pool_id", "") if external_enabled and ok else "",
+        external_pool_name=result.get("pool_name", "") if external_enabled and ok else "",
+        external_pool_error="" if ok else result.get("error", "") or "外部 Token 池导入失败",
     )
     return {"status": "ok" if ok else "failed", "account": public_child_account(updated or record)}
+
+
+@app.get("/api/child-accounts/{child_id}/export-cookie")
+async def export_child_account_cookie(child_id: str):
+    records = await list_child_accounts_raw()
+    record = find_child_record(records, child_id)
+    if not record:
+        return JSONResponse(status_code=404, content={"message": "子账号不存在"})
+    if not record.get("cookie"):
+        return JSONResponse(status_code=400, content={"message": "该子账号没有可导出的 cookie"})
+    payload = child_cookie_export_payload(record)
+    export_filename = f"{sanitize_filename(record.get('email', ''), '子账号')}_cookie.json"
+    from fastapi.responses import Response
+    return Response(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        media_type="application/json; charset=utf-8",
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(export_filename)}"
+        },
+    )
+
+
+@app.post("/api/child-accounts/delete")
+async def delete_child_account_records(req: ChildAccountDeleteRequest):
+    ids = {str(item) for item in req.ids}
+    if not ids:
+        return JSONResponse(status_code=400, content={"message": "请选择要删除的子账号记录"})
+    async with child_accounts_lock:
+        records = load_child_accounts_sync()
+        kept = [record for record in records if str(record.get("id", "")) not in ids]
+        deleted = len(records) - len(kept)
+        save_child_accounts_sync(kept)
+    await task_manager.broadcast("__STATE_UPDATE__")
+    return {"status": "ok", "deleted": deleted}
 
 
 @app.post("/api/tasks/delete")
@@ -2307,15 +2414,20 @@ async def import_cookie_to_single_token_pool(prefix: str, pool: dict, payload: d
 
 
 async def import_cookie_to_token_pool(cookie_file: str, prefix: str) -> bool:
+    result = await import_cookie_to_token_pool_result(cookie_file, prefix)
+    return bool(result.get("ok"))
+
+
+async def import_cookie_to_token_pool_result(cookie_file: str, prefix: str) -> dict:
     if not config.get("token_pool_enabled"):
-        return True
+        return {"ok": True, "status": "skipped", "pool_id": "", "pool_name": "", "error": ""}
 
     try:
         with open(cookie_file, "r", encoding="utf-8") as f:
             cookie_data = json.load(f)
     except Exception as e:
         await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败：无法读取 Cookie 文件 ({e})")
-        return False
+        return {"ok": False, "status": "failed", "pool_id": "", "pool_name": "", "error": str(e)}
 
     payload = {
         "name": cookie_data.get("name", ""),
@@ -2323,23 +2435,28 @@ async def import_cookie_to_token_pool(cookie_file: str, prefix: str) -> bool:
     }
     if not payload["cookie"]:
         await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败：Cookie 内容为空")
-        return False
+        return {"ok": False, "status": "failed", "pool_id": "", "pool_name": "", "error": "Cookie 内容为空"}
 
-    return await import_payload_to_token_pool(payload, prefix)
+    return await import_payload_to_token_pool_result(payload, prefix)
 
 
 async def import_payload_to_token_pool(payload: dict, prefix: str) -> bool:
+    result = await import_payload_to_token_pool_result(payload, prefix)
+    return bool(result.get("ok"))
+
+
+async def import_payload_to_token_pool_result(payload: dict, prefix: str) -> dict:
     if not config.get("token_pool_enabled"):
-        return True
+        return {"ok": True, "status": "skipped", "pool_id": "", "pool_name": "", "error": ""}
 
     if not payload.get("cookie"):
         await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败：Cookie 内容为空")
-        return False
+        return {"ok": False, "status": "failed", "pool_id": "", "pool_name": "", "error": "Cookie 内容为空"}
 
     ordered = await reserve_token_pool_order()
     if not ordered:
         await task_manager.broadcast(f"{prefix} ⚠️ 自动入池已开启，但没有启用的 Token 池")
-        return False
+        return {"ok": False, "status": "failed", "pool_id": "", "pool_name": "", "error": "没有启用的 Token 池"}
 
     last_error = ""
     for pool in ordered:
@@ -2349,13 +2466,19 @@ async def import_payload_to_token_pool(payload: dict, prefix: str) -> bool:
         if ok:
             await record_token_pool_result(pool.get("id", ""), True)
             await task_manager.broadcast(f"{prefix} ✅ 已自动导入 {pool_name}")
-            return True
+            return {
+                "ok": True,
+                "status": "imported",
+                "pool_id": pool.get("id", ""),
+                "pool_name": pool_name,
+                "error": "",
+            }
         await record_token_pool_result(pool.get("id", ""), False)
         last_error = error
         await task_manager.broadcast(f"{prefix} ⚠️ {pool_name} 入池失败，尝试下一个池：{error}")
 
     await task_manager.broadcast(f"{prefix} ⚠️ 自动入池失败：全部 Token 池均失败；最后错误：{last_error}")
-    return False
+    return {"ok": False, "status": "failed", "pool_id": "", "pool_name": "", "error": last_error}
 
 
 def now_text() -> str:
@@ -2506,6 +2629,21 @@ def child_cookie_payload(record: dict) -> dict:
     return {
         "name": record.get("email", ""),
         "cookie": record.get("cookie", ""),
+    }
+
+
+def child_cookie_export_payload(record: dict) -> dict:
+    return {
+        "cookie": record.get("cookie", ""),
+        "name": record.get("email", ""),
+        "email": record.get("email", ""),
+        "password": record.get("password", ""),
+        "access_token": record.get("access_token", ""),
+        "credits": record.get("credits_available"),
+        "expires_at": record.get("expires_at"),
+        "display_name": record.get("display_name", ""),
+        "user_id": record.get("user_id", ""),
+        "refresh_token": record.get("refresh_token", ""),
     }
 
 
@@ -3521,7 +3659,8 @@ async def run_invite_task(task: Task):
                             f"累计成功 {account_success}/{target_success}"
                         )
                         external_enabled = bool(config.get("token_pool_enabled"))
-                        external_ok = await import_cookie_to_token_pool(cookie_file, worker_prefix)
+                        external_result = await import_cookie_to_token_pool_result(cookie_file, worker_prefix)
+                        external_ok = bool(external_result.get("ok"))
                         if child_record:
                             await update_child_account(
                                 child_record.get("id", ""),
@@ -3530,7 +3669,9 @@ async def run_invite_task(task: Task):
                                     else "skipped" if not external_enabled
                                     else "failed"
                                 ),
-                                external_pool_error="" if external_ok else "外部 Token 池导入失败",
+                                external_pool_id=external_result.get("pool_id", "") if external_enabled and external_ok else "",
+                                external_pool_name=external_result.get("pool_name", "") if external_enabled and external_ok else "",
+                                external_pool_error="" if external_ok else external_result.get("error", "") or "外部 Token 池导入失败",
                             )
                         if external_ok:
                             if config.get("token_pool_enabled"):
