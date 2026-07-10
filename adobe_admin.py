@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import random
+import time
 from typing import Any, Callable, Optional
 from urllib.parse import urlencode
 
@@ -32,6 +33,26 @@ _AUTH_HOST = _p.AUTH_HOST
 
 # 被邀请子号首次登录需"补全账号":统一设置的密码(可按需修改)
 COMPLETE_PASSWORD = "Aa1230123.."
+
+
+def _member_product_count(member: dict[str, Any] | None) -> int:
+    raw = (member or {}).get("raw") if isinstance(member, dict) else None
+    if not isinstance(raw, dict):
+        raw = member or {}
+    products = raw.get("products") if isinstance(raw, dict) else []
+    if isinstance(products, list):
+        return len(products)
+    if isinstance(products, dict):
+        return len(products)
+    return 0
+
+
+def _find_member_with_product_count(client, token: str, org_id: str, email: str) -> tuple[str, int]:
+    target = email.lower().strip()
+    for member in list_members(client, token, org_id, pages=1, page_size=20, search=email):
+        if member.get("email") == target:
+            return str(member.get("member_id") or ""), _member_product_count(member)
+    return "", 0
 
 _FIRST_NAMES = [
     "Daniel", "Michael", "James", "David", "John", "Robert", "William", "Joseph",
@@ -758,19 +779,53 @@ def grant_member(*, token: str, org_id: str, product_id: str,
     """添加子账号并分配产品(=授权)。返回 {ok, member_id, message}。"""
     client = client_from_state({"proxy": proxy_url})
     try:
+        count = len(product_assignments or []) or 1
+        required_count = max(2, count)
         try:
             add_member(
                 client, token, org_id, email, product_id, license_group_id,
                 product_assignments=product_assignments,
             )
         except ProtocolError as e:
-            return {"ok": False, "member_id": "", "message": str(e)[:480]}
-        try:
-            mid = find_member_id_by_email(client, token, org_id, email)
-        except Exception:
-            mid = ""
-        count = len(product_assignments or []) or 1
-        return {"ok": True, "member_id": mid, "message": f"已授权 {count} 个产品"}
+            try:
+                mid, product_count = _find_member_with_product_count(client, token, org_id, email)
+            except Exception:
+                mid, product_count = "", 0
+            return {
+                "ok": False,
+                "member_id": mid,
+                "product_count": product_count,
+                "required_product_count": required_count,
+                "message": str(e)[:480],
+            }
+
+        mid = ""
+        product_count = 0
+        for attempt in range(5):
+            try:
+                mid, product_count = _find_member_with_product_count(client, token, org_id, email)
+            except Exception:
+                mid, product_count = "", 0
+            if product_count >= required_count:
+                break
+            if attempt < 4:
+                time.sleep(1.5)
+
+        if product_count < required_count:
+            return {
+                "ok": False,
+                "member_id": mid,
+                "product_count": product_count,
+                "required_product_count": required_count,
+                "message": f"授权产品不足：当前 {product_count}/{required_count}",
+            }
+        return {
+            "ok": True,
+            "member_id": mid,
+            "product_count": product_count,
+            "required_product_count": required_count,
+            "message": f"已授权 {product_count} 个产品",
+        }
     finally:
         client.close()
 

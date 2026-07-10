@@ -39,6 +39,7 @@ CHILD_ACCOUNTS_FILE = os.path.join(DATA_DIR, "child_accounts.json")
 CHILD_MONITOR_LOG_FILE = os.path.join(DATA_DIR, "child_monitor_logs.json")
 CHILD_MONITOR_LOG_RETENTION_SECONDS = 12 * 60 * 60
 CHILD_MONITOR_LOG_MAX_ITEMS = 500
+MAX_INVITE_CHILDREN_PER_ADMIN = 9
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 os.makedirs(TASK_LOG_DIR, exist_ok=True)
 
@@ -377,6 +378,7 @@ adobe_account_lock = asyncio.Lock()
 token_pool_lock = asyncio.Lock()
 child_accounts_lock = asyncio.Lock()
 child_monitor_task: asyncio.Task | None = None
+child_recovery_task: asyncio.Task | None = None
 child_replacement_locks: dict[str, asyncio.Lock] = {}
 
 # ─── Task Management ───
@@ -1679,6 +1681,12 @@ async def remove_adobe_members(account: dict, emails: list[str]) -> list[dict]:
         pass
 
 
+def protocol_member_product_count(item: dict) -> int:
+    raw = item.get("raw") if isinstance(item.get("raw"), dict) else item
+    products = raw.get("products") if isinstance(raw, dict) else []
+    return len(products) if isinstance(products, (list, dict)) else 0
+
+
 def protocol_member_summary(item: dict, protected: set[str] | None = None) -> dict:
     raw = item.get("raw") if isinstance(item.get("raw"), dict) else item
     email = (item.get("email") or raw.get("email") or raw.get("userName") or "").strip()
@@ -1695,7 +1703,7 @@ def protocol_member_summary(item: dict, protected: set[str] | None = None) -> di
         "protection_reason": "admin account" if email.lower() in protected else "",
         "removable": bool(member_id) and email.lower() not in protected,
         "editable": True,
-        "products": len(raw.get("products") or []),
+        "products": protocol_member_product_count(item),
     }
 
 
@@ -1736,6 +1744,9 @@ async def invite_adobe_members(account: dict, emails: list[str]) -> list[dict]:
         }]
     if not assignments:
         raise RuntimeError("账号尚未发现可用产品或授权组，请先协议检测母号")
+    if len(assignments) < 2:
+        raise RuntimeError("当前母号可授权产品少于 2 个，不能用于协议注册")
+    assignments = assignments[:2]
     proxy_url = adobe_proxy_url()
 
     async def grant(email: str) -> dict:
@@ -1754,6 +1765,8 @@ async def invite_adobe_members(account: dict, emails: list[str]) -> list[dict]:
             "email": email,
             "ok": ok,
             "member_id": result.get("member_id", ""),
+            "product_count": int(result.get("product_count", 0) or 0),
+            "required_product_count": int(result.get("required_product_count", 2) or 2),
             "message": result.get("message") or ("authorized" if ok else "authorization failed"),
         }
 
@@ -1784,6 +1797,68 @@ async def remove_adobe_members(account: dict, emails: list[str]) -> list[dict]:
             "message": "成员已不存在" if already_removed else message,
         })
     return results
+
+
+async def cleanup_adobe_member_with_retries(
+    account: dict,
+    email: str,
+    prefix: str,
+    attempts: int = 3,
+) -> dict:
+    last_message = "移除接口无返回"
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            async with adobe_account_lock:
+                results = await remove_adobe_members(account, [email])
+            result = results[0] if results else {"ok": False, "message": "移除接口无返回"}
+            if result.get("ok"):
+                if attempt > 1:
+                    await task_manager.broadcast(f"{prefix} 第 {attempt} 次清理成功：{email}")
+                return result
+            last_message = result.get("message") or last_message
+        except Exception as exc:
+            last_message = str(exc) or type(exc).__name__
+        if attempt < attempts:
+            await task_manager.broadcast(
+                f"{prefix} 清理成员失败，第 {attempt}/{attempts} 次：{email}；{last_message}"
+            )
+            await asyncio.sleep(min(3, attempt))
+    return {"email": email, "ok": False, "message": last_message}
+
+
+async def fetch_all_protocol_members(account: dict) -> list[dict]:
+    await ensure_protocol_admin(account)
+    return await asyncio.to_thread(
+        adobe_admin.fetch_members,
+        token=account["admin_token"],
+        org_id=account["org_id"],
+        proxy_url=adobe_proxy_url(),
+        pages=20,
+    )
+
+
+async def inspect_adobe_account_capacity(account: dict) -> dict:
+    async with adobe_account_lock:
+        members = await fetch_all_protocol_members(account)
+    protected = adobe_account_email(account).strip().lower()
+    child_members = [
+        member for member in members
+        if (member.get("email") or "").strip().lower() != protected
+    ]
+    complete = sum(
+        1 for member in child_members
+        if protocol_member_product_count(member) >= 2
+    )
+    partial = sum(
+        1 for member in child_members
+        if 0 < protocol_member_product_count(member) < 2
+    )
+    return {
+        "member_count": len(child_members),
+        "complete_two_product_count": complete,
+        "partial_product_count": partial,
+        "remaining_two_product_slots": max(0, MAX_INVITE_CHILDREN_PER_ADMIN - complete),
+    }
 
 
 @app.get("/api/adobe-accounts")
@@ -2746,8 +2821,12 @@ def load_child_accounts_sync() -> list[dict]:
 
 def save_child_accounts_sync(accounts: list[dict]) -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(CHILD_ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+    temp_path = f"{CHILD_ACCOUNTS_FILE}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
         json.dump(accounts, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp_path, CHILD_ACCOUNTS_FILE)
 
 
 def load_child_monitor_logs_sync() -> list[dict]:
@@ -2889,6 +2968,64 @@ def child_cookie_export_payload(record: dict) -> dict:
     }
 
 
+def build_authorized_child_record(
+    *,
+    account: dict,
+    reserved: dict,
+    task: Task | None,
+    product_count: int,
+    required_product_count: int = 2,
+) -> dict:
+    return {
+        "email": (reserved.get("email") or "").strip(),
+        "password": reserved.get("password", ""),
+        "email_password": reserved.get("password", ""),
+        "api_url": reserved.get("api_url", ""),
+        "client_id": reserved.get("client_id", ""),
+        "refresh_token": reserved.get("refresh_token", ""),
+        "adobe_account_id": account.get("id", ""),
+        "adobe_account_email": account.get("email", ""),
+        "adobe_account_name": account.get("name", ""),
+        "org_id": account.get("organization_id", "") or account.get("org_id", ""),
+        "product_id": account.get("product_id", ""),
+        "product_name": account.get("product_name", ""),
+        "license_group_id": account.get("license_group_id", ""),
+        "member_id": reserved.get("_member_id", ""),
+        "authorization_product_count": int(product_count or 0),
+        "required_product_count": max(2, int(required_product_count or 2)),
+        "authorization_completed_at": now_text(),
+        "registration_started_at": now_text(),
+        "status": "registering",
+        "external_pool_status": "pending",
+        "external_pool_error": "",
+        "check_failures": 0,
+        "failure_reason": "",
+        "source_task_id": getattr(task, "id", None),
+    }
+
+
+async def create_authorized_child_account(
+    *,
+    account: dict,
+    reserved: dict,
+    task: Task | None,
+    product_count: int,
+    required_product_count: int = 2,
+) -> dict:
+    record = build_authorized_child_record(
+        account=account,
+        reserved=reserved,
+        task=task,
+        product_count=product_count,
+        required_product_count=required_product_count,
+    )
+    saved = await upsert_child_account(record)
+    await task_manager.broadcast(
+        f"[子账号池] 已登记授权成员 {saved.get('email')}，等待完成 Firefly 注册"
+    )
+    return saved
+
+
 def build_child_account_record(
     *,
     account: dict,
@@ -2926,6 +3063,7 @@ def build_child_account_record(
         "credits_available": credits_value,
         "credits_updated_at": now_ts() if credits_value is not None else None,
         "status": "active",
+        "registration_completed_at": now_text(),
         "external_pool_status": "pending",
         "external_pool_error": "",
         "last_checked_at": "",
@@ -2946,8 +3084,12 @@ async def create_child_account_from_cookie(
         with open(cookie_file, "r", encoding="utf-8") as f:
             cookie_data = json.load(f)
     except Exception as exc:
-        await task_manager.broadcast(f"[子账号池] ⚠️ 无法读取子账号 cookie 文件：{exc}")
-        return None
+        raise RuntimeError(f"无法读取子账号 cookie 文件：{exc}") from exc
+    if not isinstance(cookie_data, dict):
+        raise RuntimeError("子账号 cookie 文件格式无效")
+    missing = [key for key in ("cookie", "access_token") if not cookie_data.get(key)]
+    if missing:
+        raise RuntimeError(f"子账号注册结果缺少字段：{', '.join(missing)}")
     record = build_child_account_record(
         account=account,
         reserved=reserved,
@@ -3558,6 +3700,73 @@ def ensure_child_monitor_started() -> None:
     child_monitor_task = loop.create_task(child_monitor_loop())
 
 
+async def recover_incomplete_child_registrations() -> dict:
+    records = await list_child_accounts_raw()
+    pending = [
+        record for record in records
+        if record.get("status") in ("registering", "cleanup_pending")
+    ]
+    recovered = 0
+    failed = 0
+    for record in pending:
+        child_id = record.get("id", "")
+        email = record.get("email", "")
+        account = find_adobe_account(record.get("adobe_account_id", ""))
+        if not account:
+            failed += 1
+            await update_child_account(
+                child_id,
+                status="cleanup_pending",
+                failure_reason="启动恢复失败：所属母号不存在",
+                recovery_checked_at=now_text(),
+            )
+            continue
+        await update_child_account(
+            child_id,
+            status="cleanup_pending",
+            failure_reason="检测到中断的注册流程，正在清理组织残留成员",
+            recovery_checked_at=now_text(),
+        )
+        result = await cleanup_adobe_member_with_retries(
+            account,
+            email,
+            "[子账号池启动恢复]",
+        )
+        if result.get("ok"):
+            recovered += 1
+            await update_child_account(
+                child_id,
+                status="removed",
+                removed_at=now_text(),
+                failure_reason="注册流程中断，启动时已清理组织成员",
+                cleanup_completed_at=now_text(),
+            )
+        else:
+            failed += 1
+            await update_child_account(
+                child_id,
+                status="cleanup_pending",
+                failure_reason=f"启动恢复清理失败：{result.get('message', '未知错误')}",
+            )
+    if pending:
+        await task_manager.broadcast(
+            f"[子账号池启动恢复] 扫描 {len(pending)} 条中断记录，已清理 {recovered}，待处理 {failed}"
+        )
+        await task_manager.broadcast("__STATE_UPDATE__")
+    return {"checked": len(pending), "recovered": recovered, "failed": failed}
+
+
+def ensure_child_recovery_started() -> None:
+    global child_recovery_task
+    if child_recovery_task and not child_recovery_task.done():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    child_recovery_task = loop.create_task(recover_incomplete_child_registrations())
+
+
 def write_protocol_cookie_result(cookie_id: str, email: str, password: str, record: dict) -> str:
     cookie_file = os.path.join(SCREENSHOT_DIR, f"cookie_{cookie_id}.json")
     data = {
@@ -3899,7 +4108,31 @@ async def run_invite_task(task: Task):
         account_label = account.get("email") or account.get("name") or account_id
         prefix = f"[Task#{task.id}: {account_label}]"
         target_success = max(1, int(task.batch_quantity or task.quantity or 1))
+        if target_success > MAX_INVITE_CHILDREN_PER_ADMIN:
+            await task_manager.broadcast(
+                f"{prefix} 单个母号最多授权 {MAX_INVITE_CHILDREN_PER_ADMIN} 个两产品子号，"
+                f"本母号目标从 {target_success} 调整为 {MAX_INVITE_CHILDREN_PER_ADMIN}"
+            )
+            target_success = MAX_INVITE_CHILDREN_PER_ADMIN
         if getattr(task, "replacement_child_ids", None) or getattr(task, "replacement_child_id", ""):
+            replacement_ids = list(getattr(task, "replacement_child_ids", []) or [])
+            if not replacement_ids and getattr(task, "replacement_child_id", ""):
+                replacement_ids = [task.replacement_child_id]
+            if len(replacement_ids) > MAX_INVITE_CHILDREN_PER_ADMIN:
+                overflow_ids = replacement_ids[MAX_INVITE_CHILDREN_PER_ADMIN:]
+                task.replacement_child_ids = replacement_ids[:MAX_INVITE_CHILDREN_PER_ADMIN]
+                task.replacement_child_id = task.replacement_child_ids[0] if task.replacement_child_ids else ""
+                for child_id in overflow_ids:
+                    await update_child_account(
+                        child_id,
+                        status="removed",
+                        failure_reason=f"超过单个母号 {MAX_INVITE_CHILDREN_PER_ADMIN} 个两产品子号上限，等待下次补号",
+                        replacement_reason="补号任务按母号上限拆分",
+                    )
+                await task_manager.broadcast(
+                    f"{prefix} 单个母号最多补 {MAX_INVITE_CHILDREN_PER_ADMIN} 个两产品子号，"
+                    f"本任务先处理 {MAX_INVITE_CHILDREN_PER_ADMIN} 个，剩余 {len(overflow_ids)} 个等待下次补号"
+                )
             prepared_child_ids = await prepare_replacement_children_for_task(task, account, prefix)
             if not prepared_child_ids:
                 await task_manager.broadcast(f"{prefix} ⚠️ 没有旧子号被成功移除，补号任务取消")
@@ -3915,6 +4148,7 @@ async def run_invite_task(task: Task):
             f"{prefix} 目标 {target_success} 个成功账号；每个目标最多换邮箱 {max_attempts_per_slot} 次，直到凑满或邮箱池耗尽"
         )
 
+        capacity = None
         if task.invite_remove_members:
             await task_manager.broadcast(f"{prefix} Step 1/3：读取并清理全部可移除成员...")
             try:
@@ -3925,6 +4159,12 @@ async def run_invite_task(task: Task):
                 removed_count = len(removal_results) - len(removal_failures)
                 suffix = f"，{len(removal_failures)} 个移除失败" if removal_failures else ""
                 await task_manager.broadcast(f"{prefix} 成员清理完成：已移除 {removed_count} 个{suffix}")
+                if not removal_failures:
+                    capacity = {
+                        "complete_two_product_count": 0,
+                        "partial_product_count": 0,
+                        "remaining_two_product_slots": MAX_INVITE_CHILDREN_PER_ADMIN,
+                    }
             except Exception as exc:
                 task.failed += target_success
                 await task_manager.broadcast(f"{prefix} ❌ 成员清理失败，本母号取消：{exc}")
@@ -3932,6 +4172,30 @@ async def run_invite_task(task: Task):
         else:
             await task_manager.broadcast(f"{prefix} Step 1/3：已关闭清理成员，直接开始授权")
 
+        try:
+            capacity = capacity or await inspect_adobe_account_capacity(account)
+            remaining_slots = int(capacity.get("remaining_two_product_slots", 0) or 0)
+            await task_manager.broadcast(
+                f"{prefix} 两产品成员 {capacity.get('complete_two_product_count', 0)}/"
+                f"{MAX_INVITE_CHILDREN_PER_ADMIN}，剩余可授权 {remaining_slots}；"
+                f"授权不完整成员 {capacity.get('partial_product_count', 0)}"
+            )
+            if remaining_slots <= 0:
+                task.failed += target_success
+                await task_manager.broadcast(f"{prefix} ❌ 两产品子号名额已满，本母号取消")
+                continue
+            if target_success > remaining_slots:
+                await task_manager.broadcast(
+                    f"{prefix} 目标超过剩余名额，本母号目标从 {target_success} 调整为 {remaining_slots}"
+                )
+                target_success = remaining_slots
+                task.batch_quantity = target_success
+        except Exception as exc:
+            task.failed += target_success
+            await task_manager.broadcast(f"{prefix} ❌ 授权前容量检查失败，本母号取消：{exc}")
+            continue
+
+        max_registration_attempts = target_success * max_attempts_per_slot
         sem = asyncio.Semaphore(max(1, task.concurrency))
 
         async def run_invite_slot(slot_index: int) -> bool | None:
@@ -3965,22 +4229,79 @@ async def run_invite_task(task: Task):
                         invite_result = {"email": email, "ok": False, "message": str(exc)}
 
                     if not invite_result.get("ok"):
-                        await release_self_email_account(email)
+                        cleanup_result = await cleanup_adobe_member_with_retries(
+                            account, email, worker_prefix
+                        )
+                        if cleanup_result.get("ok"):
+                            await release_self_email_account(email)
+                            cleanup_text = "残留成员已清理，释放邮箱"
+                        else:
+                            await mark_self_email_used(email)
+                            cleanup_text = f"残留成员清理失败：{cleanup_result.get('message', '未知错误')}"
+                            reserved["_member_id"] = invite_result.get("member_id", "")
+                            try:
+                                pending_child = await create_authorized_child_account(
+                                    account=account,
+                                    reserved=reserved,
+                                    task=task,
+                                    product_count=int(invite_result.get("product_count", 0) or 0),
+                                    required_product_count=int(invite_result.get("required_product_count", 2) or 2),
+                                )
+                                await update_child_account(
+                                    pending_child.get("id", ""),
+                                    status="cleanup_pending",
+                                    failure_reason=f"授权失败且残留成员清理失败：{cleanup_result.get('message', '未知错误')}",
+                                )
+                            except Exception as persist_exc:
+                                cleanup_text += f"；残留记录保存失败：{persist_exc}"
                         task.failed += 1
                         await task_manager.broadcast(
-                            f"{worker_prefix} ❌ [{email}] 授权失败：{invite_result.get('message', '')}，释放邮箱"
+                            f"{worker_prefix} ❌ [{email}] 授权失败：{invite_result.get('message', '')}；{cleanup_text}"
                         )
                         await task_manager.broadcast("__STATE_UPDATE__")
                         continue
 
                     reserved["_member_id"] = invite_result.get("member_id", "")
-                    await task_manager.broadcast(f"{worker_prefix} ✅ [{email}] 授权成功")
+                    try:
+                        pending_child = await create_authorized_child_account(
+                            account=account,
+                            reserved=reserved,
+                            task=task,
+                            product_count=int(invite_result.get("product_count", 0) or 0),
+                            required_product_count=int(invite_result.get("required_product_count", 2) or 2),
+                        )
+                    except Exception as exc:
+                        await mark_self_email_used(email)
+                        cleanup_result = await cleanup_adobe_member_with_retries(
+                            account, email, worker_prefix
+                        )
+                        task.failed += 1
+                        await task_manager.broadcast(
+                            f"{worker_prefix} ❌ [{email}] 授权后无法保存恢复记录：{exc}；"
+                            f"成员清理{'成功' if cleanup_result.get('ok') else '失败'}"
+                        )
+                        await task_manager.broadcast("__STATE_UPDATE__")
+                        continue
+                    await task_manager.broadcast(
+                        f"{worker_prefix} ✅ [{email}] 已确认授权 "
+                        f"{invite_result.get('product_count', 0)}/{invite_result.get('required_product_count', 2)} 个产品"
+                    )
 
                     if task.status == "stopping":
                         await mark_self_email_used(email)
-                        with suppress(Exception):
-                            async with adobe_account_lock:
-                                await remove_adobe_members(account, [email])
+                        cleanup_result = await cleanup_adobe_member_with_retries(
+                            account, email, worker_prefix
+                        )
+                        await update_child_account(
+                            pending_child.get("id", ""),
+                            status="removed" if cleanup_result.get("ok") else "cleanup_pending",
+                            removed_at=now_text() if cleanup_result.get("ok") else "",
+                            failure_reason=(
+                                "任务停止，授权成员已清理"
+                                if cleanup_result.get("ok")
+                                else f"任务停止，成员清理失败：{cleanup_result.get('message', '未知错误')}"
+                            ),
+                        )
                         await task_manager.broadcast("__STATE_UPDATE__")
                         return False
 
@@ -3993,61 +4314,76 @@ async def run_invite_task(task: Task):
                             account, reserved, cookie_id, worker_prefix
                         )
                         await mark_self_email_used(email)
-                        task.completed += 1
-                        task.result_files.append(cookie_file)
-                        account_success += 1
                         child_record = await create_child_account_from_cookie(
                             account=account,
                             reserved=reserved,
                             cookie_file=cookie_file,
                             task=task,
                         )
-                        replacement_child_id = consume_replacement_child_id(task) if child_record else ""
-                        if replacement_child_id and child_record:
-                            await update_child_account(
-                                replacement_child_id,
-                                status="replaced",
-                                replaced_at=now_text(),
-                                replacement_child_id=child_record.get("id", ""),
-                            )
-                        await task_manager.broadcast(
-                            f"{worker_prefix} ✅ [{email}] 子任务完成，已导出 Firefly cookie/token；"
-                            f"累计成功 {account_success}/{target_success}"
-                        )
-                        external_enabled = bool(config.get("token_pool_enabled"))
-                        external_result = await import_cookie_to_token_pool_result(cookie_file, worker_prefix)
-                        external_ok = bool(external_result.get("ok"))
-                        if child_record:
-                            await update_child_account(
-                                child_record.get("id", ""),
-                                external_pool_status=(
-                                    "imported" if external_enabled and external_ok
-                                    else "skipped" if not external_enabled
-                                    else "failed"
-                                ),
-                                external_pool_id=external_result.get("pool_id", "") if external_enabled and external_ok else "",
-                                external_pool_name=external_result.get("pool_name", "") if external_enabled and external_ok else "",
-                                external_pool_error="" if external_ok else external_result.get("error", "") or "外部 Token 池导入失败",
-                            )
-                        if external_ok:
-                            if config.get("token_pool_enabled"):
-                                task.token_pool_imported += 1
-                                task.token_pool_imported_files.append(cookie_file)
-                        if replacement_child_id and child_record:
-                            await cleanup_replaced_child_token(replacement_child_id, worker_prefix)
-                        await task_manager.broadcast("__STATE_UPDATE__")
-                        return True
                     except Exception as exc:
                         task.failed += 1
                         await mark_self_email_used(email)
+                        cleanup_result = await cleanup_adobe_member_with_retries(
+                            account, email, worker_prefix
+                        )
+                        await update_child_account(
+                            pending_child.get("id", ""),
+                            status="removed" if cleanup_result.get("ok") else "cleanup_pending",
+                            removed_at=now_text() if cleanup_result.get("ok") else "",
+                            failure_reason=(
+                                f"注册失败，成员已清理：{exc}"
+                                if cleanup_result.get("ok")
+                                else f"注册失败且成员清理失败：{exc}；{cleanup_result.get('message', '未知错误')}"
+                            ),
+                            cleanup_completed_at=now_text() if cleanup_result.get("ok") else "",
+                        )
                         await task_manager.broadcast(
                             f"{worker_prefix} ❌ [{email}] 注册失败：{exc}，"
-                            f"邮箱标记已使用并尝试移除成员，准备换邮箱"
+                            f"邮箱已标记使用；成员清理{'成功' if cleanup_result.get('ok') else '失败，已进入待清理状态'}，准备换邮箱"
                         )
-                        with suppress(Exception):
-                            async with adobe_account_lock:
-                                await remove_adobe_members(account, [email])
                         await task_manager.broadcast("__STATE_UPDATE__")
+                        continue
+
+                    replacement_child_id = consume_replacement_child_id(task)
+                    if replacement_child_id:
+                        await update_child_account(
+                            replacement_child_id,
+                            status="replaced",
+                            replaced_at=now_text(),
+                            replacement_child_id=child_record.get("id", ""),
+                        )
+                    task.completed += 1
+                    task.result_files.append(cookie_file)
+                    account_success += 1
+                    await task_manager.broadcast(
+                        f"{worker_prefix} ✅ [{email}] 子任务完成，Firefly cookie/token 已保存到子账号池；"
+                        f"累计成功 {account_success}/{target_success}"
+                    )
+
+                    external_enabled = bool(config.get("token_pool_enabled"))
+                    try:
+                        external_result = await import_cookie_to_token_pool_result(cookie_file, worker_prefix)
+                    except Exception as exc:
+                        external_result = {"ok": False, "error": str(exc)}
+                    external_ok = bool(external_result.get("ok"))
+                    await update_child_account(
+                        child_record.get("id", ""),
+                        external_pool_status=(
+                            "imported" if external_enabled and external_ok
+                            else "skipped" if not external_enabled
+                            else "failed"
+                        ),
+                        external_pool_id=external_result.get("pool_id", "") if external_enabled and external_ok else "",
+                        external_pool_name=external_result.get("pool_name", "") if external_enabled and external_ok else "",
+                        external_pool_error="" if external_ok else external_result.get("error", "") or "外部 Token 池导入失败",
+                    )
+                    if external_enabled and external_ok:
+                        task.token_pool_imported += 1
+                        task.token_pool_imported_files.append(cookie_file)
+                    if replacement_child_id:
+                        await cleanup_replaced_child_token(replacement_child_id, worker_prefix)
+                    await task_manager.broadcast("__STATE_UPDATE__")
+                    return True
 
                 await task_manager.broadcast(f"{worker_prefix} ⚠️ 子任务已达到 {max_attempts_per_slot} 次尝试上限")
                 return False
@@ -4303,6 +4639,7 @@ app.mount("/", StaticFiles(directory="static", html=True), name="static")
 @app.on_event("startup")
 async def cleanup_profiles_on_startup():
     cleanup_stale_profiles(collect_active_profile_paths(task_manager.tasks))
+    ensure_child_recovery_started()
     ensure_child_monitor_started()
 
 if __name__ == "__main__":
