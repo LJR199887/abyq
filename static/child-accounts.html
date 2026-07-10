@@ -50,7 +50,7 @@
                     <div>
                         <span class="eyebrow">CHILD ACCOUNT POOL</span>
                         <h2>子账号池</h2>
-                        <p class="card-desc">协议注册成功的子号会保存在这里；监测模式会查询 Token 池已耗尽邮箱，命中后自动移除旧号并补号。</p>
+                        <p class="card-desc">协议注册成功的子号会保存在这里；监测模式会查询 Token 池已耗尽和异常邮箱，命中后自动移除旧号并补号。</p>
                     </div>
                     <div class="child-pool-actions">
                         <button class="btn-sm primary" id="refresh-btn">刷新列表</button>
@@ -63,7 +63,7 @@
                 <div class="child-pool-stats">
                     <div class="stat-item"><span class="stat-value" id="stat-total">0</span><span class="stat-label">总数</span></div>
                     <div class="stat-item"><span class="stat-value" id="stat-active">0</span><span class="stat-label">可用</span></div>
-                    <div class="stat-item"><span class="stat-value" id="stat-low">0</span><span class="stat-label">已耗尽</span></div>
+                    <div class="stat-item"><span class="stat-value" id="stat-low">0</span><span class="stat-label">需补号</span></div>
                     <div class="stat-item"><span class="stat-value" id="stat-replacing">0</span><span class="stat-label">补号中</span></div>
                     <div class="stat-item"><span class="stat-value" id="stat-replacement-failed">0</span><span class="stat-label">补号失败</span></div>
                 </div>
@@ -203,7 +203,7 @@
             return {
                 active: "可用",
                 check_failed: "检测失败",
-                exhausted: "已耗尽",
+                exhausted: "需补号",
                 replacing: "换号中",
                 removed: "已移除",
                 replaced: "已替换",
@@ -333,11 +333,15 @@
                 const exhaustedPools = Array.isArray(account.exhausted_pool_ids) && account.exhausted_pool_ids.length
                     ? account.exhausted_pool_ids.join(", ")
                     : "-";
+                const abnormalPools = Array.isArray(account.abnormal_pool_ids) && account.abnormal_pool_ids.length
+                    ? account.abnormal_pool_ids.join(", ")
+                    : "-";
                 const workflowHint = account.status === "registering" ? "注册处理中" : "";
                 const failure = account.failure_reason || workflowHint || account.external_pool_error || account.exhausted_token_delete_error || "";
                 const poolLines = [
                     poolDisplay(account),
                     exhaustedPools !== "-" ? `耗尽来源：${exhaustedPools}` : "",
+                    abnormalPools !== "-" ? `异常来源：${abnormalPools}` : "",
                     account.exhausted_token_delete_status ? `旧 token：${tokenDeleteText(account.exhausted_token_delete_status)}` : "",
                 ].filter(Boolean);
                 return `
@@ -437,12 +441,22 @@
             ]));
         }
 
+        function monitorPoolCountText(pool) {
+            const exhausted = Number(pool.exhausted_count ?? pool.count ?? 0) || 0;
+            const abnormal = Number(pool.abnormal_count || 0) || 0;
+            if ("abnormal_count" in pool || abnormal) {
+                return `${exhausted} 耗尽 / ${abnormal} 异常`;
+            }
+            return `${exhausted} 个耗尽`;
+        }
+
         function monitorMatchedRows(log) {
             const poolNameById = monitorPoolNameMap(log);
             return (log.matched_accounts || []).map(item => {
-                const sources = Array.isArray(item.pool_names) && item.pool_names.length
+                const issueLabels = Array.isArray(item.issue_labels) ? item.issue_labels.filter(Boolean) : [];
+                const sources = issueLabels.length ? issueLabels : (Array.isArray(item.pool_names) && item.pool_names.length
                     ? item.pool_names
-                    : (item.pool_ids || []).map(poolId => poolNameById[String(poolId)] || (poolId === "legacy" ? "1号池" : poolId));
+                    : (item.pool_ids || []).map(poolId => poolNameById[String(poolId)] || (poolId === "legacy" ? "1号池" : poolId)));
                 return {
                     primary: item.email || "-",
                     secondary: sources.length ? `来源：${sources.join("、")}` : "来源未记录",
@@ -541,7 +555,7 @@
                 const poolChips = (log.pool_results || []).map(pool => `
                     <span class="monitor-pool-chip ${pool.ok ? "ok" : "fail"}">
                         ${escapeHtml(pool.pool_name || pool.pool_id || "Token 池")}
-                        <b>${pool.ok ? `${pool.count || 0} 个耗尽` : "查询失败"}</b>
+                        <b>${pool.ok ? monitorPoolCountText(pool) : `${monitorPoolCountText(pool)} · 查询失败`}</b>
                     </span>
                 `).join("");
                 const failedCount = Number(log.failed || 0);
