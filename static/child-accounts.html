@@ -32,7 +32,7 @@
                     <div>
                         <span class="eyebrow">MONITOR LOG</span>
                         <h2>监测日志</h2>
-                        <p class="card-desc">默认显示最近 5 条；展开可查看更多，后端只保留最近 12 小时日志。</p>
+                        <p class="card-desc">默认只显示最新一条；展开后可查看最近 12 小时内的日志。</p>
                     </div>
                     <div class="child-pool-actions">
                         <button class="btn-sm primary" id="refresh-log-btn">刷新日志</button>
@@ -118,6 +118,26 @@
         </main>
     </div>
 
+    <div class="modal-backdrop" id="monitor-log-modal" aria-hidden="true">
+        <div class="modal-panel monitor-log-modal-panel" role="dialog" aria-modal="true" aria-labelledby="monitor-log-modal-title">
+            <div class="modal-header">
+                <div>
+                    <span class="eyebrow">MONITOR LOG</span>
+                    <h2 id="monitor-log-modal-title">监测日志</h2>
+                    <p class="card-desc">最近 12 小时内的监测记录。</p>
+                </div>
+                <div class="modal-actions">
+                    <button class="btn-sm primary" id="refresh-log-modal-btn">刷新日志</button>
+                    <button class="btn-sm success" id="download-log-modal-btn">下载日志</button>
+                    <button class="btn-sm secondary" id="close-log-modal-btn">关闭</button>
+                </div>
+            </div>
+            <div id="monitor-log-modal-list" class="monitor-log-list monitor-log-modal-list">
+                <div class="empty-hint">暂无监测日志</div>
+            </div>
+        </div>
+    </div>
+
     <script>
     document.addEventListener("DOMContentLoaded", () => {
         const body = document.getElementById("child-account-body");
@@ -127,6 +147,11 @@
         const poolFilter = document.getElementById("pool-filter");
         const monitorLogList = document.getElementById("monitor-log-list");
         const toggleLogBtn = document.getElementById("toggle-log-btn");
+        const monitorLogModal = document.getElementById("monitor-log-modal");
+        const monitorLogModalList = document.getElementById("monitor-log-modal-list");
+        const closeLogModalBtn = document.getElementById("close-log-modal-btn");
+        const refreshLogModalBtn = document.getElementById("refresh-log-modal-btn");
+        const downloadLogModalBtn = document.getElementById("download-log-modal-btn");
         const selectAllAccounts = document.getElementById("select-all-accounts");
         const deleteSelectedBtn = document.getElementById("delete-selected-btn");
         const replaceSelectedBtn = document.getElementById("replace-selected-btn");
@@ -134,7 +159,6 @@
         const childPagePrevBtn = document.getElementById("child-page-prev");
         const childPageNextBtn = document.getElementById("child-page-next");
         const childPageInfo = document.getElementById("child-page-info");
-        let monitorLogExpanded = false;
         let accounts = [];
         let selectedIds = new Set();
         let childPage = 1;
@@ -385,12 +409,12 @@
             });
         }
 
-        function renderMonitorLogs(logs) {
+        function renderMonitorLogs(logs, target = monitorLogList) {
             if (!logs.length) {
-                monitorLogList.innerHTML = '<div class="empty-hint">暂无监测日志</div>';
+                target.innerHTML = '<div class="empty-hint">暂无监测日志</div>';
                 return;
             }
-            monitorLogList.innerHTML = logs.map(log => {
+            target.innerHTML = logs.map(log => {
                 const poolLines = (log.pool_results || []).map(pool => `
                     <span class="${pool.ok ? "ok" : "fail"}">${escapeHtml(pool.pool_name || pool.pool_id)}：${pool.ok ? `${pool.count || 0} 个耗尽` : escapeHtml(pool.error || "")}${pool.attempts > 1 ? `（尝试 ${pool.attempts}/3）` : ""}</span>
                 `).join("");
@@ -421,11 +445,23 @@
             }).join("");
         }
 
-        function loadMonitorLogs() {
-            const limit = monitorLogExpanded ? 50 : 5;
+        function loadMonitorLogs(limit = 1, target = monitorLogList) {
             return fetch(`/api/child-accounts/monitor/logs?limit=${limit}`)
                 .then(response => response.json())
-                .then(data => renderMonitorLogs(data.logs || []));
+                .then(data => renderMonitorLogs(data.logs || [], target));
+        }
+
+        function openMonitorLogModal() {
+            monitorLogModal.classList.add("show");
+            monitorLogModal.setAttribute("aria-hidden", "false");
+            document.body.classList.add("modal-open");
+            loadMonitorLogs(500, monitorLogModalList);
+        }
+
+        function closeMonitorLogModal() {
+            monitorLogModal.classList.remove("show");
+            monitorLogModal.setAttribute("aria-hidden", "true");
+            document.body.classList.remove("modal-open");
         }
 
         body.addEventListener("click", event => {
@@ -534,19 +570,34 @@
                 .then(response => response.json())
                 .then(data => {
                     showStatus(`✅ 监测完成：检测 ${data.checked || 0}，命中 ${data.matched || 0}，换号 ${data.replaced || 0}`);
-                    return Promise.all([loadAccounts(), loadMonitorLogs()]);
+                    return Promise.all([
+                        loadAccounts(),
+                        loadMonitorLogs(),
+                        monitorLogModal.classList.contains("show") ? loadMonitorLogs(500, monitorLogModalList) : Promise.resolve(),
+                    ]);
                 })
                 .catch(() => showStatus("❌ 监测失败", false))
                 .finally(() => { btn.disabled = false; });
         });
         document.getElementById("refresh-log-btn").addEventListener("click", () => loadMonitorLogs());
         toggleLogBtn.addEventListener("click", () => {
-            monitorLogExpanded = !monitorLogExpanded;
-            toggleLogBtn.textContent = monitorLogExpanded ? "收起日志" : "展开日志";
-            loadMonitorLogs();
+            openMonitorLogModal();
         });
         document.getElementById("download-log-btn").addEventListener("click", () => {
             window.location.href = "/api/child-accounts/monitor/logs/download";
+        });
+        closeLogModalBtn.addEventListener("click", closeMonitorLogModal);
+        refreshLogModalBtn.addEventListener("click", () => loadMonitorLogs(500, monitorLogModalList));
+        downloadLogModalBtn.addEventListener("click", () => {
+            window.location.href = "/api/child-accounts/monitor/logs/download";
+        });
+        monitorLogModal.addEventListener("click", event => {
+            if (event.target === monitorLogModal) closeMonitorLogModal();
+        });
+        document.addEventListener("keydown", event => {
+            if (event.key === "Escape" && monitorLogModal.classList.contains("show")) {
+                closeMonitorLogModal();
+            }
         });
         [searchInput, motherFilter, poolFilter].forEach(el => {
             el.addEventListener("input", () => {
@@ -562,7 +613,12 @@
         loadAccounts();
         loadMonitorLogs();
         setInterval(loadAccounts, 15000);
-        setInterval(loadMonitorLogs, 15000);
+        setInterval(() => {
+            loadMonitorLogs();
+            if (monitorLogModal.classList.contains("show")) {
+                loadMonitorLogs(500, monitorLogModalList);
+            }
+        }, 15000);
     });
     </script>
 </body>

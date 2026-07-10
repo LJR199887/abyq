@@ -2020,6 +2020,51 @@ textarea:focus {
     margin-top: 16px;
 }
 
+#monitor-log-modal {
+    display: none;
+}
+
+#monitor-log-modal.show {
+    display: flex;
+}
+
+body.modal-open {
+    overflow: hidden;
+}
+
+.modal-panel {
+    background: rgba(20, 23, 32, 0.98);
+    border: 1px solid var(--card-border);
+    border-radius: 12px;
+    box-shadow: 0 24px 80px rgba(0, 0, 0, 0.42);
+    padding: 1.25rem;
+}
+
+.monitor-log-modal-panel {
+    display: flex;
+    flex-direction: column;
+    max-height: min(86vh, 860px);
+    width: min(1180px, 96vw);
+}
+
+.monitor-log-modal-panel .modal-header {
+    align-items: flex-start;
+    margin-bottom: 1rem;
+}
+
+.monitor-log-modal-panel .modal-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    justify-content: flex-end;
+    margin-top: 0;
+}
+
+.monitor-log-modal-list {
+    overflow-y: auto;
+    padding-right: 6px;
+}
+
 .monitor-log-item {
     background: rgba(255, 255, 255, 0.035);
     border: 1px solid var(--border-color);
