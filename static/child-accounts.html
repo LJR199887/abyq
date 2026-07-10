@@ -300,6 +300,7 @@
             const items = pageAccounts();
             body.innerHTML = items.map(account => {
                 const isArchived = ["removed", "replaced"].includes(account.status);
+                const isPending = ["registering", "cleanup_pending"].includes(account.status);
                 const motherCell = isArchived
                     ? `
                         <span class="archived-account-label">已移除</span>
@@ -309,11 +310,13 @@
                         <span>${escapeHtml(account.adobe_account_email || account.adobe_account_name || "-")}</span>
                         <small>${escapeHtml(account.product_name || account.org_id || "")}</small>
                     `;
-                const disabledAttr = isArchived ? "disabled title=\"旧记录不可操作\"" : "";
+                const disabledAttr = (isArchived || isPending) ? "disabled title=\"当前状态不可操作\"" : "";
+                const exportDisabledAttr = account.cookie_file ? "" : "disabled title=\"尚未生成 Cookie\"";
                 const exhaustedPools = Array.isArray(account.exhausted_pool_ids) && account.exhausted_pool_ids.length
                     ? account.exhausted_pool_ids.join(", ")
                     : "-";
-                const failure = account.failure_reason || account.external_pool_error || account.exhausted_token_delete_error || "";
+                const workflowHint = account.status === "registering" ? "注册处理中" : "";
+                const failure = account.failure_reason || workflowHint || account.external_pool_error || account.exhausted_token_delete_error || "";
                 const poolLines = [
                     poolDisplay(account),
                     exhaustedPools !== "-" ? `耗尽来源：${exhaustedPools}` : "",
@@ -339,7 +342,7 @@
                         </td>
                         <td>
                             <div class="child-row-actions">
-                                <button class="btn-sm primary" data-action="export-cookie">导出</button>
+                                <button class="btn-sm primary" data-action="export-cookie" ${exportDisabledAttr}>导出</button>
                                 <button class="btn-sm warning" data-action="import" ${disabledAttr}>入池</button>
                                 <button class="btn-sm danger" data-action="remove" ${disabledAttr}>移除</button>
                                 <button class="btn-sm success" data-action="replace" ${disabledAttr}>补号</button>
