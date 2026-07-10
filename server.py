@@ -2135,6 +2135,7 @@ async def get_child_accounts(
     mother_status: str = "",
     pool_status: str = "",
 ):
+    await repair_stale_replacing_child_accounts()
     records = await list_child_accounts_raw()
     query = (search or "").strip().lower()
     threshold = float(config.get("child_monitor_threshold", 100) or 0)
@@ -2270,6 +2271,7 @@ async def get_child_accounts(
 
 @app.post("/api/child-accounts/monitor/run")
 async def run_child_monitor_now():
+    await repair_stale_replacing_child_accounts()
     summary = await monitor_child_accounts_once("manual")
     await task_manager.broadcast("__STATE_UPDATE__")
     return {"status": "ok", **summary}
@@ -2321,6 +2323,7 @@ async def remove_child_account_member(child_id: str):
 @app.post("/api/child-accounts/{child_id}/replace")
 async def replace_child_account_api(child_id: str):
     try:
+        await repair_stale_replacing_child_accounts()
         updated = await replace_child_account(child_id, "手动补号")
         return {"status": "ok", "account": public_child_account(updated)}
     except Exception as exc:
@@ -2332,6 +2335,7 @@ async def replace_child_accounts_bulk(req: ChildAccountDeleteRequest):
     ids = [str(item) for item in req.ids if str(item)]
     if not ids:
         return JSONResponse(status_code=400, content={"message": "请选择要补号的子账号"})
+    await repair_stale_replacing_child_accounts()
     results = []
     records = await list_child_accounts_raw()
     selected_records = []
@@ -3359,7 +3363,45 @@ def is_retryable_removed_child(record: dict) -> bool:
     )
 
 
+def replacement_task_is_active(task_id: int | str | None) -> bool:
+    try:
+        tid = int(task_id or 0)
+    except (TypeError, ValueError):
+        return False
+    task = task_manager.tasks.get(tid)
+    return bool(task and task.status in ("pending", "running", "stopping"))
+
+
+async def repair_stale_replacing_child_accounts() -> int:
+    records = await list_child_accounts_raw()
+    repaired = 0
+    for record in records:
+        if record.get("status") != "replacing":
+            continue
+        task_id = record.get("replacement_task_id")
+        if replacement_task_is_active(task_id):
+            continue
+        email = record.get("email") or record.get("id", "")
+        reason = (
+            f"补号任务 #{task_id} 已结束但未成功补号"
+            if task_id
+            else "补号任务不存在，已自动转为待重试"
+        )
+        await update_child_account(
+            record.get("id", ""),
+            status="removed",
+            failure_reason=reason,
+            replacement_reason="补号中状态自动修复，可重新监测或手动补号",
+        )
+        repaired += 1
+        await task_manager.broadcast(f"[子账号池] 已修复卡住的补号中记录：{email}（{reason}）")
+    if repaired:
+        await task_manager.broadcast("__STATE_UPDATE__")
+    return repaired
+
+
 async def monitor_child_accounts_once(source: str = "manual") -> dict:
+    await repair_stale_replacing_child_accounts()
     records = await list_child_accounts_raw()
     active = [
         record for record in records
