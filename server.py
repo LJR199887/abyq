@@ -2171,8 +2171,9 @@ async def get_child_accounts(
             continue
         mother_seen.add(key)
         mother_options.append({"email": email})
+    filtered.sort(key=parse_child_created_ts, reverse=True)
     return {
-        "accounts": list(reversed(filtered)),
+        "accounts": filtered,
         "summary": summary,
         "pool_options": pool_options,
         "mother_options": mother_options,
@@ -2601,6 +2602,15 @@ def now_text() -> str:
 
 def now_ts() -> int:
     return int(datetime.now().timestamp())
+
+
+def parse_child_created_ts(record: dict) -> float:
+    created_at = str(record.get("created_at") or "").strip()
+    if not created_at:
+        return 0
+    with suppress(Exception):
+        return datetime.fromisoformat(created_at).timestamp()
+    return 0
 
 
 def load_child_accounts_sync() -> list[dict]:
