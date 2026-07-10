@@ -671,6 +671,10 @@ class ChildAccountDeleteRequest(BaseModel):
     ids: list[str]
 
 
+class AdobeAccountBulkRequest(BaseModel):
+    ids: list[str]
+
+
 class AdobeAccountUpdate(BaseModel):
     id: str = ""
     name: str = ""
@@ -1775,6 +1779,52 @@ async def delete_adobe_account(account_id: str):
     return {"ok": True}
 
 
+@app.post("/api/adobe-accounts/delete")
+async def delete_adobe_accounts_bulk(req: AdobeAccountBulkRequest):
+    global config
+    ids = {item.strip() for item in req.ids if item and item.strip()}
+    if not ids:
+        return JSONResponse(status_code=400, content={"message": "请选择母号"})
+    before = len(config.get("adobe_accounts", []))
+    config["adobe_accounts"] = [
+        account for account in config.get("adobe_accounts", []) if account.get("id") not in ids
+    ]
+    deleted = before - len(config["adobe_accounts"])
+    save_config(config)
+    return {"ok": True, "deleted": deleted}
+
+
+async def run_adobe_account_test(account: dict) -> dict:
+    logs: list[str] = []
+    try:
+        async with adobe_account_lock:
+            await ensure_protocol_admin(account, log=logs.append)
+            account["last_checked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+            account["is_valid"] = True
+            save_config(config)
+            return {
+                "ok": True,
+                "id": account.get("id", ""),
+                "email": adobe_account_email(account),
+                "message": account.get("check_message") or "协议登录成功，已获取管理权限",
+                "organization_id": account.get("org_id", ""),
+                "product_name": account.get("product_name", ""),
+                "logs": logs[-80:],
+            }
+    except Exception as exc:
+        account["is_valid"] = False
+        account["check_message"] = str(exc)[:500]
+        account["last_checked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        save_config(config)
+        return {
+            "ok": False,
+            "id": account.get("id", ""),
+            "email": adobe_account_email(account),
+            "message": str(exc),
+            "logs": logs[-80:],
+        }
+
+
 @app.post("/api/adobe-accounts/{account_id}/test")
 async def test_adobe_account(account_id: str):
     account = find_adobe_account(account_id)
@@ -1803,6 +1853,29 @@ async def test_adobe_account(account_id: str):
             status_code=400,
             content={"ok": False, "message": str(exc), "logs": logs[-80:]},
         )
+
+
+@app.post("/api/adobe-accounts/test")
+async def test_adobe_accounts_bulk(req: AdobeAccountBulkRequest):
+    ids = [item.strip() for item in req.ids if item and item.strip()]
+    if not ids:
+        return JSONResponse(status_code=400, content={"message": "请选择母号"})
+    by_id = {account.get("id"): account for account in config.get("adobe_accounts", [])}
+    results = []
+    for account_id in ids:
+        account = by_id.get(account_id)
+        if not account:
+            results.append({"ok": False, "id": account_id, "email": account_id, "message": "账号不存在", "logs": []})
+            continue
+        results.append(await run_adobe_account_test(account))
+    success = sum(1 for item in results if item.get("ok"))
+    return {
+        "ok": success == len(results),
+        "total": len(results),
+        "success": success,
+        "failed": len(results) - success,
+        "results": results,
+    }
 
 
 @app.get("/api/adobe-accounts/{account_id}/members")

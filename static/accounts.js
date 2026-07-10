@@ -10,6 +10,9 @@ document.addEventListener("DOMContentLoaded", () => {
     const selectedPill = document.getElementById("selected-account-pill");
     const testBtn = document.getElementById("test-account-btn");
     const deleteBtn = document.getElementById("delete-account-btn");
+    const selectAllAccounts = document.getElementById("select-all-accounts");
+    const testSelectedAccountsBtn = document.getElementById("test-selected-accounts-btn");
+    const deleteSelectedAccountsBtn = document.getElementById("delete-selected-accounts-btn");
     const accountPageLabel = document.getElementById("account-page-label");
     const accountPrevBtn = document.getElementById("account-prev-btn");
     const accountNextBtn = document.getElementById("account-next-btn");
@@ -27,6 +30,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const batchContent = document.getElementById("batch-import-content");
     let accounts = [];
     let selectedId = "";
+    let selectedAccountIds = new Set();
     let memberPage = 0;
     let memberHasMore = false;
     let accountPage = 0;
@@ -90,18 +94,48 @@ document.addEventListener("DOMContentLoaded", () => {
         renderAccounts();
     }
 
+    function pageAccountIds() {
+        const pageStart = accountPage * accountPageSize;
+        return accounts.slice(pageStart, pageStart + accountPageSize).map(account => account.id);
+    }
+
+    function updateAccountBulkSelection() {
+        const validIds = new Set(accounts.map(account => account.id));
+        selectedAccountIds = new Set([...selectedAccountIds].filter(id => validIds.has(id)));
+        const selectedCount = selectedAccountIds.size;
+        const pageIds = pageAccountIds();
+        const checkedOnPage = pageIds.filter(id => selectedAccountIds.has(id)).length;
+        if (selectAllAccounts) {
+            selectAllAccounts.disabled = pageIds.length === 0;
+            selectAllAccounts.checked = pageIds.length > 0 && checkedOnPage === pageIds.length;
+            selectAllAccounts.indeterminate = checkedOnPage > 0 && checkedOnPage < pageIds.length;
+        }
+        if (testSelectedAccountsBtn) {
+            testSelectedAccountsBtn.disabled = selectedCount === 0;
+            testSelectedAccountsBtn.textContent = selectedCount ? `检测选中 ${selectedCount}` : "检测选中";
+        }
+        if (deleteSelectedAccountsBtn) {
+            deleteSelectedAccountsBtn.disabled = selectedCount === 0;
+            deleteSelectedAccountsBtn.textContent = selectedCount ? `删除选中 ${selectedCount}` : "删除选中";
+        }
+    }
+
     function renderAccounts() {
         const totalPages = Math.max(1, Math.ceil(accounts.length / accountPageSize));
         accountPage = Math.min(accountPage, totalPages - 1);
         if (!accounts.length) {
             listEl.innerHTML = '<div class="empty-hint">尚未导入母号</div>';
             updateAccountPagination();
+            updateAccountBulkSelection();
             return;
         }
         const pageStart = accountPage * accountPageSize;
         const pageAccounts = accounts.slice(pageStart, pageStart + accountPageSize);
         listEl.innerHTML = pageAccounts.map((account, index) => `
             <div class="account-item ${account.id === selectedId ? "active" : ""}">
+                <label class="account-batch-check-wrap" title="选择母号">
+                    <input class="account-batch-check" type="checkbox" data-id="${account.id}" ${selectedAccountIds.has(account.id) ? "checked" : ""}>
+                </label>
                 <button class="account-select-btn" data-id="${account.id}">
                     <span class="account-sequence">${pageStart + index + 1}</span>
                     <span class="account-avatar">${escapeHtml((account.email || account.name || "A").slice(0, 1).toUpperCase())}</span>
@@ -117,6 +151,7 @@ document.addEventListener("DOMContentLoaded", () => {
             </div>
         `).join("");
         updateAccountPagination();
+        updateAccountBulkSelection();
     }
 
     function updateAccountPagination() {
@@ -287,7 +322,54 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    async function deleteSelectedAccounts() {
+        const ids = [...selectedAccountIds];
+        if (!ids.length) return;
+        if (!confirm(`确定删除选中的 ${ids.length} 个母号吗？`)) return;
+        deleteSelectedAccountsBtn.disabled = true;
+        deleteSelectedAccountsBtn.textContent = "删除中...";
+        try {
+            const result = await api("/api/adobe-accounts/delete", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({ids}),
+            });
+            if (ids.includes(selectedId)) selectedId = "";
+            selectedAccountIds.clear();
+            await loadAccounts(selectedId);
+            showStatus(`已删除 ${result.deleted || 0} 个母号`, true);
+        } catch (error) {
+            showStatus(error.message, false);
+            updateAccountBulkSelection();
+        }
+    }
+
+    async function testSelectedAccounts() {
+        const ids = [...selectedAccountIds];
+        if (!ids.length) return;
+        testSelectedAccountsBtn.disabled = true;
+        testSelectedAccountsBtn.textContent = "检测中...";
+        try {
+            const result = await api("/api/adobe-accounts/test", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({ids}),
+            });
+            renderResults("批量协议检测", result.results || []);
+            showStatus(`批量检测完成：成功 ${result.success || 0}，失败 ${result.failed || 0}`, (result.failed || 0) === 0);
+            await loadAccounts(selectedId);
+        } catch (error) {
+            showStatus(error.message, false);
+            renderResults("批量协议检测", error.results || [{ok: false, message: error.message, logs: error.logs || []}]);
+            updateAccountBulkSelection();
+        }
+    }
+
     listEl.addEventListener("click", event => {
+        if (event.target.closest(".account-batch-check-wrap")) {
+            event.stopPropagation();
+            return;
+        }
         const deleteButton = event.target.closest(".account-inline-delete");
         if (deleteButton) {
             deleteAccount(deleteButton.dataset.id);
@@ -297,6 +379,29 @@ document.addEventListener("DOMContentLoaded", () => {
         if (selectButton) setSelected(selectButton.dataset.id);
     });
 
+    listEl.addEventListener("change", event => {
+        const checkbox = event.target.closest(".account-batch-check");
+        if (!checkbox) return;
+        if (checkbox.checked) {
+            selectedAccountIds.add(checkbox.dataset.id);
+        } else {
+            selectedAccountIds.delete(checkbox.dataset.id);
+        }
+        updateAccountBulkSelection();
+    });
+
+    selectAllAccounts?.addEventListener("change", () => {
+        pageAccountIds().forEach(id => {
+            if (selectAllAccounts.checked) {
+                selectedAccountIds.add(id);
+            } else {
+                selectedAccountIds.delete(id);
+            }
+        });
+        renderAccounts();
+    });
+    testSelectedAccountsBtn?.addEventListener("click", testSelectedAccounts);
+    deleteSelectedAccountsBtn?.addEventListener("click", deleteSelectedAccounts);
     deleteBtn.addEventListener("click", () => deleteAccount(selectedId));
     accountPrevBtn.addEventListener("click", () => { accountPage = Math.max(0, accountPage - 1); renderAccounts(); });
     accountNextBtn.addEventListener("click", () => {

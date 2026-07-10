@@ -37,6 +37,16 @@
                         <button class="btn-sm primary" id="new-account-btn">新增</button>
                     </div>
                     <p class="card-desc">导入邮箱、邮箱密码、Adobe 密码、ClientID、RefreshToken 后，系统会自动收验证码并获取管理权限。</p>
+                    <div class="account-batch-toolbar">
+                        <label class="account-batch-select">
+                            <input type="checkbox" id="select-all-accounts">
+                            <span>全选本页</span>
+                        </label>
+                        <div class="account-batch-actions">
+                            <button class="btn-sm success" id="test-selected-accounts-btn" disabled>检测选中</button>
+                            <button class="btn-sm danger" id="delete-selected-accounts-btn" disabled>删除选中</button>
+                        </div>
+                    </div>
                     <div id="account-list" class="account-list">
                         <div class="empty-hint">尚未导入母号</div>
                     </div>
