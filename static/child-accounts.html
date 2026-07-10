@@ -163,6 +163,8 @@
         let selectedIds = new Set();
         let childPage = 1;
         let childPageSize = parseInt(localStorage.getItem("childAccountPageSize") || "20", 10) || 20;
+        const monitorLogStore = new Map();
+        const monitorDetailPageSize = 20;
         if (![20, 30, 50].includes(childPageSize)) childPageSize = 20;
         childPageSizeInput.value = String(childPageSize);
 
@@ -412,37 +414,138 @@
             });
         }
 
+        function monitorPoolNameMap(log) {
+            return Object.fromEntries((log.pool_results || []).map(pool => [
+                String(pool.pool_id || ""),
+                String(pool.pool_name || pool.pool_id || "Token 池"),
+            ]));
+        }
+
+        function monitorMatchedRows(log) {
+            const poolNameById = monitorPoolNameMap(log);
+            return (log.matched_accounts || []).map(item => {
+                const sources = Array.isArray(item.pool_names) && item.pool_names.length
+                    ? item.pool_names
+                    : (item.pool_ids || []).map(poolId => poolNameById[String(poolId)] || (poolId === "legacy" ? "1号池" : poolId));
+                return {
+                    primary: item.email || "-",
+                    secondary: sources.length ? `来源：${sources.join("、")}` : "来源未记录",
+                };
+            });
+        }
+
+        function monitorReplacementRows(log) {
+            const groups = new Map();
+            (log.replacements || []).forEach(item => {
+                const taskId = String(item.replacement_task_id || "-");
+                if (!groups.has(taskId)) groups.set(taskId, []);
+                groups.get(taskId).push(item.email || "-");
+            });
+            return [...groups.entries()].map(([taskId, emails]) => ({
+                primary: `任务 #${taskId}`,
+                secondary: `${emails.length} 个子号 · ${emails.slice(0, 3).join("、")}${emails.length > 3 ? `，其余 ${emails.length - 3} 个` : ""}`,
+            }));
+        }
+
+        function monitorFailedRows(log) {
+            return (log.failed_accounts || []).map(item => ({
+                primary: item.email || "监测任务",
+                secondary: item.error || "未知错误",
+                failed: true,
+            }));
+        }
+
+        function monitorRowsForTab(log, tab) {
+            if (tab === "tasks") return monitorReplacementRows(log);
+            if (tab === "failed") return monitorFailedRows(log);
+            return monitorMatchedRows(log);
+        }
+
+        function renderMonitorDetail(key) {
+            const state = monitorLogStore.get(key);
+            if (!state) return;
+            const host = state.target.querySelector(`[data-monitor-detail-body="${key}"]`);
+            const item = state.target.querySelector(`[data-monitor-key="${key}"]`);
+            if (!host || !item) return;
+            const query = (state.query || "").trim().toLowerCase();
+            let rows = monitorRowsForTab(state.log, state.tab);
+            if (query) {
+                rows = rows.filter(row => `${row.primary} ${row.secondary}`.toLowerCase().includes(query));
+            }
+            const pageCount = Math.max(1, Math.ceil(rows.length / monitorDetailPageSize));
+            state.page = Math.min(Math.max(1, state.page || 1), pageCount);
+            const start = (state.page - 1) * monitorDetailPageSize;
+            const pageRows = rows.slice(start, start + monitorDetailPageSize);
+            host.innerHTML = pageRows.length ? pageRows.map(row => `
+                <div class="monitor-detail-row ${row.failed ? "failed" : ""}">
+                    <strong>${escapeHtml(row.primary)}</strong>
+                    <span>${escapeHtml(row.secondary)}</span>
+                </div>
+            `).join("") : '<div class="empty-hint">暂无记录</div>';
+            item.querySelectorAll("[data-monitor-tab]").forEach(button => {
+                button.classList.toggle("active", button.dataset.monitorTab === state.tab);
+            });
+            const pageInfo = item.querySelector("[data-monitor-page-info]");
+            const prev = item.querySelector('[data-monitor-page="prev"]');
+            const next = item.querySelector('[data-monitor-page="next"]');
+            if (pageInfo) pageInfo.textContent = `第 ${state.page} / ${pageCount} 页 · 共 ${rows.length} 条`;
+            if (prev) prev.disabled = state.page <= 1;
+            if (next) next.disabled = state.page >= pageCount;
+        }
+
         function renderMonitorLogs(logs, target = monitorLogList) {
             if (!logs.length) {
                 target.innerHTML = '<div class="empty-hint">暂无监测日志</div>';
                 return;
             }
-            target.innerHTML = logs.map(log => {
-                const poolLines = (log.pool_results || []).map(pool => `
-                    <span class="${pool.ok ? "ok" : "fail"}">${escapeHtml(pool.pool_name || pool.pool_id)}：${pool.ok ? `${pool.count || 0} 个耗尽` : escapeHtml(pool.error || "")}${pool.attempts > 1 ? `（尝试 ${pool.attempts}/3）` : ""}</span>
+            [...monitorLogStore.entries()].forEach(([key, state]) => {
+                if (state.target === target) monitorLogStore.delete(key);
+            });
+            const showDetails = target === monitorLogModalList;
+            target.innerHTML = logs.map((log, index) => {
+                const key = `${target.id}-${index}`;
+                monitorLogStore.set(key, {log, target, tab: "matched", page: 1, query: ""});
+                const poolChips = (log.pool_results || []).map(pool => `
+                    <span class="monitor-pool-chip ${pool.ok ? "ok" : "fail"}">
+                        ${escapeHtml(pool.pool_name || pool.pool_id || "Token 池")}
+                        <b>${pool.ok ? `${pool.count || 0} 个耗尽` : "查询失败"}</b>
+                    </span>
                 `).join("");
-                const matchedLines = (log.matched_accounts || []).map(item => `
-                    <span>${escapeHtml(item.email)} ← ${escapeHtml((item.pool_ids || []).join(", "))}</span>
-                `).join("");
-                const replacementLines = (log.replacements || []).map(item => `
-                    <span>${escapeHtml(item.email)} → 任务 #${escapeHtml(item.replacement_task_id || "-")}</span>
-                `).join("");
-                const failedLines = (log.failed_accounts || []).map(item => `
-                    <span class="fail">${escapeHtml(item.email || "监测")}：${escapeHtml(item.error || "")}</span>
-                `).join("");
+                const failedCount = Number(log.failed || 0);
                 return `
-                    <div class="monitor-log-item">
+                    <div class="monitor-log-item" data-monitor-key="${key}">
                         <div class="monitor-log-head">
-                            <strong>${escapeHtml(log.created_at || "-")}</strong>
-                            <span>${log.source === "auto" ? "自动监测" : "手动监测"}</span>
-                            <span>检测 ${log.checked || 0} / 命中 ${log.matched || 0} / 补号 ${log.replaced || 0} / 失败 ${log.failed || 0}</span>
+                            <div class="monitor-log-identity">
+                                <strong>${escapeHtml(log.created_at || "-")}</strong>
+                                <span>${log.source === "auto" ? "自动监测" : "手动监测"}</span>
+                            </div>
+                            <div class="monitor-log-metrics">
+                                <span><b>${log.checked || 0}</b>检测</span>
+                                <span><b>${log.matched || 0}</b>命中</span>
+                                <span><b>${log.replaced || 0}</b>补号</span>
+                                <span class="${failedCount ? "danger" : ""}"><b>${failedCount}</b>失败</span>
+                            </div>
+                            ${showDetails ? `<button type="button" class="btn-sm secondary monitor-detail-toggle" data-monitor-toggle aria-expanded="false">查看详情</button>` : ""}
                         </div>
-                        <div class="monitor-log-grid">
-                            <div><b>Token 池</b>${poolLines || "<span>无</span>"}</div>
-                            <div><b>命中子号</b>${matchedLines || "<span>无</span>"}</div>
-                            <div><b>补号任务</b>${replacementLines || "<span>无</span>"}</div>
-                            <div><b>失败</b>${failedLines || "<span>无</span>"}</div>
-                        </div>
+                        <div class="monitor-pool-summary">${poolChips || '<span class="monitor-pool-empty">未查询 Token 池</span>'}</div>
+                        ${showDetails ? `
+                            <div class="monitor-log-detail" hidden>
+                                <div class="monitor-detail-toolbar">
+                                    <div class="monitor-detail-tabs" role="tablist">
+                                        <button type="button" class="active" data-monitor-tab="matched">命中账号 ${log.matched || 0}</button>
+                                        <button type="button" data-monitor-tab="tasks">补号任务 ${monitorReplacementRows(log).length}</button>
+                                        ${failedCount ? `<button type="button" data-monitor-tab="failed">失败 ${failedCount}</button>` : ""}
+                                    </div>
+                                    <input type="search" data-monitor-search placeholder="搜索邮箱或任务号">
+                                </div>
+                                <div class="monitor-detail-body" data-monitor-detail-body="${key}"></div>
+                                <div class="monitor-detail-pagination">
+                                    <button type="button" class="btn-sm primary" data-monitor-page="prev">上一页</button>
+                                    <span data-monitor-page-info>第 1 / 1 页</span>
+                                    <button type="button" class="btn-sm primary" data-monitor-page="next">下一页</button>
+                                </div>
+                            </div>
+                        ` : ""}
                     </div>
                 `;
             }).join("");
@@ -593,6 +696,45 @@
         refreshLogModalBtn.addEventListener("click", () => loadMonitorLogs(500, monitorLogModalList));
         downloadLogModalBtn.addEventListener("click", () => {
             window.location.href = "/api/child-accounts/monitor/logs/download";
+        });
+        monitorLogModalList.addEventListener("click", event => {
+            const item = event.target.closest("[data-monitor-key]");
+            if (!item) return;
+            const key = item.dataset.monitorKey;
+            const state = monitorLogStore.get(key);
+            if (!state) return;
+            const toggle = event.target.closest("[data-monitor-toggle]");
+            if (toggle) {
+                const detail = item.querySelector(".monitor-log-detail");
+                const opening = detail.hidden;
+                detail.hidden = !opening;
+                toggle.setAttribute("aria-expanded", String(opening));
+                toggle.textContent = opening ? "收起详情" : "查看详情";
+                if (opening) renderMonitorDetail(key);
+                return;
+            }
+            const tab = event.target.closest("[data-monitor-tab]");
+            if (tab) {
+                state.tab = tab.dataset.monitorTab || "matched";
+                state.page = 1;
+                renderMonitorDetail(key);
+                return;
+            }
+            const pageButton = event.target.closest("[data-monitor-page]");
+            if (pageButton) {
+                state.page += pageButton.dataset.monitorPage === "next" ? 1 : -1;
+                renderMonitorDetail(key);
+            }
+        });
+        monitorLogModalList.addEventListener("input", event => {
+            const search = event.target.closest("[data-monitor-search]");
+            if (!search) return;
+            const item = search.closest("[data-monitor-key]");
+            const state = monitorLogStore.get(item?.dataset.monitorKey || "");
+            if (!state) return;
+            state.query = search.value;
+            state.page = 1;
+            renderMonitorDetail(item.dataset.monitorKey);
         });
         monitorLogModal.addEventListener("click", event => {
             if (event.target === monitorLogModal) closeMonitorLogModal();
