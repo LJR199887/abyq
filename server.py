@@ -1766,10 +1766,12 @@ async def remove_adobe_members(account: dict, emails: list[str]) -> list[dict]:
             email=email,
             proxy_url=proxy_url,
         )
+        message = result.get("message") or ""
+        already_removed = "未找到成员" in message or "成员已不存在" in message or "not found" in message.lower()
         results.append({
             "email": email,
-            "ok": bool(result.get("ok")),
-            "message": result.get("message") or "",
+            "ok": bool(result.get("ok")) or already_removed,
+            "message": "成员已不存在" if already_removed else message,
         })
     return results
 
@@ -2329,8 +2331,8 @@ async def replace_child_accounts_bulk(req: ChildAccountDeleteRequest):
             results.append({"id": child_id, "email": child_id, "ok": False, "skipped": False, "message": "子账号不存在"})
             continue
         email = record.get("email", "")
-        if record.get("status") in ("removed", "replaced"):
-            results.append({"id": child_id, "email": email, "ok": False, "skipped": True, "message": "已移除记录不执行补号"})
+        if record.get("status") == "replaced":
+            results.append({"id": child_id, "email": email, "ok": False, "skipped": True, "message": "已替换记录不重复补号"})
             continue
         selected_records.append(record)
     grouped_records: dict[str, list[dict]] = {}
@@ -3327,29 +3329,16 @@ async def replace_child_account(child_id: str, reason: str = "积分低于阈值
             raise RuntimeError("子账号不存在")
         if record.get("status") in ("replacing", "replaced"):
             return record
-        if record.get("status") == "removed":
-            task = await create_replacement_task(record, reason)
-            updated = await update_child_account(
-                child_id,
-                replacement_task_id=task.id,
-                failure_reason="",
-            )
-            return updated or record
-        await update_child_account(child_id, status="replacing", failure_reason="", replacement_reason=reason)
-        try:
-            removed = await remove_child_member(record, reason)
-            task = await create_replacement_task(removed, reason)
-            updated = await update_child_account(
-                child_id,
-                status="removed",
-                replacement_task_id=task.id,
-                replaced_at="",
-                failure_reason="",
-            )
-            return updated or removed
-        except Exception as exc:
-            updated = await update_child_account(child_id, status="active", failure_reason=f"换号失败：{exc}")
-            raise RuntimeError(str(exc)) from exc
+        task = await create_replacement_task(record, reason)
+        updated = await update_child_account(
+            child_id,
+            status="replacing" if record.get("status") != "removed" else "removed",
+            replacement_task_id=task.id,
+            replaced_at="",
+            failure_reason="",
+            replacement_reason=f"{reason}，等待任务开始移除",
+        )
+        return updated or record
 
 
 async def monitor_child_accounts_once(source: str = "manual") -> dict:
@@ -3363,6 +3352,8 @@ async def monitor_child_accounts_once(source: str = "manual") -> dict:
     matched_accounts = []
     replacements = []
     failed_accounts = []
+    replacement_records: list[dict] = []
+    replacement_reasons: dict[str, str] = {}
     for record in active:
         email = (record.get("email") or "").strip().lower()
         pool_ids = sorted(exhausted.get(email, set()))
@@ -3383,14 +3374,8 @@ async def monitor_child_accounts_once(source: str = "manual") -> dict:
                     last_checked_at=now_text(),
                     failure_reason="",
                 )
-                updated = await replace_child_account(record.get("id", ""), f"Token 池标记耗尽：{', '.join(pool_ids)}")
-                replacements.append({
-                    "child_id": record.get("id", ""),
-                    "email": record.get("email", ""),
-                    "replacement_task_id": updated.get("replacement_task_id"),
-                    "status": updated.get("status", ""),
-                })
-                replaced += 1
+                replacement_records.append(record)
+                replacement_reasons[record.get("id", "")] = f"Token 池标记耗尽：{', '.join(pool_ids)}"
             else:
                 updates = {
                     "last_checked_at": now_text(),
@@ -3406,6 +3391,45 @@ async def monitor_child_accounts_once(source: str = "manual") -> dict:
                 "email": record.get("email", ""),
                 "error": str(exc),
             })
+    grouped_records: dict[str, list[dict]] = {}
+    for record in replacement_records:
+        grouped_records.setdefault(record.get("adobe_account_id", ""), []).append(record)
+
+    for account_id, group_records in grouped_records.items():
+        lock = child_replacement_locks.setdefault(account_id, asyncio.Lock())
+        async with lock:
+            try:
+                reason_items = []
+                for record in group_records:
+                    reason = replacement_reasons.get(record.get("id", ""), "Token 池标记耗尽")
+                    if reason not in reason_items:
+                        reason_items.append(reason)
+                task = await create_replacement_batch_task(group_records, "；".join(reason_items[:3]))
+                for record in group_records:
+                    updated = await update_child_account(
+                        record.get("id", ""),
+                        status="replacing",
+                        replacement_task_id=task.id,
+                        replaced_at="",
+                        failure_reason="",
+                        replacement_reason=f"{replacement_reasons.get(record.get('id', ''), 'Token 池标记耗尽')}，等待任务开始移除",
+                    )
+                    replacements.append({
+                        "child_id": record.get("id", ""),
+                        "email": record.get("email", ""),
+                        "replacement_task_id": task.id,
+                        "status": (updated or record).get("status", ""),
+                    })
+                    replaced += 1
+            except Exception as exc:
+                for record in group_records:
+                    failed += 1
+                    await update_child_account(record.get("id", ""), failure_reason=f"创建补号任务失败：{exc}")
+                    failed_accounts.append({
+                        "child_id": record.get("id", ""),
+                        "email": record.get("email", ""),
+                        "error": str(exc),
+                    })
     summary = {
         "checked": checked,
         "matched": matched,
