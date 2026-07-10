@@ -2831,32 +2831,42 @@ def monitored_token_pools() -> list[dict]:
     return pools
 
 
-async def fetch_exhausted_emails_from_pool(pool: dict) -> tuple[set[str], str]:
+async def fetch_exhausted_emails_from_pool(pool: dict) -> tuple[set[str], str, int]:
     url = build_token_pool_exhausted_url(pool.get("site", ""))
     key = (pool.get("key") or "").strip()
     if not url or not key:
-        return set(), "Token 池地址或密钥未配置"
+        return set(), "Token 池地址或密钥未配置", 1
     headers = {
         "Authorization": f"Bearer {key}",
         "X-Token-Pool-Key": key,
         "Accept": "application/json",
     }
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url, headers=headers)
-        if response.status_code < 200 or response.status_code >= 300:
-            return set(), f"HTTP {response.status_code} {(response.text or '')[:160]}"
-        data = response.json()
-        emails = data.get("emails") if isinstance(data, dict) else []
-        if not isinstance(emails, list):
-            return set(), "响应缺少 emails 数组"
-        return {
-            str(email).strip().lower()
-            for email in emails
-            if str(email or "").strip()
-        }, ""
-    except Exception as exc:
-        return set(), str(exc)
+    last_error = ""
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(url, headers=headers)
+            if response.status_code < 200 or response.status_code >= 300:
+                last_error = f"HTTP {response.status_code} {(response.text or '')[:160]}"
+            else:
+                data = response.json()
+                emails = data.get("emails") if isinstance(data, dict) else []
+                if not isinstance(emails, list):
+                    last_error = "响应缺少 emails 数组"
+                else:
+                    return {
+                        str(email).strip().lower()
+                        for email in emails
+                        if str(email or "").strip()
+                    }, "", attempt
+        except Exception as exc:
+            last_error = str(exc)
+
+        if attempt < max_attempts:
+            await asyncio.sleep(2)
+
+    return set(), last_error, max_attempts
 
 
 async def fetch_exhausted_email_index() -> tuple[dict[str, set[str]], dict[str, str], list[dict]]:
@@ -2865,7 +2875,7 @@ async def fetch_exhausted_email_index() -> tuple[dict[str, set[str]], dict[str, 
     pool_results: list[dict] = []
     for pool in monitored_token_pools():
         pool_id = pool.get("id") or ""
-        emails, error = await fetch_exhausted_emails_from_pool(pool)
+        emails, error, attempts = await fetch_exhausted_emails_from_pool(pool)
         if error:
             errors[pool_id] = error
             pool_results.append({
@@ -2875,6 +2885,7 @@ async def fetch_exhausted_email_index() -> tuple[dict[str, set[str]], dict[str, 
                 "ok": False,
                 "count": 0,
                 "error": error,
+                "attempts": attempts,
             })
             continue
         pool_results.append({
@@ -2884,6 +2895,7 @@ async def fetch_exhausted_email_index() -> tuple[dict[str, set[str]], dict[str, 
             "ok": True,
             "count": len(emails),
             "error": "",
+            "attempts": attempts,
         })
         for email in emails:
             exhausted.setdefault(email, set()).add(pool_id)

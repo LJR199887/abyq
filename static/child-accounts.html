@@ -327,7 +327,7 @@
             }
             monitorLogList.innerHTML = logs.map(log => {
                 const poolLines = (log.pool_results || []).map(pool => `
-                    <span class="${pool.ok ? "ok" : "fail"}">${escapeHtml(pool.pool_name || pool.pool_id)}：${pool.ok ? `${pool.count || 0} 个耗尽` : escapeHtml(pool.error || "")}</span>
+                    <span class="${pool.ok ? "ok" : "fail"}">${escapeHtml(pool.pool_name || pool.pool_id)}：${pool.ok ? `${pool.count || 0} 个耗尽` : escapeHtml(pool.error || "")}${pool.attempts > 1 ? `（尝试 ${pool.attempts}/3）` : ""}</span>
                 `).join("");
                 const matchedLines = (log.matched_accounts || []).map(item => `
                     <span>${escapeHtml(item.email)} ← ${escapeHtml((item.pool_ids || []).join(", "))}</span>
