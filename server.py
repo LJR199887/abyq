@@ -65,6 +65,7 @@ DEFAULT_CONFIG = {
     "child_monitor_interval": 600,
     "child_monitor_max_failures": 3,
     "child_monitor_pool_ids": [],
+    "replacement_task_concurrency": 1,
     "self_email_accounts": "",
     "self_email_cursor": 0,
     "self_email_used": [],
@@ -711,6 +712,7 @@ class ConfigUpdate(BaseModel):
     child_monitor_interval: int = 600
     child_monitor_max_failures: int = 3
     child_monitor_pool_ids: list[str] = Field(default_factory=list)
+    replacement_task_concurrency: int = 1
 
 
 class SelfEmailUpdate(BaseModel):
@@ -834,6 +836,7 @@ async def update_config(item: ConfigUpdate):
         "child_monitor_interval": max(60, int(item.child_monitor_interval or 600)),
         "child_monitor_max_failures": max(1, int(item.child_monitor_max_failures or 3)),
         "child_monitor_pool_ids": [str(pool_id) for pool_id in item.child_monitor_pool_ids],
+        "replacement_task_concurrency": max(1, min(int(item.replacement_task_concurrency or 1), 10)),
         "self_email_accounts": config.get("self_email_accounts", ""),
         "self_email_cursor": config.get("self_email_cursor", 0),
         "self_email_used": config.get("self_email_used", []),
@@ -3551,9 +3554,10 @@ async def create_replacement_batch_task(records: list[dict], reason: str = "自�
         raise RuntimeError("所属母号不存在，无法补号")
     child_ids = [record.get("id", "") for record in records if record.get("id")]
     child_emails = [record.get("email", "") for record in records if record.get("email")]
+    concurrency = max(1, min(int(config.get("replacement_task_concurrency", 1) or 1), 10))
     task = task_manager.create_task(
         len(child_ids),
-        1,
+        concurrency,
         False,
         f"子号批量补号: {len(child_ids)} 个",
         "self",
@@ -3569,7 +3573,7 @@ async def create_replacement_batch_task(records: list[dict], reason: str = "自�
     if child_emails:
         await task_manager.broadcast(f"[Task#{task.id}] Step 0/3：已绑定旧子号，等待任务开始后移除：{', '.join(child_emails)}")
     await task_manager.broadcast(
-        f"[子账号池] 已创建补号任务 #{task.id}：{reason}，旧子号 {len(child_ids)} 个"
+        f"[子账号池] 已创建补号任务 #{task.id}：{reason}，旧子号 {len(child_ids)} 个，并发 {concurrency}"
         + (f"（{', '.join(child_emails[:5])}{'...' if len(child_emails) > 5 else ''}）" if child_emails else "")
     )
     await task_manager.broadcast("__STATE_UPDATE__")
