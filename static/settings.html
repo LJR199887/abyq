@@ -155,6 +155,10 @@
                     <label>监测间隔(秒)</label>
                     <input type="number" id="child_monitor_interval" value="600" min="60" step="60">
                 </div>
+                <div class="form-group">
+                    <label>补号任务并发</label>
+                    <input type="number" id="replacement_task_concurrency" value="1" min="1" max="10" step="1">
+                </div>
                 <button class="btn action" id="save-child-monitor-btn">保存监测配置</button>
                 <div class="status-msg" id="child-monitor-status"></div>
             </div>
@@ -177,6 +181,7 @@
         const addTokenPoolBtn = document.getElementById("add-token-pool-btn");
         const childMonitorEnabledInput = document.getElementById("child_monitor_enabled");
         const childMonitorIntervalInput = document.getElementById("child_monitor_interval");
+        const replacementTaskConcurrencyInput = document.getElementById("replacement_task_concurrency");
         const childMonitorPoolList = document.getElementById("child-monitor-pool-list");
         const configStatus = document.getElementById("config-status");
         const captchaStatus = document.getElementById("captcha-status");
@@ -365,6 +370,7 @@
             tokenPoolEnabledInput.checked = Boolean(data.token_pool_enabled);
             childMonitorEnabledInput.checked = Boolean(data.child_monitor_enabled);
             childMonitorIntervalInput.value = data.child_monitor_interval || 600;
+            replacementTaskConcurrencyInput.value = data.replacement_task_concurrency || 1;
             childMonitorPoolIds = Array.isArray(data.child_monitor_pool_ids) ? data.child_monitor_pool_ids : [];
             normalizeTokenPools(data);
             renderTokenPools();
@@ -398,6 +404,7 @@
                     child_monitor_enabled: childMonitorEnabledInput.checked,
                     child_monitor_interval: Number(childMonitorIntervalInput.value || 600),
                     child_monitor_pool_ids: selectedMonitorPoolIds(),
+                    replacement_task_concurrency: Number(replacementTaskConcurrencyInput.value || 1),
                 })
             }).then(r => r.json());
         }
@@ -597,6 +604,11 @@
         document.getElementById("save-child-monitor-btn").addEventListener("click", () => {
             if (Number(childMonitorIntervalInput.value || 0) < 60) {
                 showStatus(childMonitorStatus, "监测间隔不能低于 60 秒", false);
+                return;
+            }
+            const replacementConcurrency = Number(replacementTaskConcurrencyInput.value || 0);
+            if (!Number.isInteger(replacementConcurrency) || replacementConcurrency < 1 || replacementConcurrency > 10) {
+                showStatus(childMonitorStatus, "补号任务并发需为 1 到 10 的整数", false);
                 return;
             }
             if (childMonitorEnabledInput.checked && selectedMonitorPoolIds().length === 0) {
