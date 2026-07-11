@@ -13,6 +13,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const selectAllAccounts = document.getElementById("select-all-accounts");
     const testSelectedAccountsBtn = document.getElementById("test-selected-accounts-btn");
     const deleteSelectedAccountsBtn = document.getElementById("delete-selected-accounts-btn");
+    const accountSearch = document.getElementById("account-search");
     const accountPageLabel = document.getElementById("account-page-label");
     const accountPrevBtn = document.getElementById("account-prev-btn");
     const accountNextBtn = document.getElementById("account-next-btn");
@@ -96,7 +97,19 @@ document.addEventListener("DOMContentLoaded", () => {
 
     function pageAccountIds() {
         const pageStart = accountPage * accountPageSize;
-        return accounts.slice(pageStart, pageStart + accountPageSize).map(account => account.id);
+        return filteredAccounts().slice(pageStart, pageStart + accountPageSize).map(account => account.id);
+    }
+
+    function filteredAccounts() {
+        const query = (accountSearch?.value || "").trim().toLowerCase();
+        if (!query) return accounts;
+        return accounts.filter(account => [
+            account.email,
+            account.name,
+            account.organization_id,
+            account.product_name,
+            account.check_message,
+        ].some(value => String(value || "").toLowerCase().includes(query)));
     }
 
     function updateAccountBulkSelection() {
@@ -121,16 +134,17 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function renderAccounts() {
-        const totalPages = Math.max(1, Math.ceil(accounts.length / accountPageSize));
+        const visibleAccounts = filteredAccounts();
+        const totalPages = Math.max(1, Math.ceil(visibleAccounts.length / accountPageSize));
         accountPage = Math.min(accountPage, totalPages - 1);
-        if (!accounts.length) {
-            listEl.innerHTML = '<div class="empty-hint">尚未导入母号</div>';
+        if (!visibleAccounts.length) {
+            listEl.innerHTML = `<div class="empty-hint">${accounts.length ? "没有匹配的母号" : "尚未导入母号"}</div>`;
             updateAccountPagination();
             updateAccountBulkSelection();
             return;
         }
         const pageStart = accountPage * accountPageSize;
-        const pageAccounts = accounts.slice(pageStart, pageStart + accountPageSize);
+        const pageAccounts = visibleAccounts.slice(pageStart, pageStart + accountPageSize);
         listEl.innerHTML = pageAccounts.map((account, index) => `
             <div class="account-item ${account.id === selectedId ? "active" : ""}">
                 <label class="account-batch-check-wrap" title="选择母号">
@@ -155,8 +169,9 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function updateAccountPagination() {
-        const totalPages = Math.max(1, Math.ceil(accounts.length / accountPageSize));
-        accountPageLabel.textContent = `第 ${accountPage + 1} / ${totalPages} 页 · 共 ${accounts.length} 个`;
+        const visibleAccounts = filteredAccounts();
+        const totalPages = Math.max(1, Math.ceil(visibleAccounts.length / accountPageSize));
+        accountPageLabel.textContent = `第 ${accountPage + 1} / ${totalPages} 页 · ${visibleAccounts.length === accounts.length ? `共 ${accounts.length}` : `匹配 ${visibleAccounts.length} / ${accounts.length}`} 个`;
         accountPrevBtn.disabled = accountPage <= 0;
         accountNextBtn.disabled = accountPage >= totalPages - 1;
     }
@@ -398,6 +413,10 @@ document.addEventListener("DOMContentLoaded", () => {
                 selectedAccountIds.delete(id);
             }
         });
+        renderAccounts();
+    });
+    accountSearch?.addEventListener("input", () => {
+        accountPage = 0;
         renderAccounts();
     });
     testSelectedAccountsBtn?.addEventListener("click", testSelectedAccounts);

@@ -30,6 +30,12 @@ document.addEventListener("DOMContentLoaded", () => {
     let taskPage = 1;
     let latestTasks = [];
 
+    function escapeHtml(value) {
+        return String(value ?? "").replace(/[&<>"']/g, char => ({
+            "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;",
+        })[char]);
+    }
+
     function setCreateTaskCollapsed(collapsed) {
         if (!createTaskCard || !toggleCreateTaskBtn) return;
         createTaskCard.classList.toggle("collapsed", collapsed);
@@ -132,9 +138,12 @@ document.addEventListener("DOMContentLoaded", () => {
     const emailSourceGroup = document.getElementById("email-source-group");
     const inviteAccountGroup = document.getElementById("invite-account-group");
     const inviteAccountList = document.getElementById("invite-account-list");
+    const inviteAccountSearch = document.getElementById("invite-account-search");
     const inviteAccountCount = document.getElementById("invite-account-count");
     const selectAllInviteAccounts = document.getElementById("select-all-invite-accounts");
     const inviteRemoveMembersInput = document.getElementById("invite_remove_members");
+    let inviteAccounts = [];
+    let selectedInviteAccountIds = new Set();
 
     function emailSourceLabel(source) {
         return source === "self" ? "自备邮箱" : "临时邮箱";
@@ -171,36 +180,57 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function selectedAdobeAccountIds() {
-        return Array.from(inviteAccountList.querySelectorAll("input[type='checkbox']:checked")).map(input => input.value);
+        return [...selectedInviteAccountIds];
+    }
+
+    function filteredInviteAccounts() {
+        const query = (inviteAccountSearch?.value || "").trim().toLowerCase();
+        if (!query) return inviteAccounts;
+        return inviteAccounts.filter(account => [
+            account.email,
+            account.name,
+            account.organization_id,
+            account.product_name,
+        ].some(value => String(value || "").toLowerCase().includes(query)));
     }
 
     function updateInviteAccountCount() {
         const count = selectedAdobeAccountIds().length;
         inviteAccountCount.textContent = count ? `已选 ${count} 个` : "请选择账号";
         const checks = [...inviteAccountList.querySelectorAll("input[type='checkbox']")];
+        const checkedCount = checks.filter(input => input.checked).length;
         selectAllInviteAccounts.disabled = checks.length === 0;
-        selectAllInviteAccounts.checked = checks.length > 0 && count === checks.length;
-        selectAllInviteAccounts.indeterminate = count > 0 && count < checks.length;
+        selectAllInviteAccounts.checked = checks.length > 0 && checkedCount === checks.length;
+        selectAllInviteAccounts.indeterminate = checkedCount > 0 && checkedCount < checks.length;
+    }
+
+    function renderInviteAccounts() {
+        const visibleAccounts = filteredInviteAccounts();
+        inviteAccountList.innerHTML = visibleAccounts.length ? visibleAccounts.map((account, index) => `
+            <label class="invite-account-option">
+                <input type="checkbox" value="${escapeHtml(account.id)}" ${selectedInviteAccountIds.has(account.id) ? "checked" : ""}>
+                <span class="invite-account-sequence">${index + 1}</span>
+                <span class="invite-account-avatar">${escapeHtml((account.name || account.email || "A").slice(0, 1).toUpperCase())}</span>
+                <span class="invite-account-info">
+                    <strong>${escapeHtml(account.email || account.name || "未命名账号")}</strong>
+                    <small>${escapeHtml(account.organization_id || "尚未检测组织")}</small>
+                </span>
+            </label>
+        `).join("") : `<div class="empty-hint">${inviteAccounts.length ? "没有匹配的账号" : "暂无账号，请先前往账号页面配置"}</div>`;
+        updateInviteAccountCount();
     }
 
     function loadInviteAccounts() {
         fetch("/api/adobe-accounts")
             .then(response => response.json())
             .then(accounts => {
-                inviteAccountList.innerHTML = accounts.length ? accounts.map((account, index) => `
-                    <label class="invite-account-option">
-                        <input type="checkbox" value="${account.id}">
-                        <span class="invite-account-sequence">${index + 1}</span>
-                        <span class="invite-account-avatar">${(account.name || "A").slice(0, 1).toUpperCase()}</span>
-                        <span class="invite-account-info">
-                            <strong>${account.name || "未命名账号"}</strong>
-                            <small>${account.organization_id || "尚未检测组织"}</small>
-                        </span>
-                    </label>
-                `).join("") : '<div class="empty-hint">暂无账号，请先前往账号页面配置</div>';
-                updateInviteAccountCount();
+                inviteAccounts = Array.isArray(accounts) ? accounts : [];
+                const validIds = new Set(inviteAccounts.map(account => account.id));
+                selectedInviteAccountIds = new Set([...selectedInviteAccountIds].filter(id => validIds.has(id)));
+                renderInviteAccounts();
             })
             .catch(() => {
+                inviteAccounts = [];
                 inviteAccountList.innerHTML = '<div class="empty-hint">账号读取失败</div>';
                 updateInviteAccountCount();
             });
@@ -212,13 +242,22 @@ document.addEventListener("DOMContentLoaded", () => {
         emailSourceGroup.hidden = invite;
         if (invite) emailSourceInput.value = "self";
     });
-    inviteAccountList.addEventListener("change", updateInviteAccountCount);
+    inviteAccountList.addEventListener("change", event => {
+        const input = event.target.closest("input[type='checkbox']");
+        if (!input) return;
+        if (input.checked) selectedInviteAccountIds.add(input.value);
+        else selectedInviteAccountIds.delete(input.value);
+        updateInviteAccountCount();
+    });
     selectAllInviteAccounts.addEventListener("change", () => {
         inviteAccountList.querySelectorAll("input[type='checkbox']").forEach(input => {
             input.checked = selectAllInviteAccounts.checked;
+            if (input.checked) selectedInviteAccountIds.add(input.value);
+            else selectedInviteAccountIds.delete(input.value);
         });
         updateInviteAccountCount();
     });
+    inviteAccountSearch?.addEventListener("input", renderInviteAccounts);
     loadInviteAccounts();
 
     startBtn.addEventListener("click", () => {

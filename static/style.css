@@ -200,6 +200,16 @@ h1 {
     flex-wrap: wrap;
 }
 
+.account-search,
+.invite-account-search {
+    width: 100%;
+    margin: 0.75rem 0;
+}
+
+.invite-account-search {
+    margin-top: 0;
+}
+
 .account-batch-select {
     gap: 0.45rem;
     margin: 0;
