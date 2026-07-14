@@ -1227,7 +1227,7 @@ textarea:focus {
 
 .self-email-stats {
     display: grid;
-    grid-template-columns: repeat(3, minmax(72px, 1fr));
+    grid-template-columns: repeat(4, minmax(72px, 1fr));
     gap: 0.5rem;
     min-width: 250px;
 }
@@ -1887,7 +1887,7 @@ textarea:focus {
 .child-pool-stats {
     display: grid;
     gap: 12px;
-    grid-template-columns: repeat(5, minmax(100px, 1fr));
+    grid-template-columns: repeat(7, minmax(100px, 1fr));
     margin: 18px 0;
 }
 
