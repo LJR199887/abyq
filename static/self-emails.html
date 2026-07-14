@@ -27,37 +27,46 @@
         </header>
 
         <div class="self-email-layout">
-            <div class="card glass-card">
+            <div class="card glass-card self-email-config-card">
                 <div class="self-email-header">
-                    <div>
+                    <div class="self-email-heading">
                         <h2><span class="icon">📮</span> 自备邮箱配置</h2>
-                        <p class="card-desc">每行一条，支持：邮箱-密码-api取件链接，或 邮箱----密码----ClientID----RefreshToken。任务使用后会自动标记为已使用。</p>
+                        <p class="self-email-description">
+                            支持 API 取件链接或 ClientID + RefreshToken，每行一个邮箱。
+                            任务进入注册后会自动标记为已使用。
+                        </p>
                     </div>
                     <div class="self-email-stats">
-                        <div class="mini-stat">
+                        <div class="mini-stat stat-total">
                             <span id="self-total">0</span>
                             <small>总数</small>
                         </div>
-                        <div class="mini-stat">
+                        <div class="mini-stat stat-available">
                             <span id="self-available">0</span>
                             <small>未使用</small>
                         </div>
-                        <div class="mini-stat">
+                        <div class="mini-stat stat-used">
                             <span id="self-used">0</span>
                             <small>已使用</small>
                         </div>
-                        <div class="mini-stat">
+                        <div class="mini-stat stat-held" title="Adobe 成员清理未确认成功，邮箱已暂时锁定">
                             <span id="self-held">0</span>
-                            <small>待清理</small>
+                            <small>待清理 <span class="stat-help" aria-hidden="true">?</span></small>
                         </div>
                     </div>
                 </div>
 
                 <div class="self-email-actions">
-                    <button class="btn primary" id="open-editor-btn">输入邮箱</button>
-                    <label class="btn secondary file-import-btn" for="txt-import-input">导入 TXT</label>
+                    <button class="btn self-email-action action-input" id="open-editor-btn">
+                        <span class="self-email-action-icon">＋</span><span>输入邮箱</span>
+                    </button>
+                    <label class="btn self-email-action action-import file-import-btn" for="txt-import-input">
+                        <span class="self-email-action-icon">↑</span><span>导入 TXT</span>
+                    </label>
                     <input type="file" id="txt-import-input" accept=".txt,text/plain" hidden>
-                    <button class="btn secondary" id="clean-used-btn">清理已用邮箱</button>
+                    <button class="btn self-email-action action-clean" id="clean-used-btn">
+                        <span class="self-email-action-icon">✕</span><span>清理已用邮箱</span>
+                    </button>
                 </div>
                 <div class="status-msg" id="self-email-status"></div>
             </div>
