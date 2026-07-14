@@ -110,20 +110,31 @@ def complete_sub_account(
 
     复用收到验证码后的 incompleteAccount 会话(auth.susi_token)。幂等:已补全则只切资料。
     """
-    try:
-        r = auth.client.get(
-            f"{_AUTH_HOST}/signin/v1/accounts/me?client_id={auth.client_id}",
-            headers=auth.headers(), timeout=20,
-        )
-        data = r.json() if r.status_code == 200 else {}
-    except Exception as e:  # noqa: BLE001
-        lf(f"读取子号资料失败:{e}")
-        if strict:
-            raise AdminError(f"读取子号资料失败:{e}")
-        return
-    if not isinstance(data, dict) or not data:
-        if strict:
+    def read_account() -> dict:
+        try:
+            response = auth.client.get(
+                f"{_AUTH_HOST}/signin/v1/accounts/me?client_id={auth.client_id}",
+                headers=auth.headers(), timeout=20,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise AdminError(f"读取子号资料失败:{exc}") from exc
+        if response.status_code != 200:
+            detail = (response.text or "")[:200]
+            raise AdminError(f"读取子号资料失败 status={response.status_code}: {detail}")
+        try:
+            payload = response.json()
+        except Exception as exc:  # noqa: BLE001
+            raise AdminError(f"读取子号资料响应无效:{exc}") from exc
+        if not isinstance(payload, dict) or not payload:
             raise AdminError("读取子号资料为空")
+        return payload
+
+    try:
+        data = read_account()
+    except AdminError as exc:
+        lf(str(exc))
+        if strict:
+            raise
         return
 
     profile = data.get("profileData") or {}
@@ -193,37 +204,80 @@ def complete_sub_account(
                 raise AdminError(f"补全账号失败 {r.status_code}: {(r.text or '')[:200]}")
             return
         lf("✓ 已补全账号资料")
-        # 重新拉取资料,拿到更新后的链接
+    # Adobe 的邀请、账号补全和企业资料服务存在短暂传播窗口。只在当前
+    # 会话仍有效时轮询；401 会直接交给上层重建完整登录会话。
+    link: dict[str, Any] | None = None
+    for attempt in range(1, 5):
         try:
-            r = auth.client.get(
-                f"{_AUTH_HOST}/signin/v1/accounts/me?client_id={auth.client_id}",
-                headers=auth.headers(), timeout=20,
-            )
-            data = r.json() if r.status_code == 200 else data
-            profile = data.get("profileData") or {}
-        except Exception:
-            pass
+            data = read_account()
+        except AdminError as exc:
+            lf(str(exc))
+            if strict:
+                raise
+            return
+        profile = data.get("profileData") or {}
+        links = profile.get("links") or []
+        link = next(
+            (item for item in links if isinstance(item, dict) and item.get("status") == "active"),
+            None,
+        )
+        candidate = link or next(
+            (item for item in links if isinstance(item, dict) and item.get("ident")),
+            None,
+        )
+        if link:
+            break
+        if candidate and candidate.get("ident"):
+            try:
+                response = auth.client.post(
+                    f"{_AUTH_HOST}/signin/v2/links/{candidate.get('ident')}",
+                    headers=auth.headers(), json={"status": "active"}, timeout=15,
+                )
+                if response.status_code == 401:
+                    raise AdminError(
+                        f"激活企业资料失败 status=401: {(response.text or '')[:200]}"
+                    )
+                if response.status_code < 200 or response.status_code >= 300:
+                    raise AdminError(
+                        f"激活企业资料失败 status={response.status_code}: {(response.text or '')[:200]}"
+                    )
+                lf(f"已请求激活企业资料:{candidate.get('description') or '-'}")
+                # 如果企业链接恰好在最后一次轮询才出现，激活后
+                # 再做一次即时确认，避免已激活却被误判为同步失败。
+                if attempt == 4:
+                    confirmed = read_account()
+                    confirmed_links = (confirmed.get("profileData") or {}).get("links") or []
+                    link = next(
+                        (
+                            item for item in confirmed_links
+                            if isinstance(item, dict)
+                            and item.get("ident") == candidate.get("ident")
+                            and item.get("status") == "active"
+                        ),
+                        None,
+                    )
+                    if link:
+                        break
+            except AdminError:
+                if strict:
+                    raise
+                return
+            except Exception as exc:  # noqa: BLE001
+                if strict:
+                    raise AdminError(f"激活企业资料异常:{exc}") from exc
+                return
+        if attempt < 4:
+            lf(f"企业资料尚未同步，第 {attempt}/4 次检查，5 秒后重试…")
+            time.sleep(5)
 
-    # 选择并激活企业(被邀请)资料
-    links = profile.get("links") or []
-    link = next((lk for lk in links if lk.get("status") == "active"), None) \
-        or next((lk for lk in links if lk.get("ident")), None)
     if not link:
-        lf("无企业资料链接,按个人资料继续")
+        lf("企业资料暂未同步")
         if strict:
-            raise AdminError("未找到企业资料链接")
+            raise AdminError("企业资料暂未同步")
         return
+
     ident = link.get("ident")
     guid = link.get("entitlementAccountUserId") or ""
-    if link.get("status") != "active":
-        try:
-            auth.client.post(
-                f"{_AUTH_HOST}/signin/v2/links/{ident}",
-                headers=auth.headers(), json={"status": "active"}, timeout=15,
-            )
-            lf(f"已激活企业资料:{link.get('description') or '-'}")
-        except Exception:
-            pass
     if guid:
         try:
             auth.client.put(

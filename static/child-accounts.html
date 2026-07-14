@@ -65,6 +65,8 @@
                     <div class="stat-item"><span class="stat-value" id="stat-active">0</span><span class="stat-label">可用</span></div>
                     <div class="stat-item"><span class="stat-value" id="stat-low">0</span><span class="stat-label">需补号</span></div>
                     <div class="stat-item"><span class="stat-value" id="stat-replacing">0</span><span class="stat-label">补号中</span></div>
+                    <div class="stat-item"><span class="stat-value" id="stat-replacement-stopped">0</span><span class="stat-label">停止待重试</span></div>
+                    <div class="stat-item"><span class="stat-value" id="stat-removed-waiting">0</span><span class="stat-label">已移除待补</span></div>
                     <div class="stat-item"><span class="stat-value" id="stat-replacement-failed">0</span><span class="stat-label">补号失败</span></div>
                 </div>
 
@@ -204,8 +206,13 @@
                 active: "可用",
                 check_failed: "检测失败",
                 exhausted: "需补号",
+                replacement_pending: "等待补号",
                 replacing: "换号中",
-                removed: "已移除",
+                replacement_stopped: "补号已停止",
+                removed: "已移除待补",
+                replacement_failed: "补号失败",
+                registering: "注册中",
+                cleanup_pending: "待清理",
                 replaced: "已替换",
             }[status] || status || "未知";
         }
@@ -229,7 +236,7 @@
         }
 
         function poolDisplay(account) {
-            const removedSuffix = ["removed", "replaced"].includes(account.status) ? "（已移除）" : "";
+            const removedSuffix = ["removed", "replacement_failed", "replaced"].includes(account.status) ? "（已移除）" : "";
             if (account.external_pool_status === "imported") {
                 return `${account.external_pool_name || account.external_pool_id || "已入池（未记录池名）"}${removedSuffix}`;
             }
@@ -240,7 +247,10 @@
         function syncSelectionState() {
             const pageIds = pageAccounts().map(account => account.id).filter(Boolean);
             const selectedVisibleCount = pageIds.filter(id => selectedIds.has(id)).length;
-            const replaceableCount = accounts.filter(account => selectedIds.has(account.id) && !["removed", "replaced"].includes(account.status)).length;
+            const replaceableCount = accounts.filter(account => (
+                selectedIds.has(account.id)
+                && !["replacement_pending", "replacing", "registering", "cleanup_pending", "replaced"].includes(account.status)
+            )).length;
             deleteSelectedBtn.disabled = selectedIds.size === 0;
             deleteSelectedBtn.textContent = selectedIds.size ? `删除选中 ${selectedIds.size}` : "删除选中";
             replaceSelectedBtn.disabled = replaceableCount === 0;
@@ -254,6 +264,8 @@
             document.getElementById("stat-active").textContent = summary.active || 0;
             document.getElementById("stat-low").textContent = summary.low_credits || 0;
             document.getElementById("stat-replacing").textContent = summary.replacing || 0;
+            document.getElementById("stat-replacement-stopped").textContent = summary.replacement_stopped || 0;
+            document.getElementById("stat-removed-waiting").textContent = summary.removed_waiting || 0;
             document.getElementById("stat-replacement-failed").textContent = summary.replacement_failed || 0;
         }
 
@@ -317,18 +329,24 @@
             }
             const items = pageAccounts();
             body.innerHTML = items.map(account => {
-                const isArchived = ["removed", "replaced"].includes(account.status);
+                const isArchived = ["removed", "replacement_failed", "replaced"].includes(account.status);
                 const isPending = ["registering", "cleanup_pending"].includes(account.status);
                 const motherCell = isArchived
                     ? `
-                        <span class="archived-account-label">已移除</span>
+                        <span class="archived-account-label">${escapeHtml(statusText(account.status))}</span>
                         <small>旧子号记录</small>
                     `
                     : `
                         <span>${escapeHtml(account.adobe_account_email || account.adobe_account_name || "-")}</span>
                         <small>${escapeHtml(account.product_name || account.org_id || "")}</small>
                     `;
-                const disabledAttr = (isArchived || isPending) ? "disabled title=\"当前状态不可操作\"" : "";
+                const disabledAttr = (
+                    isArchived || isPending
+                    || ["replacement_pending", "replacing", "replacement_stopped"].includes(account.status)
+                ) ? "disabled title=\"当前状态不可操作\"" : "";
+                const replaceDisabledAttr = ["replacement_pending", "replacing", "registering", "cleanup_pending", "replaced"].includes(account.status)
+                    ? "disabled title=\"当前状态不可补号\""
+                    : "";
                 const exportDisabledAttr = account.cookie_file ? "" : "disabled title=\"尚未生成 Cookie\"";
                 const exhaustedPools = Array.isArray(account.exhausted_pool_ids) && account.exhausted_pool_ids.length
                     ? account.exhausted_pool_ids.join(", ")
@@ -336,7 +354,9 @@
                 const abnormalPools = Array.isArray(account.abnormal_pool_ids) && account.abnormal_pool_ids.length
                     ? account.abnormal_pool_ids.join(", ")
                     : "-";
-                const workflowHint = account.status === "registering" ? "注册处理中" : "";
+                const workflowHint = account.status === "registering"
+                    ? (account.workflow_phase === "waiting_sync" ? "授权完成，等待同步" : "注册处理中")
+                    : "";
                 const failure = account.failure_reason || workflowHint || account.external_pool_error || account.exhausted_token_delete_error || "";
                 const poolLines = [
                     poolDisplay(account),
@@ -367,7 +387,7 @@
                                 <button class="btn-sm primary" data-action="export-cookie" ${exportDisabledAttr}>导出</button>
                                 <button class="btn-sm warning" data-action="import" ${disabledAttr}>入池</button>
                                 <button class="btn-sm danger" data-action="remove" ${disabledAttr}>移除</button>
-                                <button class="btn-sm success" data-action="replace" ${disabledAttr}>补号</button>
+                                <button class="btn-sm success" data-action="replace" ${replaceDisabledAttr}>补号</button>
                             </div>
                         </td>
                     </tr>

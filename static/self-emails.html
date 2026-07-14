@@ -46,6 +46,10 @@
                             <span id="self-used">0</span>
                             <small>已使用</small>
                         </div>
+                        <div class="mini-stat">
+                            <span id="self-held">0</span>
+                            <small>待清理</small>
+                        </div>
                     </div>
                 </div>
 
@@ -118,6 +122,7 @@
         const totalEl = document.getElementById("self-total");
         const availableEl = document.getElementById("self-available");
         const usedEl = document.getElementById("self-used");
+        const heldEl = document.getElementById("self-held");
         const rowsEl = document.getElementById("self-email-rows");
         const emptyEl = document.getElementById("self-email-empty");
         const summaryEl = document.getElementById("self-email-summary");
@@ -136,7 +141,7 @@
         const nextPageBtn = document.getElementById("next-page-btn");
         const pageInfo = document.getElementById("page-info");
 
-        let currentData = {accounts: [], raw: "", total: 0, available: 0, used: 0};
+        let currentData = {accounts: [], raw: "", total: 0, available: 0, used: 0, held: 0};
         let currentPage = 1;
 
         function showStatus(message, ok = true) {
@@ -192,7 +197,10 @@
             totalEl.textContent = currentData.total || 0;
             availableEl.textContent = currentData.available || 0;
             usedEl.textContent = currentData.used || 0;
-            summaryEl.textContent = currentData.total ? `未使用 ${currentData.available} / 已使用 ${currentData.used}` : "";
+            heldEl.textContent = currentData.held || 0;
+            summaryEl.textContent = currentData.total
+                ? `未使用 ${currentData.available} / 已使用 ${currentData.used} / 待清理 ${currentData.held || 0}`
+                : "";
 
             const accounts = currentData.accounts || [];
             const totalPages = Math.max(1, Math.ceil(accounts.length / PAGE_SIZE));
@@ -214,7 +222,7 @@
                     <td>${escapeHtml(item.email)}</td>
                     <td>${escapeHtml(item.password_mask)}</td>
                     <td class="api-url">${escapeHtml(item.receive_mode || (item.api_url ? "API" : "Graph/IMAP"))}<small>${escapeHtml(item.api_url || item.client_id || "")}</small></td>
-                    <td><span class="badge ${item.used ? "stopped" : "completed"}">${item.used ? "已使用" : "未使用"}</span></td>
+                    <td><span class="badge ${item.used || item.held ? "stopped" : "completed"}">${item.used ? "已使用" : item.held ? "待清理" : "未使用"}</span></td>
                 </tr>
             `).join("");
             rowsEl.querySelectorAll(".self-email-check").forEach(input => {
